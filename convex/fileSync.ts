@@ -121,6 +121,7 @@ export const listSnapshot = query({
 				path: folder.path,
 				updatedAtMs: folder.updatedAtMs,
 				isExplicitlyEmpty: folder.isExplicitlyEmpty,
+				updatedByClientId: folder.updatedByClientId ?? "",
 			})),
 			obsidianBundle:
 				bundle === null
@@ -169,7 +170,6 @@ export const syncFolderState = mutation({
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		void args.clientId;
 		const normalizedEmpty = new Set(
 			args.emptyFolderPaths.map((path) => normalizePath(path)),
 		);
@@ -179,6 +179,7 @@ export const syncFolderState = mutation({
 			await ctx.db.patch(folder._id, {
 				updatedAtMs: args.scannedAtMs,
 				isExplicitlyEmpty: shouldBeEmpty,
+				updatedByClientId: args.clientId,
 			});
 			normalizedEmpty.delete(folder.path);
 		}
@@ -187,6 +188,7 @@ export const syncFolderState = mutation({
 				path,
 				updatedAtMs: args.scannedAtMs,
 				isExplicitlyEmpty: true,
+				updatedByClientId: args.clientId,
 			});
 		}
 	},

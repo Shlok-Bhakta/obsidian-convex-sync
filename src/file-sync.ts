@@ -30,6 +30,7 @@ type Snapshot = {
 		path: string;
 		updatedAtMs: number;
 		isExplicitlyEmpty: boolean;
+		updatedByClientId: string;
 	}>;
 	obsidianBundle: {
 		contentHash: string;
@@ -491,6 +492,7 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		if (remote.updatedAtMs > localUpdatedAtMs) {
 			const remotePayload = await readRemoteFileBytes(client, secret, path);
 			if (!remotePayload) {
+				tick("Skipping unavailable remote updates");
 				continue;
 			}
 			await localFile.writeBytes(remotePayload.bytes);
@@ -536,6 +538,7 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 			remoteFile.path,
 		);
 		if (!remotePayload) {
+			tick("Skipping unavailable remote files");
 			continue;
 		}
 		const parent = folderPathForFile(remoteFile.path);

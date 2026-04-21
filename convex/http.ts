@@ -51,4 +51,40 @@ http.route({
 	}),
 });
 
+http.route({
+	path: "/obsidian-convex-sync/bootstrap-download",
+	method: "GET",
+	handler: httpAction(async (ctx, request) => {
+		const url = new URL(request.url);
+		const token = url.searchParams.get("token") ?? "";
+		if (!token) {
+			return new Response("Missing token", { status: 400, headers: noStoreHeaders });
+		}
+		const resolved = await ctx.runQuery(internal.bootstrap.resolveDownloadByToken, {
+			token,
+		});
+		if (!resolved) {
+			return new Response("Bootstrap link expired or invalid", {
+				status: 404,
+				headers: noStoreHeaders,
+			});
+		}
+		const blob = await ctx.storage.get(resolved.storageId);
+		if (!blob) {
+			return new Response("Archive not found", {
+				status: 404,
+				headers: noStoreHeaders,
+			});
+		}
+		return new Response(blob.stream(), {
+			status: 200,
+			headers: {
+				...noStoreHeaders,
+				"Content-Type": "application/zip",
+				"Content-Disposition": `attachment; filename="${resolved.archiveName}"`,
+			},
+		});
+	}),
+});
+
 export default http;
