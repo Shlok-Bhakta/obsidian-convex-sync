@@ -18,6 +18,31 @@ export default defineSchema({
 		text: v.string(),
 		isCompleted: v.boolean(),
 	}),
+	vaultFiles: defineTable({
+		path: v.string(),
+		storageId: v.id("_storage"),
+		contentHash: v.string(),
+		sizeBytes: v.number(),
+		updatedAtMs: v.number(),
+		updatedByClientId: v.string(),
+	})
+		.index("by_path", ["path"])
+		.index("by_updatedAtMs", ["updatedAtMs"]),
+	vaultFolders: defineTable({
+		path: v.string(),
+		updatedAtMs: v.number(),
+		isExplicitlyEmpty: v.boolean(),
+	})
+		.index("by_path", ["path"])
+		.index("by_updatedAtMs", ["updatedAtMs"]),
+	vaultBundles: defineTable({
+		scope: v.string(),
+		storageId: v.id("_storage"),
+		contentHash: v.string(),
+		sizeBytes: v.number(),
+		updatedAtMs: v.number(),
+		updatedByClientId: v.string(),
+	}).index("by_scope", ["scope"]),
 	/** At most one row: shared vault API key for this deployment. */
 	pluginAuth: defineTable({
 		secret: v.string(),

@@ -13,6 +13,7 @@ import {
 	ensureVaultSecretRegisteredWithDeployment,
 	mintVaultApiSecretFromConvexSite,
 } from "./security";
+import { runVaultFileSync } from "./file-sync";
 import {
 	DEFAULT_SETTINGS,
 	MyPluginSettings,
@@ -22,7 +23,7 @@ import {
 // Remember to rename these classes and interfaces!
 
 export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+	settings: MyPluginSettings = { ...DEFAULT_SETTINGS };
 	/**
 	 * New UUID on every plugin load. Not persisted (avoids synced `.obsidian` giving every device the same id).
 	 * Convex `clientId` / leave / heartbeat all use this.
@@ -34,6 +35,7 @@ export default class MyPlugin extends Plugin {
 		client: ConvexClient;
 		url: string;
 	} | null = null;
+	private syncStatusBarItemEl: HTMLElement | null = null;
 
 	getPresenceSessionId(): string {
 		return this.presenceSessionId;
@@ -108,14 +110,43 @@ export default class MyPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "sync-vault-files",
+			name: "Sync vault files with Convex",
+			callback: () => {
+				this.syncStatusBarItemEl?.setText("Convex sync: starting...");
+				void runVaultFileSync({
+					app: this.app,
+					settings: this.settings,
+					getConvexHttpClient: () => this.getConvexHttpClient(),
+					getPresenceSessionId: () => this.getPresenceSessionId(),
+					reportSyncProgress: ({ phase, completed, total }) => {
+						const percent = total <= 0 ? 0 : Math.min(100, Math.round((completed / total) * 100));
+						this.syncStatusBarItemEl?.setText(
+							`Convex sync: ${percent}% (${completed}/${total}) - ${phase}`,
+						);
+					},
+				})
+					.then(() => {
+						this.syncStatusBarItemEl?.setText("Convex sync: complete");
+					})
+					.catch((err: unknown) => {
+					const message = err instanceof Error ? err.message : String(err);
+					new Notice(`Convex sync failed: ${message}`, 10000);
+					this.syncStatusBarItemEl?.setText("Convex sync: failed");
+					console.error(err);
+				});
+			},
+		});
+
 		// Dev: click the dice ribbon to fetch a random Convex task (reload Obsidian after rebuild).
 		this.addRibbonIcon("dice", "Convex sample task", () => {
 			void this.showRandomTaskNotice();
 		});
 
 		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
+		this.syncStatusBarItemEl = this.addStatusBarItem();
+		this.syncStatusBarItemEl.setText("Convex sync: idle");
 
 		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
@@ -170,7 +201,8 @@ export default class MyPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const disk = (await this.loadData()) as Record<string, unknown> &
+		const raw = await this.loadData();
+		const disk = (raw ?? {}) as Record<string, unknown> &
 			Partial<MyPluginSettings>;
 		const { presenceClientId: _legacyPresenceId, ...rest } = disk;
 		void _legacyPresenceId;

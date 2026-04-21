@@ -25,6 +25,7 @@
 	},
 	"dependencies": {
 		"convex": "^1.35.1",
+		"fflate": "^0.8.2",
 		"obsidian": "latest"
 	}
 }
