@@ -1,25 +1,17 @@
-import { v } from "convex/values";
-import { query } from "./_generated/server";
-import { requirePluginSecret } from "./security";
+import { authedQuery } from "./_lib/auth";
 
-export const get = query({
-	args: { convexSecret: v.string() },
-	handler: async (ctx, args) => {
-		await requirePluginSecret(ctx, args.convexSecret);
+export const get = authedQuery({}, async (ctx: any, args: any) => {
+		void args;
 		return await ctx.db.query("tasks").collect();
-	},
-});
+	});
 
 /** One task chosen at random on the server, or `null` if the table is empty. */
-export const getRandom = query({
-	args: { convexSecret: v.string() },
-	handler: async (ctx, args) => {
-		await requirePluginSecret(ctx, args.convexSecret);
+export const getRandom = authedQuery({}, async (ctx: any, args: any) => {
+		void args;
 		const tasks = await ctx.db.query("tasks").collect();
 		if (tasks.length === 0) {
 			return null;
 		}
 		const index = Math.floor(Math.random() * tasks.length);
 		return tasks[index] ?? null;
-	},
-});
+	});

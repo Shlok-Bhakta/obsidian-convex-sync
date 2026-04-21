@@ -1,32 +1,8 @@
 import { ConvexError, v } from "convex/values";
-import {
-	internalMutation,
-	mutation,
-	query,
-} from "./_generated/server";
+import { internalMutation, mutation, query } from "./_generated/server";
+import { PRESENCE_STALE_MS } from "./_lib/constants";
+import { editorCursor, emptyCursor } from "./_lib/validators";
 import { requirePluginSecret } from "./security";
-
-/** Three missed 10s heartbeats */
-const STALE_MS = 30_000;
-
-const editorPosition = v.object({
-	line: v.number(),
-	ch: v.number(),
-});
-
-const editorCursor = v.object({
-	anchor: editorPosition,
-	head: editorPosition,
-	from: editorPosition,
-	to: editorPosition,
-});
-
-const emptyCursor = {
-	anchor: { line: 0, ch: 0 },
-	head: { line: 0, ch: 0 },
-	from: { line: 0, ch: 0 },
-	to: { line: 0, ch: 0 },
-};
 
 export const listActive = query({
 	args: { convexSecret: v.string() },
@@ -35,7 +11,7 @@ export const listActive = query({
 		const now = Date.now();
 		const rows = await ctx.db.query("clientPresence").collect();
 		return rows
-			.filter((r) => now - r.lastHeartbeatAt <= STALE_MS)
+			.filter((r) => now - r.lastHeartbeatAt <= PRESENCE_STALE_MS)
 			.map((r) => ({
 				clientId: r.clientId,
 				openFilePath: r.openFilePath,
@@ -47,10 +23,7 @@ export const listActive = query({
 });
 
 export const heartbeat = mutation({
-	args: {
-		convexSecret: v.string(),
-		clientId: v.string(),
-	},
+	args: { convexSecret: v.string(), clientId: v.string() },
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		if (args.clientId.trim() === "") {
@@ -126,7 +99,7 @@ export const removeStalePresence = internalMutation({
 		const now = Date.now();
 		const rows = await ctx.db.query("clientPresence").collect();
 		for (const row of rows) {
-			if (now - row.lastHeartbeatAt > STALE_MS) {
+			if (now - row.lastHeartbeatAt > PRESENCE_STALE_MS) {
 				await ctx.db.delete(row._id);
 			}
 		}

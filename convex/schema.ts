@@ -1,17 +1,6 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
-
-const editorPosition = v.object({
-	line: v.number(),
-	ch: v.number(),
-});
-
-const editorCursor = v.object({
-	anchor: editorPosition,
-	head: editorPosition,
-	from: editorPosition,
-	to: editorPosition,
-});
+import { editorCursor } from "./_lib/validators";
 
 export default defineSchema({
 	tasks: defineTable({

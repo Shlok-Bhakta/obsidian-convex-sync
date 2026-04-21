@@ -1,8 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { OBSIDIAN_BUNDLE_SCOPE } from "./_lib/constants";
 import { requirePluginSecret } from "./security";
-
-const OBSIDIAN_BUNDLE_SCOPE = "obsidian_bundle_v1";
 
 function normalizePath(input: string): string {
 	const normalized = input.trim().replace(/\\/g, "/").replace(/^\/+/, "");
