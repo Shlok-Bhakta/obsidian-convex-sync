@@ -1,13 +1,21 @@
-import {App, PluginSettingTab, Setting} from "obsidian";
+import {App, Notice, PluginSettingTab, Setting} from "obsidian";
 import MyPlugin from "./main";
 
 export interface MyPluginSettings {
-	mySetting: string;
+	convexUrl: string;
+	convexSiteUrl: string;
+	/** Sent with Convex calls so the backend can verify the client. Issued once from the deployment (HTTP mint); never generated in Obsidian. */
+	convexSecret: string;
+	/** Deployment URL for which {@link convexSecret} was successfully registered (empty if not yet). */
+	convexSecretDeployedToUrl: string;
 }
 
 export const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
+	convexUrl: "http://127.0.0.1:3210",
+	convexSiteUrl: "http://127.0.0.1:3211",
+	convexSecret: "",
+	convexSecretDeployedToUrl: "",
+};
 
 export class SampleSettingTab extends PluginSettingTab {
 	plugin: MyPlugin;
@@ -23,14 +31,73 @@ export class SampleSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Settings #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
+			.setName("Convex URL")
+			.setDesc("Deployment URL (CONVEX_URL).")
+			.addText(text =>
+				text
+					.setPlaceholder("http://...")
+					.setValue(this.plugin.settings.convexUrl)
+					.onChange(async value => {
+						this.plugin.settings.convexUrl = value;
+						await this.plugin.saveSettings();
+						await this.plugin.ensureConvexSecretRegisteredWithDeployment();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Convex site URL")
+			.setDesc("Site URL for HTTP routes (CONVEX_SITE_URL). Required before you can mint a vault API key below.")
+			.addText(text =>
+				text
+					.setPlaceholder("http://...")
+					.setValue(this.plugin.settings.convexSiteUrl)
+					.onChange(async value => {
+						this.plugin.settings.convexSiteUrl = value;
+						await this.plugin.saveSettings();
+						this.display();
+					}),
+			);
+
+		const canMint =
+			this.plugin.settings.convexSiteUrl.trim() !== "" &&
+			this.plugin.settings.convexSecret.trim() === "";
+
+		new Setting(containerEl)
+			.setName("Mint vault API key")
+			.setDesc(
+				"Request a one-time server-generated key from your Convex deployment. Set Convex site URL first. If this deployment already has a key, mint is denied; use the original vault or clear pluginAuth in the Convex dashboard.",
+			)
+			.addButton(button =>
+				button
+					.setButtonText("Mint from Convex")
+					.setTooltip(
+						canMint
+							? "Call the deployment HTTP mint endpoint once"
+							: "Set site URL and ensure no key is stored yet",
+					)
+					.setDisabled(!canMint)
+					.onClick(async () => {
+						button.setDisabled(true);
+						try {
+							await this.plugin.mintVaultSecretFromDeployment();
+						} catch (err) {
+							console.error(err);
+							new Notice(
+								"Convex: mint failed unexpectedly. Check the console.",
+								10000,
+							);
+						}
+						this.display();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Convex secret")
+			.setDesc(
+				"Shared secret sent to Convex (CONVEX_SECRET). Mint it with the button above; keep it private.",
+			)
+			.addText(text => {
+				text.setValue(this.plugin.settings.convexSecret).setDisabled(true);
+			});
 	}
 }

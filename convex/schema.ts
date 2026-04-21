@@ -6,4 +6,8 @@ export default defineSchema({
 		text: v.string(),
 		isCompleted: v.boolean(),
 	}),
+	/** At most one row: shared vault API key for this deployment. */
+	pluginAuth: defineTable({
+		secret: v.string(),
+	}),
 });
