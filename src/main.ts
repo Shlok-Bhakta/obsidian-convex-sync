@@ -1,15 +1,43 @@
-import { ConvexHttpClient } from "convex/browser";
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
+import { ConvexClient, ConvexHttpClient } from "convex/browser";
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, WorkspaceLeaf } from "obsidian";
 import { api } from "../convex/_generated/api";
+import {
+	ClientsPresenceView,
+	CLIENTS_PRESENCE_VIEW_TYPE,
+	leaveClientsPresence,
+	revealClientsPresenceView,
+	startClientsPresence,
+} from "./clients-presence";
 import { createConvexHttpClient } from "./convex-client";
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import {
+	ensureVaultSecretRegisteredWithDeployment,
+	mintVaultApiSecretFromConvexSite,
+} from "./security";
+import {
+	DEFAULT_SETTINGS,
+	MyPluginSettings,
+	SampleSettingTab,
+} from "./settings";
 
 // Remember to rename these classes and interfaces!
 
 export default class MyPlugin extends Plugin {
 	settings: MyPluginSettings;
+	/**
+	 * New UUID on every plugin load. Not persisted (avoids synced `.obsidian` giving every device the same id).
+	 * Convex `clientId` / leave / heartbeat all use this.
+	 */
+	private presenceSessionId = "";
 	private convexHttpClientCache: { client: ConvexHttpClient; url: string } | null =
 		null;
+	private convexRealtimeClientCache: {
+		client: ConvexClient;
+		url: string;
+	} | null = null;
+
+	getPresenceSessionId(): string {
+		return this.presenceSessionId;
+	}
 
 	/**
 	 * Convex HTTP client using **Settings → Convex URL**, not `.env.local`.
@@ -29,9 +57,56 @@ export default class MyPlugin extends Plugin {
 		return this.convexHttpClientCache.client;
 	}
 
+	/**
+	 * WebSocket client for live queries (e.g. connected clients). Recreated when the deployment URL changes.
+	 */
+	getConvexRealtimeClient(): ConvexClient | null {
+		const url = this.settings.convexUrl.trim();
+		const secret = this.settings.convexSecret.trim();
+		if (!url || !secret) {
+			void this.convexRealtimeClientCache?.client.close();
+			this.convexRealtimeClientCache = null;
+			return null;
+		}
+		if (
+			!this.convexRealtimeClientCache ||
+			this.convexRealtimeClientCache.url !== url
+		) {
+			void this.convexRealtimeClientCache?.client.close();
+			this.convexRealtimeClientCache = {
+				client: new ConvexClient(url),
+				url,
+			};
+		}
+		return this.convexRealtimeClientCache.client;
+	}
+
 	async onload() {
 		await this.loadSettings();
+		this.presenceSessionId = crypto.randomUUID();
 		await this.ensureConvexSecretRegisteredWithDeployment();
+
+		this.registerView(
+			CLIENTS_PRESENCE_VIEW_TYPE,
+			(leaf: WorkspaceLeaf) => new ClientsPresenceView(leaf, this),
+		);
+
+		const stopClientsPresence = startClientsPresence(this);
+		this.register(() => {
+			stopClientsPresence();
+		});
+
+		this.addRibbonIcon("users", "Open connected clients", () => {
+			void revealClientsPresenceView(this.app);
+		});
+
+		this.addCommand({
+			id: "open-connected-clients",
+			name: "Open connected clients",
+			callback: () => {
+				void revealClientsPresenceView(this.app);
+			},
+		});
 
 		// Dev: click the dice ribbon to fetch a random Convex task (reload Obsidian after rebuild).
 		this.addRibbonIcon("dice", "Convex sample task", () => {
@@ -88,145 +163,45 @@ export default class MyPlugin extends Plugin {
 	}
 
 	onunload() {
+		void leaveClientsPresence(this);
+		void this.convexRealtimeClientCache?.client.close();
+		this.convexRealtimeClientCache = null;
 		this.convexHttpClientCache = null;
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
-		);
+		const disk = (await this.loadData()) as Record<string, unknown> &
+			Partial<MyPluginSettings>;
+		const { presenceClientId: _legacyPresenceId, ...rest } = disk;
+		void _legacyPresenceId;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, rest);
 	}
 
-	/**
-	 * Fetches a one-time vault API key from Convex HTTP (server-side Node `randomUUID`).
-	 * Call from settings after Convex site URL is set. No client-side crypto.
-	 */
+	/** Delegates to {@link mintVaultApiSecretFromConvexSite} for settings UI. */
 	async mintVaultSecretFromDeployment(): Promise<boolean> {
-		if (this.settings.convexSecret.trim() !== "") {
-			new Notice(
-				"Convex: this vault already has an API key. Clear plugin data only if you intend to replace it.",
-				10000,
-			);
-			return false;
-		}
-		const secret = await this.requestMintedSecretFromConvexSite();
-		if (!secret) {
-			return false;
-		}
-		this.settings.convexSecret = secret;
-		await this.saveData(this.settings);
-		new Notice("Convex: vault API key saved.", 6000);
-		await this.ensureConvexSecretRegisteredWithDeployment();
-		return true;
-	}
-
-	/**
-	 * POST to the deployment site mint route; returns the secret body or null on failure.
-	 */
-	private async requestMintedSecretFromConvexSite(): Promise<string | null> {
-		const base = this.settings.convexSiteUrl.trim().replace(/\/$/, "");
-		if (!base) {
-			new Notice(
-				"Convex: set Convex site URL in settings to obtain a vault API key.",
-				10000,
-			);
-			return null;
-		}
-		const url = `${base}/obsidian-convex-sync/mint-vault-api-secret`;
-		try {
-			const res = await fetch(url, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: "{}",
-				cache: "no-store",
-			});
-			const text = await res.text();
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(text) as unknown;
-			} catch {
-				new Notice(
-					`Convex: invalid response from vault key mint (${res.status}).`,
-					10000,
-				);
-				return null;
-			}
-			if (!parsed || typeof parsed !== "object") {
-				new Notice("Convex: unexpected mint response.", 8000);
-				return null;
-			}
-			const body = parsed as {
-				ok?: unknown;
-				secret?: unknown;
-				message?: unknown;
-			};
-			if (
-				body.ok === true &&
-				typeof body.secret === "string" &&
-				body.secret.length > 0
-			) {
-				return body.secret;
-			}
-			if (body.ok === false) {
-				const msg =
-					typeof body.message === "string" && body.message.length > 0
-						? body.message
-						: "Access denied: uuid already registered for this deployment.";
-				new Notice(msg, 12000);
-				return null;
-			}
-			new Notice("Convex: unexpected mint response.", 8000);
-			return null;
-		} catch (err) {
-			const message =
-				err instanceof Error ? err.message : String(err);
-			new Notice(
-				`Convex: could not obtain vault API key: ${message}`,
-				10000,
-			);
-			console.error(err);
-			return null;
-		}
+		return mintVaultApiSecretFromConvexSite({
+			settings: this.settings,
+			saveSettings: () => this.saveSettings(),
+			ensureRegistered: () =>
+				this.ensureConvexSecretRegisteredWithDeployment(),
+		});
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
 
-	/**
-	 * Registers this vault's API key with Convex when the table is empty, or verifies it matches.
-	 * Skipped when URL is unchanged and registration already succeeded.
-	 */
 	async ensureConvexSecretRegisteredWithDeployment(): Promise<void> {
-		const url = this.settings.convexUrl.trim();
-		if (!url || !this.settings.convexSecret.trim()) {
-			return;
-		}
-		if (this.settings.convexSecretDeployedToUrl === url) {
-			return;
-		}
-		try {
-			const client = this.getConvexHttpClient();
-			const result = await client.mutation(api.security.registerPluginSecret, {
-				proposedSecret: this.settings.convexSecret,
-			});
-			if (!result.ok) {
-				new Notice(result.message, 12000);
-				return;
-			}
-			this.settings.convexSecretDeployedToUrl = url;
-			await this.saveSettings();
-		} catch (err) {
-			const message =
-				err instanceof Error ? err.message : String(err);
-			new Notice(
-				`Convex: could not register vault API key: ${message}`,
-				10000,
-			);
-			console.error(err);
-		}
+		return ensureVaultSecretRegisteredWithDeployment({
+			convexUrl: this.settings.convexUrl,
+			convexSecret: this.settings.convexSecret,
+			convexSecretDeployedToUrl: this.settings.convexSecretDeployedToUrl,
+			getClient: () => this.getConvexHttpClient(),
+			markSecretDeployedToUrl: async url => {
+				this.settings.convexSecretDeployedToUrl = url;
+				await this.saveSettings();
+			},
+		});
 	}
 
 	private async showRandomTaskNotice(): Promise<void> {
