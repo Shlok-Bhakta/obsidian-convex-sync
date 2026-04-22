@@ -88,6 +88,16 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 					});
 			},
 		});
+		this.addCommand({
+			id: "generate-bootstrap-link",
+			name: "Generate vault bootstrap link (10 min)",
+			callback: () => {
+				new Notice(
+					"Open plugin settings and use Bootstrap new device to generate the link.",
+					6000,
+				);
+			},
+		});
 
 		this.syncStatusBarItemEl = this.addStatusBarItem();
 		this.syncStatusBarItemEl.setText("Convex sync: idle");

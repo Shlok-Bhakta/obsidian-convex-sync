@@ -19,7 +19,6 @@ import type * as fileSync from "../fileSync.js";
 import type * as http from "../http.js";
 import type * as pluginSecretMint from "../pluginSecretMint.js";
 import type * as security from "../security.js";
-import type * as tasks from "../tasks.js";
 
 import type {
   ApiFromModules,
@@ -39,7 +38,6 @@ declare const fullApi: ApiFromModules<{
   http: typeof http;
   pluginSecretMint: typeof pluginSecretMint;
   security: typeof security;
-  tasks: typeof tasks;
 }>;
 
 /**
