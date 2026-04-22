@@ -1,10 +1,5 @@
 import { ConvexError, v } from "convex/values";
-import {
-	internalMutation,
-	internalQuery,
-	mutation,
-} from "./_generated/server";
-import { internal } from "./_generated/api";
+import { internalMutation, mutation } from "./_generated/server";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 
 /**
@@ -33,21 +28,6 @@ export const claimInitialPluginSecret = internalMutation({
 	},
 });
 
-export const validatePluginSecret = internalQuery({
-	args: { secret: v.string() },
-	handler: async (ctx, args) => {
-		const rows = await ctx.db.query("pluginAuth").take(1);
-		const row = rows[0];
-		if (!row) {
-			return { ok: false as const, reason: "not_configured" as const };
-		}
-		if (row.secret !== args.secret) {
-			return { ok: false as const, reason: "invalid" as const };
-		}
-		return { ok: true as const };
-	},
-});
-
 /**
  * Throws if the client secret does not match the single stored deployment secret.
  * Call from every public query/mutation except {@link registerPluginSecret}.
@@ -56,15 +36,14 @@ export async function requirePluginSecret(
 	ctx: QueryCtx | MutationCtx,
 	secret: string,
 ): Promise<void> {
-	const result = await ctx.runQuery(internal.security.validatePluginSecret, {
-		secret,
-	});
-	if (!result.ok) {
-		if (result.reason === "not_configured") {
-			throw new ConvexError(
-				"No vault API key is registered for this Convex deployment yet. Reload the plugin or run registration from settings.",
-			);
-		}
+	const rows = await ctx.db.query("pluginAuth").take(1);
+	const row = rows[0];
+	if (!row) {
+		throw new ConvexError(
+			"No vault API key is registered for this Convex deployment yet. Reload the plugin or run registration from settings.",
+		);
+	}
+	if (row.secret !== secret) {
 		throw new ConvexError(
 			"The vault API key does not match the one registered for this deployment. Check that this vault uses the same Obsidian plugin data as the vault that first connected, or reset pluginAuth in Convex if you are starting over.",
 		);

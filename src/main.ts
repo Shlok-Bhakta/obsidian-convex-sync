@@ -18,12 +18,14 @@ import {
 	ConvexSyncSettingTab,
 	type MyPluginSettings,
 } from "./settings";
+import { LiveSyncEngine } from "./sync";
 
 export default class ObsidianConvexSyncPlugin extends Plugin {
 	settings: MyPluginSettings = { ...DEFAULT_SETTINGS };
 	private presenceSessionId = "";
 	private convex = new ConvexClientManager(() => this.settings);
 	private syncStatusBarItemEl: HTMLElement | null = null;
+	private liveSyncEngine: LiveSyncEngine | null = null;
 
 	getPresenceSessionId(): string {
 		return this.presenceSessionId;
@@ -32,6 +34,7 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 	getConvexHttpClient = () => this.convex.getHttp();
 	getConvexRealtimeClient = () => this.convex.getRealtime();
 	getKeepaliveHttpClient = () => this.convex.getKeepaliveHttp();
+	setSyncStatus = (message: string) => this.syncStatusBarItemEl?.setText(message);
 
 	async onload() {
 		await this.loadSettings();
@@ -42,6 +45,9 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			CLIENTS_PRESENCE_VIEW_TYPE,
 			(leaf: WorkspaceLeaf) => new ClientsPresenceView(leaf, this),
 		);
+
+		this.syncStatusBarItemEl = this.addStatusBarItem();
+		this.syncStatusBarItemEl.setText("Convex sync: idle");
 
 		const stopClientsPresence = startClientsPresence(this);
 		this.register(() => {
@@ -99,13 +105,15 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			},
 		});
 
-		this.syncStatusBarItemEl = this.addStatusBarItem();
-		this.syncStatusBarItemEl.setText("Convex sync: idle");
 		this.addSettingTab(new ConvexSyncSettingTab(this.app, this));
+
+		this.liveSyncEngine = await LiveSyncEngine.create(this);
 
 	}
 
 	onunload() {
+		this.liveSyncEngine?.stop();
+		this.liveSyncEngine = null;
 		void leaveClientsPresence(this);
 		this.convex.dispose();
 	}

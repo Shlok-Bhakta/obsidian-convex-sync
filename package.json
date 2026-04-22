@@ -24,6 +24,10 @@
 		"typescript-eslint": "8.35.1"
 	},
 	"dependencies": {
+		"@automerge/automerge": "^3.2.6",
+		"@automerge/automerge-repo": "^2.5.5",
+		"@automerge/automerge-repo-storage-indexeddb": "^2.5.5",
+		"@convex-dev/migrations": "^0.3.3",
 		"convex": "^1.35.1",
 		"fflate": "^0.8.2",
 		"obsidian": "latest"

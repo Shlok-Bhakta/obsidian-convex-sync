@@ -10,4 +10,18 @@ crons.interval(
 	{},
 );
 
+crons.interval(
+	"Compact hot live-sync docs",
+	{ minutes: 15 },
+	internal.sync.compactHotDocs,
+	{},
+);
+
+crons.cron(
+	"Sweep expired trashed docs",
+	"0 3 * * *",
+	internal.sync.sweepTrash,
+	{},
+);
+
 export default crons;

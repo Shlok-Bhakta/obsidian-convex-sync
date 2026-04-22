@@ -3,6 +3,10 @@ export interface MyPluginSettings {
 	convexSiteUrl: string;
 	convexSecret: string;
 	convexSecretDeployedToUrl: string;
+	binaryVersionRetention: number;
+	trashRetentionDays: number;
+	liveSyncEnabled: boolean;
+	editorKeystrokeBatchMs: number;
 }
 
 export const DEFAULT_SETTINGS: MyPluginSettings = {
@@ -10,6 +14,10 @@ export const DEFAULT_SETTINGS: MyPluginSettings = {
 	convexSiteUrl: "http://127.0.0.1:3211",
 	convexSecret: "",
 	convexSecretDeployedToUrl: "",
+	binaryVersionRetention: 5,
+	trashRetentionDays: 30,
+	liveSyncEnabled: true,
+	editorKeystrokeBatchMs: 15,
 };
 
 export function normalizeLoadedSettings(raw: unknown): MyPluginSettings {
@@ -18,5 +26,24 @@ export function normalizeLoadedSettings(raw: unknown): MyPluginSettings {
 	};
 	const { presenceClientId: _legacyPresenceId, ...rest } = disk;
 	void _legacyPresenceId;
-	return Object.assign({}, DEFAULT_SETTINGS, rest);
+	return {
+		...DEFAULT_SETTINGS,
+		...rest,
+		binaryVersionRetention:
+			typeof disk.binaryVersionRetention === "number"
+				? disk.binaryVersionRetention
+				: DEFAULT_SETTINGS.binaryVersionRetention,
+		trashRetentionDays:
+			typeof disk.trashRetentionDays === "number"
+				? disk.trashRetentionDays
+				: DEFAULT_SETTINGS.trashRetentionDays,
+		liveSyncEnabled:
+			typeof disk.liveSyncEnabled === "boolean"
+				? disk.liveSyncEnabled
+				: DEFAULT_SETTINGS.liveSyncEnabled,
+		editorKeystrokeBatchMs:
+			typeof disk.editorKeystrokeBatchMs === "number"
+				? disk.editorKeystrokeBatchMs
+				: DEFAULT_SETTINGS.editorKeystrokeBatchMs,
+	};
 }

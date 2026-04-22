@@ -132,6 +132,63 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 				text.setValue(this.plugin.settings.convexSecret).setDisabled(true);
 			});
 
+		new Setting(containerEl)
+			.setName("Enable live sync")
+			.setDesc(
+				"Use the new continuous sync engine for normal vault files. Turn this off to fall back to manual full sync.",
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.liveSyncEnabled).onChange(async (value) => {
+					this.plugin.settings.liveSyncEnabled = value;
+					await this.plugin.saveSettings();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Binary version retention")
+			.setDesc("How many historical binary versions to keep per file.")
+			.addText((text) =>
+				text
+					.setValue(String(this.plugin.settings.binaryVersionRetention))
+					.onChange(async (value) => {
+						const parsed = Number(value);
+						this.plugin.settings.binaryVersionRetention = Number.isFinite(parsed)
+							? parsed
+							: this.plugin.settings.binaryVersionRetention;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Trash retention (days)")
+			.setDesc("How long deleted files stay in .trash before server GC removes them.")
+			.addText((text) =>
+				text
+					.setValue(String(this.plugin.settings.trashRetentionDays))
+					.onChange(async (value) => {
+						const parsed = Number(value);
+						this.plugin.settings.trashRetentionDays = Number.isFinite(parsed)
+							? parsed
+							: this.plugin.settings.trashRetentionDays;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Editor batch window (ms)")
+			.setDesc("Debounce window for bundling local editor changes before sending ops.")
+			.addText((text) =>
+				text
+					.setValue(String(this.plugin.settings.editorKeystrokeBatchMs))
+					.onChange(async (value) => {
+						const parsed = Number(value);
+						this.plugin.settings.editorKeystrokeBatchMs = Number.isFinite(parsed)
+							? parsed
+							: this.plugin.settings.editorKeystrokeBatchMs;
+						await this.plugin.saveSettings();
+					}),
+			);
+
 		this.renderBootstrapSection(containerEl);
 		if (!this.hasHydratedBootstrapState) {
 			this.hasHydratedBootstrapState = true;

@@ -11,14 +11,17 @@
 import type * as _lib_auth from "../_lib/auth.js";
 import type * as _lib_constants from "../_lib/constants.js";
 import type * as _lib_storage_finalize from "../_lib/storage_finalize.js";
+import type * as _lib_sync from "../_lib/sync.js";
 import type * as _lib_validators from "../_lib/validators.js";
 import type * as bootstrap from "../bootstrap.js";
 import type * as clients from "../clients.js";
 import type * as crons from "../crons.js";
 import type * as fileSync from "../fileSync.js";
 import type * as http from "../http.js";
+import type * as migrations from "../migrations.js";
 import type * as pluginSecretMint from "../pluginSecretMint.js";
 import type * as security from "../security.js";
+import type * as sync from "../sync.js";
 
 import type {
   ApiFromModules,
@@ -30,14 +33,17 @@ declare const fullApi: ApiFromModules<{
   "_lib/auth": typeof _lib_auth;
   "_lib/constants": typeof _lib_constants;
   "_lib/storage_finalize": typeof _lib_storage_finalize;
+  "_lib/sync": typeof _lib_sync;
   "_lib/validators": typeof _lib_validators;
   bootstrap: typeof bootstrap;
   clients: typeof clients;
   crons: typeof crons;
   fileSync: typeof fileSync;
   http: typeof http;
+  migrations: typeof migrations;
   pluginSecretMint: typeof pluginSecretMint;
   security: typeof security;
+  sync: typeof sync;
 }>;
 
 /**
@@ -66,4 +72,6 @@ export declare const internal: FilterApi<
   FunctionReference<any, "internal">
 >;
 
-export declare const components: {};
+export declare const components: {
+  migrations: import("@convex-dev/migrations/_generated/component.js").ComponentApi<"migrations">;
+};
