@@ -3,6 +3,7 @@ import { EditorView } from "@codemirror/view";
 import { ConvexHttpClient, type ConvexClient } from "convex/browser";
 import {
 	App,
+	Notice,
 	Editor,
 	EventRef,
 	MarkdownView,
@@ -11,6 +12,8 @@ import {
 } from "obsidian";
 import { api } from "../../convex/_generated/api";
 import type { MyPluginSettings } from "../settings";
+import { createPresenceDecorations } from "./editor-decorations";
+import type { PresenceRow } from "./types";
 
 const HEARTBEAT_MS = 10_000;
 const CURSOR_DEBOUNCE_MS = 200;
@@ -36,6 +39,12 @@ export type ClientsPresenceHost = {
 		callback: (this: HTMLElement, ev: WindowEventMap[K]) => unknown,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+};
+
+type ClientsListUnsubscribe = {
+	(): void;
+	unsubscribe(): void;
+	getCurrentValue(): PresenceRow[] | undefined;
 };
 
 function readCursorFromEditor(editor: Editor) {
@@ -77,6 +86,11 @@ export function leaveClientsPresence(host: ClientsPresenceHost): void {
 
 export function startClientsPresence(host: ClientsPresenceHost): () => void {
 	const teardowns: Array<() => void> = [];
+	const decorations = createPresenceDecorations(
+		host.app,
+		host.getPresenceSessionId(),
+	);
+	host.registerEditorExtension(decorations.extension);
 
 	const canRun = (): boolean =>
 		host.settings.convexUrl.trim() !== "" &&
@@ -102,6 +116,26 @@ export function startClientsPresence(host: ClientsPresenceHost): () => void {
 			.catch(() => {});
 	};
 
+	const client = host.getConvexRealtimeClient();
+	if (canRun() && client) {
+		const listUnsub = client.onUpdate(
+			api.clients.listActive,
+			{ convexSecret: host.settings.convexSecret },
+			(rows) => {
+				decorations.setRows(rows as PresenceRow[]);
+			},
+			(err) => {
+				new Notice(`Convex presence subscription failed: ${err.message}`, 8000);
+				console.error(err);
+			},
+		) as ClientsListUnsubscribe;
+		teardowns.push(() => listUnsub());
+		const initialRows = listUnsub.getCurrentValue();
+		if (initialRows) {
+			decorations.setRows(initialRows);
+		}
+	}
+
 	const sendHeartbeat = (): void => {
 		if (!canRun()) {
 			return;
@@ -121,6 +155,7 @@ export function startClientsPresence(host: ClientsPresenceHost): () => void {
 	};
 
 	sendHeartbeat();
+	pushPresence();
 	const interval = window.setInterval(sendHeartbeat, HEARTBEAT_MS);
 	host.registerInterval(interval);
 	teardowns.push(() => window.clearInterval(interval));
@@ -158,8 +193,18 @@ export function startClientsPresence(host: ClientsPresenceHost): () => void {
 		}),
 	);
 
-	host.registerEvent(host.app.workspace.on("active-leaf-change", pushPresence));
-	host.registerEvent(host.app.workspace.on("file-open", pushPresence));
+	host.registerEvent(
+		host.app.workspace.on("active-leaf-change", () => {
+			pushPresence();
+			decorations.refresh();
+		}),
+	);
+	host.registerEvent(
+		host.app.workspace.on("file-open", () => {
+			pushPresence();
+			decorations.refresh();
+		}),
+	);
 	host.registerEvent(host.app.workspace.on("quit", () => leaveClientsPresence(host)));
 
 	if (Platform.isDesktopApp) {

@@ -191,7 +191,11 @@ export class LiveSyncEngine {
 	}
 
 	private async handleLocalModify(file: TAbstractFile): Promise<void> {
-		if (!(file instanceof TFile) || !isManagedSyncPath(file.path) || this.isSuppressed(file.path)) {
+		if (
+			!(file instanceof TFile) ||
+			!isManagedSyncPath(file.path, this.host.settings.syncIgnorePaths) ||
+			this.isSuppressed(file.path)
+		) {
 			return;
 		}
 		if (kindForAbstractFile(file) === "binary") {
@@ -202,7 +206,10 @@ export class LiveSyncEngine {
 	}
 
 	private async handleLocalCreate(file: TAbstractFile): Promise<void> {
-		if (!isManagedSyncPath(file.path) || this.isSuppressed(file.path)) {
+		if (
+			!isManagedSyncPath(file.path, this.host.settings.syncIgnorePaths) ||
+			this.isSuppressed(file.path)
+		) {
 			return;
 		}
 		if (file instanceof TFolder) {
@@ -219,7 +226,10 @@ export class LiveSyncEngine {
 	}
 
 	private async handleLocalDelete(file: TAbstractFile): Promise<void> {
-		if (!isManagedSyncPath(file.path) || this.isSuppressed(file.path)) {
+		if (
+			!isManagedSyncPath(file.path, this.host.settings.syncIgnorePaths) ||
+			this.isSuppressed(file.path)
+		) {
 			return;
 		}
 		const docId = this.docIdByPath.get(file.path);
@@ -238,7 +248,10 @@ export class LiveSyncEngine {
 	}
 
 	private async handleLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
-		if (!isManagedSyncPath(file.path) || this.isSuppressed(file.path)) {
+		if (
+			!isManagedSyncPath(file.path, this.host.settings.syncIgnorePaths) ||
+			this.isSuppressed(file.path)
+		) {
 			return;
 		}
 		const docId = this.docIdByPath.get(oldPath);

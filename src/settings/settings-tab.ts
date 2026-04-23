@@ -1,5 +1,6 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ObsidianConvexSyncPlugin from "../main";
+import { DEFAULT_SYNC_IGNORE_PATHS, normalizeSyncIgnorePaths } from "../sync-ignore";
 import {
 	cancelBootstrap,
 	readBootstrapStatus,
@@ -188,6 +189,28 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}),
 			);
+
+		new Setting(containerEl)
+			.setName("Sync ignore paths")
+			.setDesc(
+				`One path per line. Add a trailing / to ignore a whole folder. Defaults: ${DEFAULT_SYNC_IGNORE_PATHS.join(", ")}.`,
+			)
+			.addTextArea((text) => {
+				text
+					.setPlaceholder(".obsidian/cache/\n.obsidian/workspace.json")
+					.setValue(this.plugin.settings.syncIgnorePaths.join("\n"))
+					.onChange(async (value) => {
+						this.plugin.settings.syncIgnorePaths = normalizeSyncIgnorePaths(
+							value
+								.split("\n")
+								.map((line) => line.trim())
+								.filter((line) => line !== ""),
+						);
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.rows = 6;
+				text.inputEl.style.width = "100%";
+			});
 
 		this.renderBootstrapSection(containerEl);
 		if (!this.hasHydratedBootstrapState) {

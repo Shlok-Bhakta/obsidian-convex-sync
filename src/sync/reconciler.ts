@@ -28,7 +28,7 @@ export async function bootstrapLocalState(
 ): Promise<void> {
 	const remoteByPath = new Map(remoteDocs.map((doc) => [doc.path, doc]));
 	for (const entry of host.app.vault.getAllLoadedFiles()) {
-		if (!isManagedSyncPath(entry.path)) {
+		if (!isManagedSyncPath(entry.path, host.settings.syncIgnorePaths)) {
 			continue;
 		}
 		const remote = remoteByPath.get(entry.path);

@@ -1,4 +1,5 @@
 import { normalizePath, TAbstractFile, TFile, TFolder } from "obsidian";
+import { matchesSyncIgnorePath } from "../sync-ignore";
 
 const BINARY_EXTENSIONS = new Set([
 	"7z",
@@ -55,14 +56,15 @@ export function folderPathForFile(filePath: string): string | null {
 	return slash < 0 ? null : filePath.slice(0, slash);
 }
 
-export function isManagedSyncPath(path: string): boolean {
+export function isManagedSyncPath(path: string, ignorePaths: string[] = []): boolean {
 	const normalized = normalizeVaultPath(path);
 	return (
 		normalized !== "" &&
 		!normalized.startsWith(`${LIVE_SYNC_TRASH_ROOT}/`) &&
 		normalized !== LIVE_SYNC_TRASH_ROOT &&
 		!normalized.startsWith(".obsidian/") &&
-		normalized !== ".obsidian"
+		normalized !== ".obsidian" &&
+		!matchesSyncIgnorePath(normalized, ignorePaths)
 	);
 }
 

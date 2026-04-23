@@ -12,6 +12,7 @@ import {
 	ensureVaultSecretRegisteredWithDeployment,
 	mintVaultApiSecretFromConvexSite,
 } from "./security";
+import { startObsidianConfigSync } from "./obsidian-config-sync";
 import {
 	normalizeLoadedSettings,
 	DEFAULT_SETTINGS,
@@ -52,6 +53,10 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 		const stopClientsPresence = startClientsPresence(this);
 		this.register(() => {
 			stopClientsPresence();
+		});
+		const stopObsidianConfigSync = startObsidianConfigSync(this);
+		this.register(() => {
+			stopObsidianConfigSync();
 		});
 
 		this.addRibbonIcon("users", "Open connected clients", () => {

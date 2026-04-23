@@ -59,6 +59,18 @@ function initTextDoc(text = ""): Automerge.Doc<TextDoc> {
 	return Automerge.from<TextDoc>({ text });
 }
 
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+	const binary = atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index += 1) {
+		bytes[index] = binary.charCodeAt(index);
+	}
+	return bytes.buffer.slice(
+		bytes.byteOffset,
+		bytes.byteOffset + bytes.byteLength,
+	) as ArrayBuffer;
+}
+
 async function snapshotUrl(ctx: any, storageId: any) {
 	if (!storageId) {
 		return null;
@@ -301,7 +313,8 @@ export const appendOps = mutation({
 		ops: v.array(
 			v.object({
 				clientSeq: v.number(),
-				changeBytes: v.bytes(),
+				changeBytes: v.optional(v.bytes()),
+				changeBytesBase64: v.optional(v.string()),
 				timestampMs: v.number(),
 			}),
 		),
@@ -314,7 +327,20 @@ export const appendOps = mutation({
 		if (args.ops.length > MAX_APPEND_OPS) {
 			throw new ConvexError(`appendOps accepts at most ${MAX_APPEND_OPS} ops per call.`);
 		}
-		const payloadBytes = args.ops.reduce(
+		const ops = args.ops.map((op) => {
+			const changeBytes =
+				op.changeBytes ??
+				(op.changeBytesBase64 ? base64ToArrayBuffer(op.changeBytesBase64) : null);
+			if (!changeBytes) {
+				throw new ConvexError("appendOps requires changeBytes.");
+			}
+			return {
+				clientSeq: op.clientSeq,
+				changeBytes,
+				timestampMs: op.timestampMs,
+			};
+		});
+		const payloadBytes = ops.reduce(
 			(total, op) => total + op.changeBytes.byteLength,
 			0,
 		);
@@ -330,7 +356,7 @@ export const appendOps = mutation({
 		}
 		let seq = doc.latestSeq;
 		const assignedSeqs: number[] = [];
-		for (const op of args.ops) {
+		for (const op of ops) {
 			const dup = await ctx.db
 				.query("docOps")
 				.withIndex("by_client_seq", (q: any) =>

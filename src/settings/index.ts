@@ -1,8 +1,11 @@
+import { DEFAULT_SYNC_IGNORE_PATHS, normalizeSyncIgnorePaths } from "../sync-ignore";
+
 export interface MyPluginSettings {
 	convexUrl: string;
 	convexSiteUrl: string;
 	convexSecret: string;
 	convexSecretDeployedToUrl: string;
+	syncIgnorePaths: string[];
 	binaryVersionRetention: number;
 	trashRetentionDays: number;
 	liveSyncEnabled: boolean;
@@ -14,6 +17,7 @@ export const DEFAULT_SETTINGS: MyPluginSettings = {
 	convexSiteUrl: "http://127.0.0.1:3211",
 	convexSecret: "",
 	convexSecretDeployedToUrl: "",
+	syncIgnorePaths: [...DEFAULT_SYNC_IGNORE_PATHS],
 	binaryVersionRetention: 5,
 	trashRetentionDays: 30,
 	liveSyncEnabled: true,
@@ -29,6 +33,7 @@ export function normalizeLoadedSettings(raw: unknown): MyPluginSettings {
 	return {
 		...DEFAULT_SETTINGS,
 		...rest,
+		syncIgnorePaths: normalizeSyncIgnorePaths(disk.syncIgnorePaths),
 		binaryVersionRetention:
 			typeof disk.binaryVersionRetention === "number"
 				? disk.binaryVersionRetention

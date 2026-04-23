@@ -2,20 +2,9 @@ import { Notice, WorkspaceLeaf, ItemView, App } from "obsidian";
 import { api } from "../../convex/_generated/api";
 import { formatCursor, shortClientId } from "./formatting";
 import type { ClientsPresenceHost } from "./service";
+import type { PresenceRow } from "./types";
 
 export const CLIENTS_PRESENCE_VIEW_TYPE = "obsidian-convex-sync-clients";
-
-type PresenceRow = {
-	clientId: string;
-	openFilePath: string;
-	cursor: {
-		anchor: { line: number; ch: number };
-		head: { line: number; ch: number };
-		from: { line: number; ch: number };
-		to: { line: number; ch: number };
-	};
-	lastHeartbeatAt: number;
-};
 
 type ClientsListUnsubscribe = {
 	(): void;

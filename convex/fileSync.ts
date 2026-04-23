@@ -105,10 +105,6 @@ export const listSnapshot = query({
 		await requirePluginSecret(ctx, args.convexSecret);
 		const files = await ctx.db.query("vaultFiles").collect();
 		const folders = await ctx.db.query("vaultFolders").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
 		return {
 			files: files.map((file) => ({
 				path: file.path,
@@ -123,15 +119,6 @@ export const listSnapshot = query({
 				isExplicitlyEmpty: folder.isExplicitlyEmpty,
 				updatedByClientId: folder.updatedByClientId ?? "",
 			})),
-			obsidianBundle:
-				bundle === null
-					? null
-					: {
-							contentHash: bundle.contentHash,
-							sizeBytes: bundle.sizeBytes,
-							updatedAtMs: bundle.updatedAtMs,
-							updatedByClientId: bundle.updatedByClientId,
-						},
 		};
 	},
 });

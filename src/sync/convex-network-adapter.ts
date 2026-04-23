@@ -175,9 +175,7 @@ export class ConvexNetworkAdapter {
 		this.flushingDocs.add(docId);
 		const batch = pending.slice(0, 50).map((op) => ({
 			clientSeq: op.clientSeq,
-			changeBytes: Uint8Array.from(atob(op.changeBytesBase64), (char) =>
-				char.charCodeAt(0),
-			).buffer,
+			changeBytesBase64: op.changeBytesBase64,
 			timestampMs: op.timestampMs,
 		}));
 		try {

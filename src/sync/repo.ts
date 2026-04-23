@@ -53,6 +53,17 @@ function emptyMeta(path: string): StoredTextMeta {
 	};
 }
 
+function docText(doc: Automerge.Doc<TextDoc>): string {
+	const value = (doc as { text?: unknown }).text;
+	if (typeof value === "string") {
+		return value;
+	}
+	if (value && typeof (value as { toString(): string }).toString === "function") {
+		return (value as { toString(): string }).toString();
+	}
+	return "";
+}
+
 export async function probeLiveSyncSupport(): Promise<boolean> {
 	if (typeof indexedDB === "undefined") {
 		return false;
@@ -115,7 +126,7 @@ export class LiveSyncRepo {
 	}
 
 	async getText(docId: string, path: string): Promise<string> {
-		return (await this.load(docId, path)).doc.text ?? "";
+		return docText((await this.load(docId, path)).doc);
 	}
 
 	async applyLocalText(
@@ -124,7 +135,7 @@ export class LiveSyncRepo {
 		text: string,
 	): Promise<{ changed: boolean; clientSeq: number | null }> {
 		const state = await this.load(docId, path);
-		if ((state.doc.text ?? "") === text) {
+		if (docText(state.doc) === text) {
 			return { changed: false, clientSeq: null };
 		}
 		const nextDoc = Automerge.change(state.doc, (draft: any) => {
@@ -195,7 +206,7 @@ export class LiveSyncRepo {
 			),
 		};
 		await this.save(docId, baseDoc, nextMeta);
-		return baseDoc.text ?? "";
+		return docText(baseDoc);
 	}
 
 	async pendingOps(docId: string, path: string): Promise<PendingTextOp[]> {

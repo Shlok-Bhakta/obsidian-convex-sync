@@ -59,16 +59,24 @@ export const updateEditorPresence = mutation({
 		if (args.clientId.trim() === "") {
 			throw new ConvexError("clientId is required.");
 		}
+		const now = Date.now();
 		const existing = await ctx.db
 			.query("clientPresence")
 			.withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
 			.unique();
-		if (!existing) {
+		if (existing) {
+			await ctx.db.patch(existing._id, {
+				openFilePath: args.openFilePath,
+				cursor: args.cursor,
+				lastHeartbeatAt: now,
+			});
 			return;
 		}
-		await ctx.db.patch(existing._id, {
+		await ctx.db.insert("clientPresence", {
+			clientId: args.clientId,
 			openFilePath: args.openFilePath,
 			cursor: args.cursor,
+			lastHeartbeatAt: now,
 		});
 	},
 });
