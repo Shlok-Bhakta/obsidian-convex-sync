@@ -26,14 +26,6 @@ export default defineSchema({
 	})
 		.index("by_path", ["path"])
 		.index("by_updatedAtMs", ["updatedAtMs"]),
-	vaultBundles: defineTable({
-		scope: v.string(),
-		storageId: v.id("_storage"),
-		contentHash: v.string(),
-		sizeBytes: v.number(),
-		updatedAtMs: v.number(),
-		updatedByClientId: v.string(),
-	}).index("by_scope", ["scope"]),
 	vaultBootstraps: defineTable({
 		status: v.union(
 			v.literal("building"),

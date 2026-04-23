@@ -403,6 +403,7 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 					settings: this.plugin.settings,
 					getConvexHttpClient: this.plugin.getConvexHttpClient,
 					getPresenceSessionId: this.plugin.getPresenceSessionId.bind(this.plugin),
+					syncBeforeBootstrap: (onState) => this.plugin.syncVaultToConvex(onState),
 				},
 				(state) => {
 					this.bootstrapState = state;

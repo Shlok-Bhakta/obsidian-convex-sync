@@ -7,6 +7,13 @@ type BootstrapHost = {
 	settings: MyPluginSettings;
 	getConvexHttpClient(): ConvexHttpClient;
 	getPresenceSessionId(): string;
+	syncBeforeBootstrap?: (
+		onState: (state: {
+			phase: string;
+			completed: number;
+			total: number;
+		}) => void,
+	) => Promise<void>;
 };
 
 export type BootstrapUiState =
@@ -64,20 +71,31 @@ export async function startBootstrapBuild(
 ): Promise<void> {
 	const client = host.getConvexHttpClient();
 	onState({ kind: "syncing", phase: "Syncing vault to Convex", completed: 0, total: 1 });
-	await runVaultFileSync({
-		app: host.app,
-		settings: host.settings,
-		getConvexHttpClient: host.getConvexHttpClient,
-		getPresenceSessionId: host.getPresenceSessionId,
-		reportSyncProgress: ({ phase, completed, total }) => {
+	if (host.syncBeforeBootstrap) {
+		await host.syncBeforeBootstrap(({ phase, completed, total }) => {
 			onState({
 				kind: "syncing",
 				phase,
 				completed,
 				total,
 			});
-		},
-	});
+		});
+	} else {
+		await runVaultFileSync({
+			app: host.app,
+			settings: host.settings,
+			getConvexHttpClient: host.getConvexHttpClient,
+			getPresenceSessionId: host.getPresenceSessionId,
+			reportSyncProgress: ({ phase, completed, total }) => {
+				onState({
+					kind: "syncing",
+					phase,
+					completed,
+					total,
+				});
+			},
+		});
+	}
 	await (client.mutation as any)("bootstrap:startBuild", {
 		convexSecret: host.settings.convexSecret,
 		clientId: host.getPresenceSessionId(),

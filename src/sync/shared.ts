@@ -62,8 +62,6 @@ export function isManagedSyncPath(path: string, ignorePaths: string[] = []): boo
 		normalized !== "" &&
 		!normalized.startsWith(`${LIVE_SYNC_TRASH_ROOT}/`) &&
 		normalized !== LIVE_SYNC_TRASH_ROOT &&
-		!normalized.startsWith(".obsidian/") &&
-		normalized !== ".obsidian" &&
 		!matchesSyncIgnorePath(normalized, ignorePaths)
 	);
 }

@@ -1,5 +1,8 @@
+// Convex runs in a workerd-style runtime, so we force the workerd Automerge entrypoint here.
+// @ts-expect-error Convex's TS program does not pick up declarations for this private path.
+import * as Automerge from "../node_modules/@automerge/automerge/dist/mjs/entrypoints/fullfat_workerd.js";
 import { ConvexError, v } from "convex/values";
-import { unzipSync, zipSync } from "fflate";
+import { zipSync } from "fflate";
 import { internal } from "./_generated/api";
 import {
 	internalAction,
@@ -8,22 +11,11 @@ import {
 	mutation,
 	query,
 } from "./_generated/server";
-import { OBSIDIAN_BUNDLE_SCOPE } from "./_lib/constants";
 import { requirePluginSecret } from "./security";
 
 const TEN_MINUTES_MS = 10 * 60_000;
 
-function toHex(buffer: ArrayBuffer): string {
-	const bytes = new Uint8Array(buffer);
-	return Array.from(bytes)
-		.map((byte) => byte.toString(16).padStart(2, "0"))
-		.join("");
-}
-
-async function sha256Bytes(bytes: ArrayBuffer): Promise<string> {
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return toHex(digest);
-}
+type TextDoc = { text: string };
 
 type BootstrapRow = {
 	_id: string;
@@ -32,6 +24,58 @@ type BootstrapRow = {
 	archiveName?: string;
 	status: "building" | "ready" | "expired" | "failed";
 };
+
+type BootstrapFileEntry =
+	| {
+			kind: "text";
+			docId: string;
+			path: string;
+			sizeBytes: number;
+	  }
+	| {
+			kind: "binary";
+			docId: string;
+			path: string;
+			storageId: string;
+			sizeBytes: number;
+	  }
+	| {
+			kind: "legacyBinary";
+			path: string;
+			storageId: string;
+			sizeBytes: number;
+	  };
+
+function toHex(buffer: ArrayBuffer): string {
+	const bytes = new Uint8Array(buffer);
+	return Array.from(bytes)
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
+function emptyDoc(): Automerge.Doc<TextDoc> {
+	return Automerge.init<TextDoc>();
+}
+
+function toUint8Array(bytes: ArrayBuffer | Uint8Array): Uint8Array {
+	return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+}
+
+function docText(doc: Automerge.Doc<TextDoc>): string {
+	const value = (doc as { text?: unknown }).text;
+	if (typeof value === "string") {
+		return value;
+	}
+	if (value && typeof (value as { toString(): string }).toString === "function") {
+		return (value as { toString(): string }).toString();
+	}
+	return "";
+}
+
+async function sha256Bytes(bytes: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return toHex(digest);
+}
 
 async function getSingletonRow(ctx: any): Promise<any | null> {
 	const rows = await ctx.db.query("vaultBootstraps").collect();
@@ -42,6 +86,103 @@ async function cleanupBootstrapStorage(ctx: any, row: BootstrapRow | null): Prom
 	if (row?.storageId) {
 		await ctx.storage.delete(row.storageId as never);
 	}
+}
+
+async function latestSnapshotForDoc(ctx: any, docId: string) {
+	const rows = await ctx.db
+		.query("docSnapshots")
+		.withIndex("by_doc_seq", (q: any) => q.eq("docId", docId))
+		.order("desc")
+		.take(1);
+	return rows[0] ?? null;
+}
+
+async function latestBinaryForDoc(ctx: any, docId: string) {
+	const rows = await ctx.db
+		.query("binaryVersions")
+		.withIndex("by_doc_time", (q: any) => q.eq("docId", docId))
+		.order("desc")
+		.take(1);
+	return rows[0] ?? null;
+}
+
+async function buildDocsSnapshot(ctx: any): Promise<BootstrapFileEntry[]> {
+	const docs = await ctx.db.query("docs").collect();
+	const activeDocs = docs
+		.filter((doc: any) => !doc.deletedAtMs && doc.kind !== "folder")
+		.sort((a: any, b: any) => a.path.localeCompare(b.path));
+	const files: BootstrapFileEntry[] = [];
+	for (const doc of activeDocs) {
+		if (doc.kind === "binary") {
+			const binary = await latestBinaryForDoc(ctx, doc.docId);
+			if (!binary) {
+				continue;
+			}
+			files.push({
+				kind: "binary",
+				docId: doc.docId,
+				path: doc.path,
+				storageId: binary.storageId,
+				sizeBytes: binary.sizeBytes,
+			});
+			continue;
+		}
+		const snapshot = await latestSnapshotForDoc(ctx, doc.docId);
+		const ops = await ctx.db
+			.query("docOps")
+			.withIndex("by_doc_seq", (q: any) => q.eq("docId", doc.docId))
+			.collect();
+		const deltaBytes = ops
+			.filter((op: any) => op.seq > (snapshot?.upToSeq ?? 0))
+			.reduce(
+				(total: number, op: any) => total + op.changeBytes.byteLength,
+				0,
+			);
+		files.push({
+			kind: "text",
+			docId: doc.docId,
+			path: doc.path,
+			sizeBytes: (snapshot?.sizeBytes ?? 0) + deltaBytes,
+		});
+	}
+	return files;
+}
+
+async function readBootstrapFiles(ctx: any): Promise<BootstrapFileEntry[]> {
+	const docFiles = await buildDocsSnapshot(ctx);
+	if (docFiles.length > 0) {
+		return docFiles;
+	}
+	const legacyFiles = await ctx.db.query("vaultFiles").collect();
+	return legacyFiles
+		.sort((a: any, b: any) => a.path.localeCompare(b.path))
+		.map((row: any) => ({
+			kind: "legacyBinary" as const,
+			path: row.path,
+			storageId: row.storageId,
+			sizeBytes: row.sizeBytes,
+		}));
+}
+
+async function materializeTextDoc(ctx: any, docId: string): Promise<Uint8Array> {
+	const payload = await ctx.runQuery(internal.sync.getCompactionPayload, { docId });
+	if (!payload) {
+		return new TextEncoder().encode("");
+	}
+	let doc = emptyDoc();
+	if (payload.snapshot?.storageId) {
+		const blob = await ctx.storage.get(payload.snapshot.storageId);
+		if (blob) {
+			doc = Automerge.load<TextDoc>(new Uint8Array(await blob.arrayBuffer()));
+		}
+	}
+	if (payload.ops.length > 0) {
+		doc = Automerge.applyChanges(
+			doc,
+			payload.ops.map((op: any) => toUint8Array(op.changeBytes)),
+		)[0];
+	}
+	return new TextEncoder().encode(docText(doc));
 }
 
 export const startBuild = mutation({
@@ -62,12 +203,8 @@ export const startBuild = mutation({
 			await ctx.db.delete(existing._id);
 		}
 
-		const allFiles = await ctx.db.query("vaultFiles").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q: any) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		const bytesTotal = allFiles.reduce((sum, file) => sum + file.sizeBytes, 0) + (bundle?.sizeBytes ?? 0);
+		const files = await readBootstrapFiles(ctx);
+		const bytesTotal = files.reduce((sum, file) => sum + file.sizeBytes, 0);
 
 		const cleanVaultName = args.vaultName
 			.trim()
@@ -79,7 +216,7 @@ export const startBuild = mutation({
 			status: "building",
 			phase: "Queued",
 			filesProcessed: 0,
-			filesTotal: allFiles.length + (bundle ? 1 : 0),
+			filesTotal: files.length,
 			bytesProcessed: 0,
 			bytesTotal,
 			archiveName,
@@ -179,7 +316,7 @@ export const finalizeArchive = internalMutation({
 	},
 	handler: async (ctx, args) => {
 		const row = await ctx.db.get(args.bootstrapId);
-		if (!row) {
+		if (!row || row.status !== "building") {
 			await ctx.storage.delete(args.storageId);
 			return;
 		}
@@ -281,11 +418,18 @@ export const buildArchive = internalAction({
 			const chunkInterval = 8;
 
 			for (const row of snapshot.files) {
-				const blob = await ctx.storage.get(row.storageId);
-				if (!blob) {
+				let bytes: Uint8Array | null = null;
+				if (row.kind === "text") {
+					bytes = await materializeTextDoc(ctx, row.docId);
+				} else {
+					const blob = await ctx.storage.get(row.storageId);
+					if (blob) {
+						bytes = new Uint8Array(await blob.arrayBuffer());
+					}
+				}
+				if (!bytes) {
 					continue;
 				}
-				const bytes = new Uint8Array(await blob.arrayBuffer());
 				archiveEntries[row.path] = bytes;
 				filesProcessed += 1;
 				bytesProcessed += row.sizeBytes;
@@ -293,24 +437,6 @@ export const buildArchive = internalAction({
 					await ctx.runMutation(internal.bootstrap.updateProgress, {
 						bootstrapId: args.bootstrapId,
 						phase: `Collecting vault files (${filesProcessed}/${snapshot.files.length})`,
-						filesProcessed,
-						bytesProcessed,
-					});
-				}
-			}
-
-			if (snapshot.bundle) {
-				const bundleBlob = await ctx.storage.get(snapshot.bundle.storageId);
-				if (bundleBlob) {
-					const archive = unzipSync(new Uint8Array(await bundleBlob.arrayBuffer()));
-					for (const [relativePath, content] of Object.entries(archive)) {
-						archiveEntries[`.obsidian/${relativePath}`] = content;
-					}
-					filesProcessed += 1;
-					bytesProcessed += snapshot.bundle.sizeBytes;
-					await ctx.runMutation(internal.bootstrap.updateProgress, {
-						bootstrapId: args.bootstrapId,
-						phase: "Merged .obsidian bundle",
 						filesProcessed,
 						bytesProcessed,
 					});
@@ -350,23 +476,8 @@ export const _readSnapshot = internalQuery({
 	args: { convexSecret: v.string() },
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const files = await ctx.db.query("vaultFiles").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
 		return {
-			files: files.map((row) => ({
-				path: row.path,
-				storageId: row.storageId,
-				sizeBytes: row.sizeBytes,
-			})),
-			bundle: bundle
-				? {
-						storageId: bundle.storageId,
-						sizeBytes: bundle.sizeBytes,
-				  }
-				: null,
+			files: await readBootstrapFiles(ctx),
 		};
 	},
 });

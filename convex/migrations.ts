@@ -67,37 +67,4 @@ export const backfillVaultFolders = migrations.define({
 	},
 });
 
-export const backfillVaultBundle = migrations.define({
-	table: "vaultBundles",
-	migrateOne: async (ctx, row) => {
-		const path = ".obsidian.bundle.zip";
-		const existing = await ctx.db
-			.query("docs")
-			.withIndex("by_path", (q) => q.eq("path", path))
-			.unique();
-		if (existing) {
-			return;
-		}
-		const docId = legacyDocIdForPath(path);
-		await ctx.db.insert("docs", {
-			docId,
-			kind: "binary",
-			path,
-			createdAtMs: row.updatedAtMs,
-			createdByClientId: row.updatedByClientId,
-			updatedAtMs: row.updatedAtMs,
-			updatedByClientId: row.updatedByClientId,
-			latestSeq: 0,
-		});
-		await ctx.db.insert("binaryVersions", {
-			docId,
-			storageId: row.storageId,
-			contentHash: row.contentHash,
-			sizeBytes: row.sizeBytes,
-			updatedAtMs: row.updatedAtMs,
-			updatedByClientId: row.updatedByClientId,
-		});
-	},
-});
-
 export const run = migrations.runner();

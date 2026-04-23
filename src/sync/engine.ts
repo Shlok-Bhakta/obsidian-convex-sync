@@ -1,5 +1,10 @@
 import { MarkdownView, Notice, TAbstractFile, TFile, TFolder } from "obsidian";
-import type { ConvexHttpClient, ConvexClient } from "convex/browser";
+import type { ConvexClient, ConvexHttpClient } from "convex/browser";
+import {
+	collectTrackedObsidianState,
+	ensureAdapterFolderExists,
+	isObsidianPath,
+} from "../obsidian-config";
 import { LiveSyncRepo, probeLiveSyncSupport } from "./repo";
 import {
 	ConvexNetworkAdapter,
@@ -8,6 +13,7 @@ import {
 import { bootstrapLocalState, loadRemoteIndex } from "./reconciler";
 import {
 	folderPathForFile,
+	isBinaryPath,
 	isManagedSyncPath,
 	kindForAbstractFile,
 	LIVE_SYNC_TRASH_ROOT,
@@ -16,6 +22,8 @@ import {
 	type SyncKind,
 	toArrayBuffer,
 } from "./shared";
+
+const OBSIDIAN_SCAN_INTERVAL_MS = 10_000;
 
 type IndexRow = {
 	docId: string;
@@ -63,24 +71,37 @@ export class LiveSyncEngine {
 	private readonly docIdByPath = new Map<string, string>();
 	private readonly suppressedPaths = new Map<string, number>();
 	private readonly binaryHeads = new Map<string, number>();
+	private syncingObsidian = false;
+	private pendingObsidianSync = false;
 
 	private constructor(private readonly host: LiveSyncEngineHost) {}
 
-	private async start(): Promise<void> {
-		this.host.setSyncStatus("Convex sync: loading live state");
+	async syncNow(options?: { pruneRemoteDeletions?: boolean }): Promise<void> {
 		const remote = await loadRemoteIndex(this.host);
+		const remoteDocs = (remote.docs ?? []) as IndexRow[];
 		await bootstrapLocalState(
 			this.host,
 			this.repo,
 			this.network,
-			(remote.docs ?? []).map((doc) => ({
+			remoteDocs.map((doc) => ({
 				docId: doc.docId,
 				path: doc.path,
 				kind: doc.kind,
+				updatedAtMs: doc.updatedAtMs,
 				binaryHead: doc.binaryHead,
 			})),
 		);
-		await this.applyIndex((remote.docs ?? []) as IndexRow[]);
+		if (options?.pruneRemoteDeletions) {
+			await this.deleteMissingRemoteDocs(remoteDocs);
+		}
+		await this.flushAllTextDocs();
+		const refreshed = await loadRemoteIndex(this.host);
+		await this.applyIndex((refreshed.docs ?? []) as IndexRow[]);
+	}
+
+	private async start(): Promise<void> {
+		this.host.setSyncStatus("Convex sync: loading live state");
+		await this.syncNow({ pruneRemoteDeletions: false });
 		this.network.startIndexSubscription((rows) => {
 			void this.applyIndex(rows as IndexRow[]);
 		});
@@ -121,16 +142,26 @@ export class LiveSyncEngine {
 				void this.handleLocalRename(file, oldPath);
 			}),
 		);
+		const interval = window.setInterval(() => {
+			this.queueObsidianSync();
+		}, OBSIDIAN_SCAN_INTERVAL_MS);
+		this.host.registerInterval(interval);
 	}
 
 	private async applyIndex(rows: IndexRow[]): Promise<void> {
 		for (const row of rows) {
+			const previous = this.docsById.get(row.docId);
+			if (previous && previous.path !== row.path) {
+				this.docIdByPath.delete(previous.path);
+				await this.moveLocalPathToTrash(previous.path);
+			}
 			this.docsById.set(row.docId, row);
-			this.docIdByPath.set(row.path, row.docId);
 			if (row.deletedAtMs) {
+				this.docIdByPath.delete(row.path);
 				await this.moveLocalPathToTrash(row.path);
 				continue;
 			}
+			this.docIdByPath.set(row.path, row.docId);
 			if (row.kind === "folder") {
 				await this.ensureFolder(row.path);
 				continue;
@@ -140,12 +171,18 @@ export class LiveSyncEngine {
 				continue;
 			}
 			this.network.ensureDocSubscription(row.docId, row.path, (payload) => {
-				void this.applyRemoteText(row.docId, row.path, payload);
+				void this.applyRemoteText(row.docId, payload);
 			});
 		}
 	}
 
-	private async applyRemoteText(docId: string, path: string, payload: any): Promise<void> {
+	private async applyRemoteText(docId: string, payload: any): Promise<void> {
+		const path =
+			this.docsById.get(docId)?.path ??
+			(typeof payload?.doc?.path === "string" ? payload.doc.path : null);
+		if (!path) {
+			return;
+		}
 		if (!payload?.doc || payload.doc.deletedAtMs) {
 			await this.moveLocalPathToTrash(path);
 			return;
@@ -236,26 +273,49 @@ export class LiveSyncEngine {
 		if (!docId) {
 			return;
 		}
-		let frozenStorageId: string | undefined;
-		if (file instanceof TFile && kindForAbstractFile(file) === "text") {
-			const snapshot = await this.repo.exportSnapshot(docId, file.path);
-			frozenStorageId = await this.network.uploadBytes(
-				toArrayBuffer(snapshot),
-				"application/octet-stream",
-			);
-		}
-		await this.network.deleteDoc(docId, frozenStorageId);
+		await this.deleteRemoteDoc({
+			docId,
+			path: file.path,
+			kind:
+				file instanceof TFolder
+					? "folder"
+					: kindForAbstractFile(file),
+		});
 	}
 
 	private async handleLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
-		if (
-			!isManagedSyncPath(file.path, this.host.settings.syncIgnorePaths) ||
-			this.isSuppressed(file.path)
-		) {
+		const oldManaged = isManagedSyncPath(oldPath, this.host.settings.syncIgnorePaths);
+		const newManaged = isManagedSyncPath(file.path, this.host.settings.syncIgnorePaths);
+		if ((!oldManaged && !newManaged) || this.isSuppressed(file.path)) {
 			return;
 		}
 		const docId = this.docIdByPath.get(oldPath);
-		if (!docId) {
+		if (oldManaged && docId && !newManaged) {
+			await this.deleteRemoteDoc({
+				docId,
+				path: oldPath,
+				kind:
+					file instanceof TFolder
+						? "folder"
+						: kindForAbstractFile(file),
+			});
+			return;
+		}
+		if (!oldManaged && newManaged) {
+			if (file instanceof TFolder) {
+				await this.ensureRemoteDoc(file.path, "folder");
+				return;
+			}
+			if (file instanceof TFile && kindForAbstractFile(file) === "binary") {
+				await this.syncBinaryFile(file);
+				return;
+			}
+			if (file instanceof TFile) {
+				await this.syncTextFile(file);
+			}
+			return;
+		}
+		if (!docId || !newManaged) {
 			return;
 		}
 		this.docIdByPath.delete(oldPath);
@@ -286,6 +346,29 @@ export class LiveSyncEngine {
 		this.binaryHeads.set(docId, file.stat.mtime);
 	}
 
+	private async syncObsidianTextPath(path: string): Promise<void> {
+		const docId = await this.ensureRemoteDoc(path, "text");
+		const text = await this.host.app.vault.adapter.read(path);
+		const changed = await this.repo.applyLocalText(docId, path, text);
+		if (changed.changed) {
+			this.network.scheduleFlush(docId, path);
+		}
+	}
+
+	private async syncObsidianBinaryPath(path: string, updatedAtMs: number): Promise<void> {
+		const docId = await this.ensureRemoteDoc(path, "binary");
+		const bytes = await this.host.app.vault.adapter.readBinary(path);
+		const storageId = await this.network.uploadBytes(bytes, "application/octet-stream");
+		await this.network.putBinaryVersion({
+			docId,
+			storageId,
+			contentHash: await sha256Bytes(bytes),
+			sizeBytes: bytes.byteLength,
+			updatedAtMs,
+		});
+		this.binaryHeads.set(docId, updatedAtMs);
+	}
+
 	private async ensureRemoteDoc(path: string, kind: SyncKind): Promise<string> {
 		const existing = this.docIdByPath.get(path);
 		if (existing) {
@@ -305,7 +388,139 @@ export class LiveSyncEngine {
 		return docId;
 	}
 
+	private async deleteMissingRemoteDocs(remoteDocs: IndexRow[]): Promise<void> {
+		const localPaths = await this.collectCurrentLocalPaths();
+		for (const row of remoteDocs) {
+			if (row.deletedAtMs || localPaths.has(row.path)) {
+				continue;
+			}
+			await this.deleteRemoteDoc(row);
+		}
+	}
+
+	private async collectCurrentLocalPaths(): Promise<Set<string>> {
+		const paths = new Set<string>();
+		for (const entry of this.host.app.vault.getAllLoadedFiles()) {
+			if (isManagedSyncPath(entry.path, this.host.settings.syncIgnorePaths)) {
+				paths.add(entry.path);
+			}
+		}
+		const trackedObsidian = await collectTrackedObsidianState(
+			this.host.app,
+			this.host.settings.syncIgnorePaths,
+		);
+		for (const file of trackedObsidian.files) {
+			paths.add(file.path);
+		}
+		return paths;
+	}
+
+	private async flushAllTextDocs(): Promise<void> {
+		for (const row of this.docsById.values()) {
+			if (row.kind !== "text" || row.deletedAtMs) {
+				continue;
+			}
+			await this.network.flushDoc(row.docId, row.path);
+		}
+	}
+
+	private queueObsidianSync(): void {
+		if (this.syncingObsidian) {
+			this.pendingObsidianSync = true;
+			return;
+		}
+		void this.syncObsidianState();
+	}
+
+	private async syncObsidianState(): Promise<void> {
+		this.syncingObsidian = true;
+		try {
+			const state = await collectTrackedObsidianState(
+				this.host.app,
+				this.host.settings.syncIgnorePaths,
+			);
+			const currentPaths = new Set(state.files.map((file) => file.path));
+			for (const file of state.files) {
+				if (this.isSuppressed(file.path)) {
+					continue;
+				}
+				const row = this.getRowByPath(file.path);
+				if (isBinaryPath(file.path)) {
+					const remoteUpdatedAtMs =
+						row?.kind === "binary" ? row.binaryHead?.updatedAtMs ?? 0 : 0;
+					if (!row || file.updatedAtMs > remoteUpdatedAtMs) {
+						await this.syncObsidianBinaryPath(file.path, file.updatedAtMs);
+					}
+					continue;
+				}
+				if (
+					row?.kind === "text" &&
+					row.updatedAtMs >= file.updatedAtMs
+				) {
+					continue;
+				}
+				await this.syncObsidianTextPath(file.path);
+			}
+			for (const row of this.docsById.values()) {
+				if (
+					!isObsidianPath(row.path) ||
+					row.deletedAtMs ||
+					currentPaths.has(row.path) ||
+					this.isSuppressed(row.path)
+				) {
+					continue;
+				}
+				await this.deleteRemoteDoc(row);
+			}
+		} finally {
+			this.syncingObsidian = false;
+			if (this.pendingObsidianSync) {
+				this.pendingObsidianSync = false;
+				this.queueObsidianSync();
+			}
+		}
+	}
+
+	private getRowByPath(path: string): IndexRow | null {
+		const docId = this.docIdByPath.get(path);
+		return docId ? (this.docsById.get(docId) ?? null) : null;
+	}
+
+	private async deleteRemoteDoc(row: {
+		docId: string;
+		path: string;
+		kind: SyncKind;
+	}): Promise<void> {
+		let frozenStorageId: string | undefined;
+		if (row.kind === "text") {
+			const snapshot = await this.repo.exportSnapshot(row.docId, row.path);
+			frozenStorageId = await this.network.uploadBytes(
+				toArrayBuffer(snapshot),
+				"application/octet-stream",
+			);
+		}
+		await this.network.deleteDoc(row.docId, frozenStorageId);
+		this.docIdByPath.delete(row.path);
+		const existing = this.docsById.get(row.docId);
+		if (existing) {
+			this.docsById.set(row.docId, {
+				...existing,
+				deletedAtMs: Date.now(),
+			});
+		}
+	}
+
 	private async writeTextFile(path: string, text: string): Promise<void> {
+		if (isObsidianPath(path)) {
+			await ensureAdapterFolderExists(this.host.app, folderPathForFile(path) ?? "");
+			const current = await this.host.app.vault.adapter.read(path).catch(() => null);
+			if (current === text) {
+				return;
+			}
+			this.suppressPath(path);
+			await this.host.app.vault.adapter.write(path, text);
+			return;
+		}
 		await this.ensureFolder(folderPathForFile(path));
 		const activeView = this.host.app.workspace.getActiveViewOfType(MarkdownView);
 		if (activeView?.file?.path === path) {
@@ -330,6 +545,12 @@ export class LiveSyncEngine {
 	}
 
 	private async writeBinaryFile(path: string, bytes: ArrayBuffer): Promise<void> {
+		if (isObsidianPath(path)) {
+			await ensureAdapterFolderExists(this.host.app, folderPathForFile(path) ?? "");
+			this.suppressPath(path);
+			await this.host.app.vault.adapter.writeBinary(path, bytes);
+			return;
+		}
 		await this.ensureFolder(folderPathForFile(path));
 		const existing = this.host.app.vault.getAbstractFileByPath(path);
 		if (existing instanceof TFile) {
@@ -342,6 +563,15 @@ export class LiveSyncEngine {
 	}
 
 	private async moveLocalPathToTrash(path: string): Promise<void> {
+		if (isObsidianPath(path)) {
+			const exists = await this.host.app.vault.adapter.exists(path);
+			if (!exists) {
+				return;
+			}
+			this.suppressPath(path);
+			await this.host.app.vault.adapter.remove(path);
+			return;
+		}
 		const existing = this.host.app.vault.getAbstractFileByPath(path);
 		if (!existing) {
 			return;
@@ -355,6 +585,10 @@ export class LiveSyncEngine {
 
 	private async ensureFolder(path: string | null): Promise<void> {
 		if (!path) {
+			return;
+		}
+		if (isObsidianPath(path)) {
+			await ensureAdapterFolderExists(this.host.app, path);
 			return;
 		}
 		const existing = this.host.app.vault.getAbstractFileByPath(path);

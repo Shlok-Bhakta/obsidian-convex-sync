@@ -56,6 +56,9 @@ async function latestBinaryForDoc(ctx: any, docId: string) {
 }
 
 function initTextDoc(text = ""): Automerge.Doc<TextDoc> {
+	if (text === "") {
+		return Automerge.init<TextDoc>();
+	}
 	return Automerge.from<TextDoc>({ text });
 }
 
@@ -69,6 +72,10 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 		bytes.byteOffset,
 		bytes.byteOffset + bytes.byteLength,
 	) as ArrayBuffer;
+}
+
+function toUint8Array(bytes: ArrayBuffer | Uint8Array): Uint8Array {
+	return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
 }
 
 async function snapshotUrl(ctx: any, storageId: any) {
@@ -390,6 +397,72 @@ export const appendOps = mutation({
 	},
 });
 
+export const replaceDocSnapshot = mutation({
+	args: {
+		convexSecret: v.string(),
+		docId: v.string(),
+		clientId: v.string(),
+		baseServerSeq: v.number(),
+		clientSeqs: v.array(v.number()),
+		snapshotStorageId: v.id("_storage"),
+		snapshotSizeBytes: v.number(),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		if (args.clientSeqs.length === 0) {
+			await ctx.storage.delete(args.snapshotStorageId);
+			return { assignedSeqs: [] };
+		}
+		const doc = await getDocByDocId(ctx, args.docId);
+		if (!doc) {
+			await ctx.storage.delete(args.snapshotStorageId);
+			throw new ConvexError("unknown doc");
+		}
+		if (doc.kind !== "text") {
+			await ctx.storage.delete(args.snapshotStorageId);
+			throw new ConvexError("replaceDocSnapshot only applies to text docs.");
+		}
+		if (doc.latestSeq > args.baseServerSeq) {
+			await ctx.storage.delete(args.snapshotStorageId);
+			throw new ConvexError("doc advanced before snapshot upload completed.");
+		}
+		const sortedClientSeqs = [...new Set(args.clientSeqs)].sort((a, b) => a - b);
+		const assignedSeqs = sortedClientSeqs.map((_, index) => doc.latestSeq + index + 1);
+		const previousSnapshots = await ctx.db
+			.query("docSnapshots")
+			.withIndex("by_doc_seq", (q: any) => q.eq("docId", args.docId))
+			.collect();
+		const existingOps = await ctx.db
+			.query("docOps")
+			.withIndex("by_doc_seq", (q: any) => q.eq("docId", args.docId))
+			.collect();
+		for (const op of existingOps) {
+			await ctx.db.delete(op._id);
+		}
+		for (const snapshot of previousSnapshots) {
+			await ctx.storage.delete(snapshot.storageId);
+			await ctx.db.delete(snapshot._id);
+		}
+		await ctx.db.insert("docSnapshots", {
+			docId: args.docId,
+			upToSeq: assignedSeqs[assignedSeqs.length - 1] ?? doc.latestSeq,
+			storageId: args.snapshotStorageId,
+			sizeBytes: args.snapshotSizeBytes,
+			createdAtMs: Date.now(),
+		});
+		await ctx.db.patch(doc._id, {
+			latestSeq: assignedSeqs[assignedSeqs.length - 1] ?? doc.latestSeq,
+			latestSnapshotId: args.snapshotStorageId,
+			latestSnapshotSeq: assignedSeqs[assignedSeqs.length - 1] ?? doc.latestSeq,
+			latestSnapshotAtMs: Date.now(),
+			updatedAtMs: Date.now(),
+			updatedByClientId: args.clientId,
+			deletedAtMs: undefined,
+		});
+		return { assignedSeqs };
+	},
+});
+
 export const moveDoc = mutation({
 	args: {
 		convexSecret: v.string(),
@@ -667,7 +740,7 @@ export const compactDoc = internalAction({
 		if (payload.ops.length > 0) {
 			doc = Automerge.applyChanges(
 				doc,
-				payload.ops.map((op: any) => op.changeBytes),
+				payload.ops.map((op: any) => toUint8Array(op.changeBytes)),
 			)[0];
 		}
 		const bytes = Automerge.save(doc);

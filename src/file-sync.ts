@@ -10,6 +10,7 @@ import {
 	shouldTrackObsidianPath,
 } from "./obsidian-config";
 import type { MyPluginSettings } from "./settings";
+import { isBinaryPath } from "./sync/shared";
 import { matchesSyncIgnorePath } from "./sync-ignore";
 
 type FileSyncHost = {
@@ -208,14 +209,28 @@ async function listLocalEntries(host: FileSyncHost): Promise<{
 				if (parent) {
 					await ensureAdapterFolderExists(host.app, parent);
 				}
-				await host.app.vault.adapter.writeBinary(file.path, bytes);
+				if (isBinaryPath(file.path)) {
+					await host.app.vault.adapter.writeBinary(file.path, bytes);
+					return;
+				}
+				await host.app.vault.adapter.write(
+					file.path,
+					new TextDecoder().decode(new Uint8Array(bytes)),
+				);
 			},
 			createBytes: async (bytes) => {
 				const parent = folderPathForFile(file.path);
 				if (parent) {
 					await ensureAdapterFolderExists(host.app, parent);
 				}
-				await host.app.vault.adapter.writeBinary(file.path, bytes);
+				if (isBinaryPath(file.path)) {
+					await host.app.vault.adapter.writeBinary(file.path, bytes);
+					return;
+				}
+				await host.app.vault.adapter.write(
+					file.path,
+					new TextDecoder().decode(new Uint8Array(bytes)),
+				);
 			},
 		});
 	}
@@ -410,13 +425,21 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 			if (parent) {
 				await ensureAdapterFolderExists(host.app, parent);
 			}
-			await host.app.vault.adapter.writeBinary(remoteFile.path, remotePayload.bytes);
+			if (isBinaryPath(remoteFile.path)) {
+				await host.app.vault.adapter.writeBinary(remoteFile.path, remotePayload.bytes);
+			} else {
+				await host.app.vault.adapter.write(
+					remoteFile.path,
+					new TextDecoder().decode(new Uint8Array(remotePayload.bytes)),
+				);
+			}
 		} else {
 			if (parent) {
 				await ensureFolderExists(host.app, parent);
 			}
 			await host.app.vault.createBinary(remoteFile.path, remotePayload.bytes);
 		}
+		localPaths.add(remoteFile.path);
 		tick("Creating missing local files");
 	}
 

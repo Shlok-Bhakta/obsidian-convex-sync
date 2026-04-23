@@ -12,7 +12,6 @@ import {
 	ensureVaultSecretRegisteredWithDeployment,
 	mintVaultApiSecretFromConvexSite,
 } from "./security";
-import { startObsidianConfigSync } from "./obsidian-config-sync";
 import {
 	normalizeLoadedSettings,
 	DEFAULT_SETTINGS,
@@ -54,10 +53,6 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 		this.register(() => {
 			stopClientsPresence();
 		});
-		const stopObsidianConfigSync = startObsidianConfigSync(this);
-		this.register(() => {
-			stopObsidianConfigSync();
-		});
 
 		this.addRibbonIcon("users", "Open connected clients", () => {
 			void revealClientsPresenceView(this.app);
@@ -76,17 +71,11 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			name: "Sync vault files with Convex",
 			callback: () => {
 				this.syncStatusBarItemEl?.setText("Convex sync: starting...");
-				void runVaultFileSync({
-					app: this.app,
-					settings: this.settings,
-					getConvexHttpClient: () => this.getConvexHttpClient(),
-					getPresenceSessionId: () => this.getPresenceSessionId(),
-					reportSyncProgress: ({ phase, completed, total }) => {
-						const percent = total <= 0 ? 0 : Math.min(100, Math.round((completed / total) * 100));
-						this.syncStatusBarItemEl?.setText(
-							`Convex sync: ${percent}% (${completed}/${total}) - ${phase}`,
-						);
-					},
+				void this.syncVaultToConvex(({ phase, completed, total }) => {
+					const percent = total <= 0 ? 0 : Math.min(100, Math.round((completed / total) * 100));
+					this.syncStatusBarItemEl?.setText(
+						`Convex sync: ${percent}% (${completed}/${total}) - ${phase}`,
+					);
 				})
 					.then(() => {
 						this.syncStatusBarItemEl?.setText("Convex sync: complete");
@@ -112,8 +101,9 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 
 		this.addSettingTab(new ConvexSyncSettingTab(this.app, this));
 
-		this.liveSyncEngine = await LiveSyncEngine.create(this);
-
+		window.setTimeout(() => {
+			void this.startLiveSyncEngine();
+		}, 0);
 	}
 
 	onunload() {
@@ -139,6 +129,47 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	private async startLiveSyncEngine(): Promise<void> {
+		try {
+			this.liveSyncEngine = await LiveSyncEngine.create(this);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.setSyncStatus("Convex sync: failed");
+			new Notice(`Convex live sync failed to start: ${message}`, 10000);
+			console.error("Live sync engine failed to start", error);
+		}
+	}
+
+	async syncVaultToConvex(
+		reportSyncProgress?: (status: {
+			phase: string;
+			completed: number;
+			total: number;
+		}) => void,
+	): Promise<void> {
+		if (this.liveSyncEngine) {
+			reportSyncProgress?.({
+				phase: "Reconciling live sync state",
+				completed: 0,
+				total: 1,
+			});
+			await this.liveSyncEngine.syncNow({ pruneRemoteDeletions: true });
+			reportSyncProgress?.({
+				phase: "Live sync up to date",
+				completed: 1,
+				total: 1,
+			});
+			return;
+		}
+		await runVaultFileSync({
+			app: this.app,
+			settings: this.settings,
+			getConvexHttpClient: () => this.getConvexHttpClient(),
+			getPresenceSessionId: () => this.getPresenceSessionId(),
+			reportSyncProgress,
+		});
 	}
 
 	async ensureConvexSecretRegisteredWithDeployment(): Promise<void> {

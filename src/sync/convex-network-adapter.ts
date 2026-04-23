@@ -2,6 +2,10 @@ import type { ConvexClient, ConvexHttpClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import type { MyPluginSettings } from "../settings";
 import type { LiveSyncRepo, RemoteTextOp } from "./repo";
+import { toArrayBuffer } from "./shared";
+
+const MAX_APPEND_OPS = 50;
+const MAX_APPEND_BYTES = 200_000;
 
 type IndexRow = {
 	docId: string;
@@ -60,6 +64,13 @@ type Unsubscribable = {
 	getCurrentValue(): unknown;
 };
 
+function estimatedBase64DecodedSize(base64: string): number {
+	const trimmed = base64.trim();
+	const padding =
+		trimmed.endsWith("==") ? 2 : trimmed.endsWith("=") ? 1 : 0;
+	return Math.floor((trimmed.length * 3) / 4) - padding;
+}
+
 export type LiveSyncNetworkHost = {
 	settings: MyPluginSettings;
 	getConvexHttpClient(): ConvexHttpClient;
@@ -70,6 +81,7 @@ export type LiveSyncNetworkHost = {
 
 export class ConvexNetworkAdapter {
 	private readonly docSubscriptions = new Map<string, Unsubscribable>();
+	private readonly docPaths = new Map<string, string>();
 	private indexSubscription: Unsubscribable | null = null;
 	private readonly flushTimers = new Map<string, number>();
 	private readonly flushingDocs = new Set<string>();
@@ -113,6 +125,7 @@ export class ConvexNetworkAdapter {
 		path: string,
 		onUpdate: (payload: DocPayload) => void,
 	): void {
+		this.docPaths.set(docId, path);
 		if (this.docSubscriptions.has(docId)) {
 			return;
 		}
@@ -127,7 +140,13 @@ export class ConvexNetworkAdapter {
 				docId,
 			},
 			(payload) => {
-				void this.handleDocHead(docId, path, (payload ?? null) as DocHeadPayload, onUpdate);
+				const currentPath = this.docPaths.get(docId) ?? path;
+				void this.handleDocHead(
+					docId,
+					currentPath,
+					(payload ?? null) as DocHeadPayload,
+					onUpdate,
+				);
 			},
 			(error) => {
 				console.error(`Live sync doc subscription failed for ${docId}`, error);
@@ -173,12 +192,35 @@ export class ConvexNetworkAdapter {
 			return;
 		}
 		this.flushingDocs.add(docId);
-		const batch = pending.slice(0, 50).map((op) => ({
-			clientSeq: op.clientSeq,
-			changeBytesBase64: op.changeBytesBase64,
-			timestampMs: op.timestampMs,
-		}));
 		try {
+			const oversizedOp = pending.find(
+				(op) => estimatedBase64DecodedSize(op.changeBytesBase64) > MAX_APPEND_BYTES,
+			);
+			if (oversizedOp) {
+				await this.flushSnapshot(docId, path, pending);
+				return;
+			}
+			const batch = [];
+			let payloadBytes = 0;
+			for (const op of pending) {
+				if (batch.length >= MAX_APPEND_OPS) {
+					break;
+				}
+				const opBytes = estimatedBase64DecodedSize(op.changeBytesBase64);
+				if (batch.length > 0 && payloadBytes + opBytes > MAX_APPEND_BYTES) {
+					break;
+				}
+				batch.push({
+					clientSeq: op.clientSeq,
+					changeBytesBase64: op.changeBytesBase64,
+					timestampMs: op.timestampMs,
+				});
+				payloadBytes += opBytes;
+			}
+			if (batch.length === 0) {
+				await this.flushSnapshot(docId, path, pending);
+				return;
+			}
 			const result = await this.getMutationClient().mutation(api.sync.appendOps, {
 				convexSecret: this.host.settings.convexSecret,
 				docId,
@@ -200,6 +242,33 @@ export class ConvexNetworkAdapter {
 				this.scheduleFlush(docId, path);
 			}
 		}
+	}
+
+	private async flushSnapshot(
+		docId: string,
+		path: string,
+		pending: Array<{ clientSeq: number }>,
+	): Promise<void> {
+		const snapshot = await this.repo.exportSnapshot(docId, path);
+		const storageId = await this.uploadBytes(
+			toArrayBuffer(snapshot),
+			"application/octet-stream",
+		);
+		const result = await this.getMutationClient().mutation(api.sync.replaceDocSnapshot, {
+			convexSecret: this.host.settings.convexSecret,
+			docId,
+			clientId: this.host.getPresenceSessionId(),
+			baseServerSeq: await this.repo.lastSyncedSeq(docId, path),
+			clientSeqs: pending.map((op) => op.clientSeq),
+			snapshotStorageId: storageId as never,
+			snapshotSizeBytes: snapshot.byteLength,
+		});
+		await this.repo.ackPending(
+			docId,
+			path,
+			pending.map((op) => op.clientSeq),
+			result.assignedSeqs,
+		);
 	}
 
 	async moveDoc(docId: string, newPath: string): Promise<void> {
@@ -286,6 +355,7 @@ export class ConvexNetworkAdapter {
 			subscription();
 		}
 		this.docSubscriptions.clear();
+		this.docPaths.clear();
 		for (const timer of this.flushTimers.values()) {
 			window.clearTimeout(timer);
 		}

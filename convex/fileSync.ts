@@ -1,6 +1,5 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { OBSIDIAN_BUNDLE_SCOPE } from "./_lib/constants";
 import { requirePluginSecret } from "./security";
 
 function normalizePath(input: string): string {
@@ -202,96 +201,5 @@ export const removeFilesByPath = mutation({
 			await ctx.storage.delete(row.storageId);
 			await ctx.db.delete(row._id);
 		}
-	},
-});
-
-export const issueBundleUploadUrl = mutation({
-	args: {
-		convexSecret: v.string(),
-		contentHash: v.string(),
-		updatedAtMs: v.number(),
-		sizeBytes: v.number(),
-		clientId: v.string(),
-	},
-	handler: async (ctx, args) => {
-		await requirePluginSecret(ctx, args.convexSecret);
-		void args;
-		const uploadUrl = await ctx.storage.generateUploadUrl();
-		return { uploadUrl };
-	},
-});
-
-export const finalizeBundleUpload = mutation({
-	args: {
-		convexSecret: v.string(),
-		storageId: v.id("_storage"),
-		contentHash: v.string(),
-		updatedAtMs: v.number(),
-		sizeBytes: v.number(),
-		clientId: v.string(),
-	},
-	handler: async (ctx, args) => {
-		await requirePluginSecret(ctx, args.convexSecret);
-		const existing = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		if (existing && existing.updatedAtMs > args.updatedAtMs) {
-			await ctx.storage.delete(args.storageId);
-			return {
-				ok: false as const,
-				reason: "stale_write" as const,
-				remoteUpdatedAtMs: existing.updatedAtMs,
-			};
-		}
-		let previousStorageId: typeof args.storageId | null = null;
-		if (existing) {
-			previousStorageId = existing.storageId;
-			await ctx.db.patch(existing._id, {
-				storageId: args.storageId,
-				contentHash: args.contentHash,
-				sizeBytes: args.sizeBytes,
-				updatedAtMs: args.updatedAtMs,
-				updatedByClientId: args.clientId,
-			});
-		} else {
-			await ctx.db.insert("vaultBundles", {
-				scope: OBSIDIAN_BUNDLE_SCOPE,
-				storageId: args.storageId,
-				contentHash: args.contentHash,
-				sizeBytes: args.sizeBytes,
-				updatedAtMs: args.updatedAtMs,
-				updatedByClientId: args.clientId,
-			});
-		}
-		if (previousStorageId !== null && previousStorageId !== args.storageId) {
-			await ctx.storage.delete(previousStorageId);
-		}
-		return { ok: true as const };
-	},
-});
-
-export const getBundleDownloadUrl = query({
-	args: { convexSecret: v.string() },
-	handler: async (ctx, args) => {
-		await requirePluginSecret(ctx, args.convexSecret);
-		const row = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		if (!row) {
-			return null;
-		}
-		const url = await ctx.storage.getUrl(row.storageId);
-		if (!url) {
-			return null;
-		}
-		return {
-			url,
-			contentHash: row.contentHash,
-			sizeBytes: row.sizeBytes,
-			updatedAtMs: row.updatedAtMs,
-			updatedByClientId: row.updatedByClientId,
-		};
 	},
 });

@@ -41,7 +41,7 @@ const DOC_PREFIX = ["obsidian-convex-sync", "docs"];
 const META_PREFIX = ["obsidian-convex-sync", "meta"];
 
 function emptyDoc(): Automerge.Doc<TextDoc> {
-	return Automerge.from<TextDoc>({ text: "" });
+	return Automerge.init<TextDoc>();
 }
 
 function emptyMeta(path: string): StoredTextMeta {
@@ -139,7 +139,7 @@ export class LiveSyncRepo {
 			return { changed: false, clientSeq: null };
 		}
 		const nextDoc = Automerge.change(state.doc, (draft: any) => {
-			Automerge.updateText(draft, ["text"], text);
+			draft.text = text;
 		});
 		const lastChange = Automerge.getLastLocalChange(nextDoc);
 		if (!lastChange) {
