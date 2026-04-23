@@ -11,6 +11,7 @@ import {
 } from "obsidian";
 import { api } from "../../convex/_generated/api";
 import type { MyPluginSettings } from "../settings";
+import { resolveClientId } from "../sync/client-id";
 
 const HEARTBEAT_MS = 10_000;
 const CURSOR_DEBOUNCE_MS = 200;
@@ -59,7 +60,7 @@ function getOpenMarkdownContext(
 
 export function leaveClientsPresence(host: ClientsPresenceHost): void {
 	const secret = host.settings.convexSecret.trim();
-	const clientId = host.getPresenceSessionId().trim();
+	const clientId = resolveClientId(host);
 	if (!secret || !clientId) {
 		return;
 	}
@@ -81,7 +82,7 @@ export function startClientsPresence(host: ClientsPresenceHost): () => void {
 	const canRun = (): boolean =>
 		host.settings.convexUrl.trim() !== "" &&
 		host.settings.convexSecret.trim() !== "" &&
-		host.getPresenceSessionId().trim() !== "";
+		resolveClientId(host).trim() !== "";
 
 	const pushPresence = (): void => {
 		if (!canRun()) {
@@ -95,7 +96,7 @@ export function startClientsPresence(host: ClientsPresenceHost): () => void {
 		void client
 			.mutation(api.clients.updateEditorPresence, {
 				convexSecret: host.settings.convexSecret,
-				clientId: host.getPresenceSessionId(),
+				clientId: resolveClientId(host),
 				openFilePath: ctx?.path ?? "",
 				cursor: ctx ? readCursorFromEditor(ctx.editor) : EMPTY_CURSOR,
 			})
@@ -113,7 +114,7 @@ export function startClientsPresence(host: ClientsPresenceHost): () => void {
 		void client
 			.mutation(api.clients.heartbeat, {
 				convexSecret: host.settings.convexSecret,
-				clientId: host.getPresenceSessionId(),
+				clientId: resolveClientId(host),
 			})
 			.catch((err) => {
 				console.error("Convex presence heartbeat failed", err);

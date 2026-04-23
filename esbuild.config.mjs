@@ -1,6 +1,8 @@
 import esbuild from "esbuild";
 import process from "process";
-import { builtinModules } from 'node:module';
+import path from "node:path";
+import { copyFile, lstat, mkdir, readFile, unlink } from "node:fs/promises";
+import { builtinModules } from "node:module";
 
 const banner =
 `/*
@@ -10,6 +12,46 @@ if you want to view the source, please visit the github repository of this plugi
 `;
 
 const prod = (process.argv[2] === "production");
+const manifest = JSON.parse(await readFile("manifest.json", "utf8"));
+const defaultDevPluginDir = path.resolve(
+	process.cwd(),
+	"..",
+	"convex-sync",
+	".obsidian",
+	"plugins",
+	manifest.id,
+);
+const devPluginDir =
+	process.env.OBSIDIAN_PLUGIN_DEV_DIR ??
+	defaultDevPluginDir;
+
+async function copyArtifactsToVault() {
+	if (!devPluginDir) {
+		return;
+	}
+	await mkdir(devPluginDir, { recursive: true });
+	for (const artifact of ["main.js", "manifest.json", "styles.css"]) {
+		const destination = path.join(devPluginDir, artifact);
+		try {
+			const stat = await lstat(destination).catch(() => null);
+			if (stat?.isSymbolicLink()) {
+				await unlink(destination);
+			}
+			await copyFile(artifact, destination);
+		} catch (error) {
+			if (
+				error &&
+				typeof error === "object" &&
+				"code" in error &&
+				error.code === "ENOENT"
+			) {
+				continue;
+			}
+			throw error;
+		}
+	}
+	console.log(`[obsidian-convex-sync] copied artifacts to ${devPluginDir}`);
+}
 
 const context = await esbuild.context({
 	banner: {
@@ -39,6 +81,19 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: "main.js",
 	minify: prod,
+	plugins: [
+		{
+			name: "copy-obsidian-artifacts",
+			setup(build) {
+				build.onEnd(async (result) => {
+					if (result.errors.length > 0) {
+						return;
+					}
+					await copyArtifactsToVault();
+				});
+			},
+		},
+	],
 });
 
 if (prod) {

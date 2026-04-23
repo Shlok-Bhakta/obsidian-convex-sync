@@ -6,6 +6,7 @@ import {
 	startBootstrapBuild,
 	type BootstrapUiState,
 } from "../bootstrap/service";
+import { DEFAULT_IGNORE_PATHS } from "./index";
 
 function formatBytes(value: number): string {
 	if (value < 1024) {
@@ -59,6 +60,103 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+
+		new Setting(containerEl)
+			.setName("Enable live sync")
+			.setDesc(
+				"Start background sync after plugin load and stream local changes to Convex continuously.",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.enableLiveSync)
+					.onChange(async (value) => {
+						this.plugin.settings.enableLiveSync = value;
+						await this.plugin.saveSettings();
+						void this.plugin.reloadLiveSync();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Sync .obsidian content")
+			.setDesc(
+				"Include vault configuration files in the normal per-file sync pipeline and bootstrap, while still honoring ignore rules below.",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.syncDotObsidian)
+					.onChange(async (value) => {
+						this.plugin.settings.syncDotObsidian = value;
+						await this.plugin.saveSettings();
+						void this.plugin.reloadLiveSync();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Binary version retention count")
+			.setDesc("Keep up to this many older binary versions per file on Convex.")
+			.addText((text) =>
+				text
+					.setPlaceholder("5")
+					.setValue(String(this.plugin.settings.binaryVersionRetentionCount))
+					.onChange(async (value) => {
+						const parsed = Number.parseInt(value, 10);
+						if (!Number.isNaN(parsed)) {
+							this.plugin.settings.binaryVersionRetentionCount = parsed;
+							await this.plugin.saveSettings();
+						}
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Trash retention days")
+			.setDesc("Keep deleted remote items recoverable on Convex for this many days.")
+			.addText((text) =>
+				text
+					.setPlaceholder("30")
+					.setValue(String(this.plugin.settings.trashRetentionDays))
+					.onChange(async (value) => {
+						const parsed = Number.parseInt(value, 10);
+						if (!Number.isNaN(parsed)) {
+							this.plugin.settings.trashRetentionDays = parsed;
+							await this.plugin.saveSettings();
+						}
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Filesystem batch window (ms)")
+			.setDesc("Debounce non-editor file-change bursts before pushing them to Convex. Open editor text changes are pushed much more aggressively.")
+			.addText((text) =>
+				text
+					.setPlaceholder("75")
+					.setValue(String(this.plugin.settings.editorBatchWindowMs))
+					.onChange(async (value) => {
+						const parsed = Number.parseInt(value, 10);
+						if (!Number.isNaN(parsed)) {
+							this.plugin.settings.editorBatchWindowMs = parsed;
+							await this.plugin.saveSettings();
+							void this.plugin.reloadLiveSync();
+						}
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Sync ignore paths")
+			.setDesc(
+				"One path per line. Matches the exact path or everything beneath it. Use .obsidian/... to target the config directory. Defaults shown below are safe to keep.",
+			)
+			.addTextArea((text) => {
+				text
+					.setPlaceholder(DEFAULT_IGNORE_PATHS)
+					.setValue(this.plugin.settings.syncIgnorePaths)
+					.onChange(async (value) => {
+						this.plugin.settings.syncIgnorePaths = value;
+						await this.plugin.saveSettings();
+						void this.plugin.reloadLiveSync();
+					});
+				text.inputEl.rows = 8;
+				text.inputEl.cols = 40;
+			});
 
 		new Setting(containerEl)
 			.setName("Convex URL")

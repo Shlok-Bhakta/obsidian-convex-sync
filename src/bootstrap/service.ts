@@ -1,6 +1,7 @@
 import type { ConvexHttpClient } from "convex/browser";
 import { runVaultFileSync } from "../file-sync";
 import type { MyPluginSettings } from "../settings";
+import { resolveClientId } from "../sync/client-id";
 
 type BootstrapHost = {
 	app: import("obsidian").App;
@@ -80,7 +81,7 @@ export async function startBootstrapBuild(
 	});
 	await (client.mutation as any)("bootstrap:startBuild", {
 		convexSecret: host.settings.convexSecret,
-		clientId: host.getPresenceSessionId(),
+		clientId: resolveClientId(host),
 		vaultName: host.app.vault.getName(),
 	});
 }

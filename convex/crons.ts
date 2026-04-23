@@ -10,4 +10,11 @@ crons.interval(
 	{},
 );
 
+crons.interval(
+	"Remove expired synced trash",
+	{ hours: 6 },
+	internal.fileSync.cleanupExpiredTrash,
+	{},
+);
+
 export default crons;

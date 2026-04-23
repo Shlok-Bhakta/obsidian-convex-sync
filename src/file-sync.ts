@@ -1,8 +1,11 @@
 import { ConvexHttpClient } from "convex/browser";
-import { unzipSync, zipSync } from "fflate";
 import { Notice, TFile, TFolder, normalizePath } from "obsidian";
 import { api } from "../convex/_generated/api";
 import type { MyPluginSettings } from "./settings";
+import { detectContentKind, type ContentKind } from "./sync/binary";
+import { resolveClientId } from "./sync/client-id";
+import { getConfigDir, parseIgnoreRules, shouldSyncPath } from "./sync/policy";
+import { collectSymlinkedPaths } from "./sync/symlinks";
 
 type FileSyncHost = {
 	app: App;
@@ -22,6 +25,7 @@ type Snapshot = {
 	files: Array<{
 		path: string;
 		contentHash: string;
+		contentKind: ContentKind;
 		sizeBytes: number;
 		updatedAtMs: number;
 		updatedByClientId: string;
@@ -32,31 +36,25 @@ type Snapshot = {
 		isExplicitlyEmpty: boolean;
 		updatedByClientId: string;
 	}>;
-	obsidianBundle: {
-		contentHash: string;
-		sizeBytes: number;
-		updatedAtMs: number;
-		updatedByClientId: string;
-	} | null;
 };
 
 type LocalFileEntry = {
 	path: string;
 	updatedAtMs: number;
 	readBytes: () => Promise<ArrayBuffer>;
-	writeBytes: (bytes: ArrayBuffer) => Promise<void>;
-	createBytes: (bytes: ArrayBuffer) => Promise<void>;
 };
 
-const ARG_CHUNK_SIZE = 500;
-const OBSIDIAN_ROOT = ".obsidian";
-const OBSIDIAN_BUNDLE_IGNORE_PREFIXES = [
-	".obsidian/cache/",
-	".obsidian/workspace-mobile.json",
-];
+type SyncScanContext = {
+	configDir: string;
+	ignoredPaths: string[];
+	symlinkedPaths: Set<string>;
+	syncDotObsidian: boolean;
+};
 
-function isObsidianPath(path: string): boolean {
-	return path === OBSIDIAN_ROOT || path.startsWith(`${OBSIDIAN_ROOT}/`);
+const RECONCILE_CLOCK_SKEW_TOLERANCE_MS = 10 * 60 * 1000;
+
+function isObsidianPath(path: string, configDir: string): boolean {
+	return path === configDir || path.startsWith(`${configDir}/`);
 }
 
 function toHex(buffer: ArrayBuffer): string {
@@ -79,7 +77,7 @@ function folderPathForFile(filePath: string): string | null {
 	return filePath.slice(0, slash);
 }
 
-async function ensureFolderExists(app: App, path: string): Promise<void> {
+async function ensureVaultFolderExists(app: App, path: string): Promise<void> {
 	const normalized = normalizePath(path);
 	if (!normalized) {
 		return;
@@ -90,7 +88,7 @@ async function ensureFolderExists(app: App, path: string): Promise<void> {
 	}
 	const parent = folderPathForFile(normalized);
 	if (parent) {
-		await ensureFolderExists(app, parent);
+		await ensureVaultFolderExists(app, parent);
 	}
 	await app.vault.createFolder(normalized);
 }
@@ -111,17 +109,47 @@ async function ensureAdapterFolderExists(app: App, path: string): Promise<void> 
 	await app.vault.adapter.mkdir(normalized);
 }
 
-function shouldIgnoreObsidianPath(path: string): boolean {
-	return OBSIDIAN_BUNDLE_IGNORE_PREFIXES.some(
-		(prefix) => path === prefix || path.startsWith(prefix),
-	);
+async function ensureLocalFolderExists(
+	app: App,
+	path: string,
+	configDir: string,
+): Promise<void> {
+	if (isObsidianPath(path, configDir)) {
+		await ensureAdapterFolderExists(app, path);
+		return;
+	}
+	await ensureVaultFolderExists(app, path);
+}
+
+async function createSyncScanContext(
+	host: Pick<FileSyncHost, "app" | "settings">,
+): Promise<SyncScanContext> {
+	const configDir = getConfigDir(host.app);
+	const ignoredPaths = parseIgnoreRules(host.settings, configDir);
+	const symlinkedPaths = await collectSymlinkedPaths(host.app, host.settings);
+	return {
+		configDir,
+		ignoredPaths,
+		symlinkedPaths,
+		syncDotObsidian: host.settings.syncDotObsidian,
+	};
+}
+
+function isPathInScope(path: string, context: SyncScanContext): boolean {
+	return shouldSyncPath({
+		path,
+		configDir: context.configDir,
+		ignoredPaths: context.ignoredPaths,
+		syncDotObsidian: context.syncDotObsidian,
+		symlinkedPaths: context.symlinkedPaths,
+	});
 }
 
 async function readRemoteFileBytes(
 	client: ConvexHttpClient,
 	secret: string,
 	path: string,
-): Promise<{ bytes: ArrayBuffer; updatedAtMs: number } | null> {
+): Promise<{ bytes: ArrayBuffer; updatedAtMs: number; contentKind: ContentKind } | null> {
 	const signed = await client.query(api.fileSync.getDownloadUrl, {
 		convexSecret: secret,
 		path,
@@ -134,10 +162,15 @@ async function readRemoteFileBytes(
 		throw new Error(`Failed downloading ${path}: HTTP ${response.status}`);
 	}
 	const bytes = await response.arrayBuffer();
-	return { bytes, updatedAtMs: signed.updatedAtMs };
+	return {
+		bytes,
+		updatedAtMs: signed.updatedAtMs,
+		contentKind: signed.contentKind as ContentKind,
+	};
 }
 
-async function uploadLocalFile(
+async function uploadBytesAtPath(
+	settings: Pick<MyPluginSettings, "binaryVersionRetentionCount">,
 	client: ConvexHttpClient,
 	secret: string,
 	clientId: string,
@@ -147,6 +180,7 @@ async function uploadLocalFile(
 ): Promise<"ok" | "stale_write"> {
 	const blob = new Blob([bytes], { type: "application/octet-stream" });
 	const contentHash = await sha256Bytes(bytes);
+	const contentKind = detectContentKind(bytes);
 	const issued = await client.mutation(api.fileSync.issueUploadUrl, {
 		convexSecret: secret,
 		path,
@@ -158,7 +192,7 @@ async function uploadLocalFile(
 	const uploadResponse = await fetch(issued.uploadUrl, {
 		method: "POST",
 		headers: {
-			"Content-Type": "text/markdown; charset=utf-8",
+			"Content-Type": "application/octet-stream",
 		},
 		body: blob,
 	});
@@ -174,9 +208,11 @@ async function uploadLocalFile(
 		path,
 		storageId: payload.storageId as never,
 		contentHash,
+		contentKind,
 		updatedAtMs,
 		sizeBytes: blob.size,
 		clientId,
+		retainBinaryVersions: settings.binaryVersionRetentionCount,
 	});
 	if (!finalized.ok && finalized.reason === "stale_write") {
 		return "stale_write";
@@ -184,7 +220,32 @@ async function uploadLocalFile(
 	return "ok";
 }
 
-function listEmptyFolders(app: App): string[] {
+async function readLocalPathSnapshot(
+	app: App,
+	path: string,
+	context: SyncScanContext,
+): Promise<{ bytes: ArrayBuffer; updatedAtMs: number } | null> {
+	const normalizedPath = normalizePath(path);
+	if (!isPathInScope(normalizedPath, context)) {
+		return null;
+	}
+	if (isObsidianPath(normalizedPath, context.configDir)) {
+		const stat = await app.vault.adapter.stat(normalizedPath);
+		if (!stat || stat.type !== "file") {
+			return null;
+		}
+		const bytes = await app.vault.adapter.readBinary(normalizedPath);
+		return { bytes, updatedAtMs: stat.mtime };
+	}
+	const file = app.vault.getFileByPath(normalizedPath);
+	if (!file) {
+		return null;
+	}
+	const bytes = await app.vault.readBinary(file);
+	return { bytes, updatedAtMs: file.stat.mtime };
+}
+
+function listEmptyFolders(app: App, context: SyncScanContext): string[] {
 	const all = app.vault.getAllLoadedFiles();
 	const empty: string[] = [];
 	for (const entry of all) {
@@ -195,8 +256,13 @@ function listEmptyFolders(app: App): string[] {
 			continue;
 		}
 		if (
-			entry.path === OBSIDIAN_ROOT ||
-			entry.path.startsWith(`${OBSIDIAN_ROOT}/`)
+			!shouldSyncPath({
+				path: entry.path,
+				configDir: context.configDir,
+				ignoredPaths: context.ignoredPaths,
+				syncDotObsidian: false,
+				symlinkedPaths: context.symlinkedPaths,
+			})
 		) {
 			continue;
 		}
@@ -207,200 +273,280 @@ function listEmptyFolders(app: App): string[] {
 	return empty;
 }
 
-async function collectDotObsidianState(app: App): Promise<{
-	files: Array<{ path: string; updatedAtMs: number }>;
-	emptyFolders: string[];
-	maxUpdatedAtMs: number;
-}> {
-	const rootExists = await app.vault.adapter.exists(OBSIDIAN_ROOT);
-	if (!rootExists) {
-		return { files: [], emptyFolders: [], maxUpdatedAtMs: 0 };
+async function collectConfigEntries(
+	app: App,
+	context: SyncScanContext,
+): Promise<{ files: LocalFileEntry[]; emptyFolders: string[] }> {
+	if (!context.syncDotObsidian) {
+		return { files: [], emptyFolders: [] };
 	}
-	const files: Array<{ path: string; updatedAtMs: number }> = [];
+	const rootExists = await app.vault.adapter.exists(context.configDir);
+	if (!rootExists) {
+		return { files: [], emptyFolders: [] };
+	}
+
+	const files: LocalFileEntry[] = [];
 	const emptyFolders: string[] = [];
-	let maxUpdatedAtMs = 0;
-	const queue: string[] = [OBSIDIAN_ROOT];
+	const queue: string[] = [context.configDir];
 	while (queue.length > 0) {
 		const current = queue.shift();
-		if (!current) {
-			continue;
-		}
-		if (shouldIgnoreObsidianPath(current)) {
+		if (!current || !isPathInScope(current, context)) {
 			continue;
 		}
 		const listed = await app.vault.adapter.list(current);
 		if (listed.files.length === 0 && listed.folders.length === 0) {
 			emptyFolders.push(normalizePath(current));
 		}
+
 		for (const filePath of listed.files) {
-			if (shouldIgnoreObsidianPath(filePath)) {
+			const normalizedPath = normalizePath(filePath);
+			if (!isPathInScope(normalizedPath, context)) {
 				continue;
 			}
-			const stat = await app.vault.adapter.stat(filePath);
+			const stat = await app.vault.adapter.stat(normalizedPath);
 			if (!stat || stat.type !== "file") {
 				continue;
 			}
-			if (stat.mtime > maxUpdatedAtMs) {
-				maxUpdatedAtMs = stat.mtime;
-			}
 			files.push({
-				path: normalizePath(filePath),
+				path: normalizedPath,
 				updatedAtMs: stat.mtime,
+				readBytes: () => app.vault.adapter.readBinary(normalizedPath),
 			});
 		}
+
 		for (const folderPath of listed.folders) {
 			queue.push(normalizePath(folderPath));
 		}
 	}
-	return { files, emptyFolders, maxUpdatedAtMs };
+	return { files, emptyFolders };
 }
 
-async function listLocalEntries(host: FileSyncHost): Promise<{
+async function listLocalEntries(
+	host: FileSyncHost,
+	context: SyncScanContext,
+): Promise<{
 	files: LocalFileEntry[];
 	emptyFolders: string[];
 }> {
 	const fromVault = host.app.vault
 		.getAllLoadedFiles()
 		.filter((entry): entry is TFile => entry instanceof TFile)
-		.filter(
-			(file) =>
-				file.path !== OBSIDIAN_ROOT &&
-				!file.path.startsWith(`${OBSIDIAN_ROOT}/`),
+		.filter((file) =>
+			shouldSyncPath({
+				path: file.path,
+				configDir: context.configDir,
+				ignoredPaths: context.ignoredPaths,
+				syncDotObsidian: false,
+				symlinkedPaths: context.symlinkedPaths,
+			}),
 		)
 		.map<LocalFileEntry>((file) => ({
 			path: normalizePath(file.path),
 			updatedAtMs: file.stat.mtime,
 			readBytes: () => host.app.vault.readBinary(file),
-			writeBytes: (bytes) => host.app.vault.modifyBinary(file, bytes),
-			createBytes: (bytes) => host.app.vault.createBinary(file.path, bytes).then(() => {}),
 		}));
 
+	const configEntries = await collectConfigEntries(host.app, context);
 	const byPath = new Map<string, LocalFileEntry>();
-	for (const entry of fromVault) {
+	for (const entry of [...fromVault, ...configEntries.files]) {
 		byPath.set(entry.path, entry);
 	}
 
 	return {
 		files: [...byPath.values()],
-		emptyFolders: listEmptyFolders(host.app),
+		emptyFolders: [...listEmptyFolders(host.app, context), ...configEntries.emptyFolders],
 	};
 }
 
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-	return bytes.buffer.slice(
-		bytes.byteOffset,
-		bytes.byteOffset + bytes.byteLength,
-	) as ArrayBuffer;
+export async function pushVaultPathUpdate(
+	host: FileSyncHost,
+	path: string,
+): Promise<void> {
+	const secret = host.settings.convexSecret.trim();
+	if (!secret) {
+		return;
+	}
+	const normalizedPath = normalizePath(path);
+	const context = await createSyncScanContext(host);
+	const local = await readLocalPathSnapshot(host.app, normalizedPath, context);
+	if (!local) {
+		return;
+	}
+	await uploadBytesAtPath(
+		host.settings,
+		host.getConvexHttpClient(),
+		secret,
+		resolveClientId(host),
+		normalizedPath,
+		local.bytes,
+		local.updatedAtMs,
+	);
 }
 
-async function buildObsidianBundle(app: App): Promise<{
-	zipBytes: ArrayBuffer | null;
-	updatedAtMs: number;
-}> {
-	const state = await collectDotObsidianState(app);
-	if (state.files.length === 0) {
-		return { zipBytes: null, updatedAtMs: 0 };
+export async function pushVaultTextUpdate(
+	host: FileSyncHost,
+	path: string,
+	text: string,
+	updatedAtMs = Date.now(),
+): Promise<void> {
+	const secret = host.settings.convexSecret.trim();
+	if (!secret) {
+		return;
 	}
-	const archiveEntries: Record<string, Uint8Array> = {};
-	for (const file of state.files) {
-		const relPath = file.path.slice(`${OBSIDIAN_ROOT}/`.length);
-		if (!relPath) {
-			continue;
-		}
-		const raw = await app.vault.adapter.readBinary(file.path);
-		archiveEntries[relPath] = new Uint8Array(raw);
+	const normalizedPath = normalizePath(path);
+	const context = await createSyncScanContext(host);
+	if (!isPathInScope(normalizedPath, context) || isObsidianPath(normalizedPath, context.configDir)) {
+		return;
 	}
-	const zipped = zipSync(archiveEntries, { level: 6 });
-	return { zipBytes: toArrayBuffer(zipped), updatedAtMs: state.maxUpdatedAtMs };
-}
-
-async function readRemoteObsidianBundle(
-	client: ConvexHttpClient,
-	secret: string,
-): Promise<{ bytes: ArrayBuffer; updatedAtMs: number } | null> {
-	const signed = await client.query(api.fileSync.getBundleDownloadUrl, {
-		convexSecret: secret,
-	});
-	if (!signed) {
-		return null;
-	}
-	const response = await fetch(signed.url, { method: "GET", cache: "no-store" });
-	if (!response.ok) {
-		throw new Error(
-			`Failed downloading ${OBSIDIAN_ROOT} bundle: HTTP ${response.status}`,
-		);
-	}
-	return { bytes: await response.arrayBuffer(), updatedAtMs: signed.updatedAtMs };
-}
-
-async function uploadObsidianBundle(
-	client: ConvexHttpClient,
-	secret: string,
-	clientId: string,
-	zipBytes: ArrayBuffer,
-	updatedAtMs: number,
-): Promise<"ok" | "stale_write"> {
-	const blob = new Blob([zipBytes], { type: "application/zip" });
-	const contentHash = await sha256Bytes(zipBytes);
-	const issued = await client.mutation(api.fileSync.issueBundleUploadUrl, {
-		convexSecret: secret,
-		contentHash,
+	const bytes = new TextEncoder().encode(text).buffer as ArrayBuffer;
+	await uploadBytesAtPath(
+		host.settings,
+		host.getConvexHttpClient(),
+		secret,
+		resolveClientId(host),
+		normalizedPath,
+		bytes,
 		updatedAtMs,
-		sizeBytes: blob.size,
-		clientId,
-	});
-	const uploadResponse = await fetch(issued.uploadUrl, {
-		method: "POST",
-		headers: { "Content-Type": "application/zip" },
-		body: blob,
-	});
-	if (!uploadResponse.ok) {
-		throw new Error(
-			`Upload failed for ${OBSIDIAN_ROOT} bundle: HTTP ${uploadResponse.status}`,
-		);
-	}
-	const payload = (await uploadResponse.json()) as { storageId?: string };
-	if (!payload.storageId) {
-		throw new Error("Upload did not return storageId for .obsidian bundle");
-	}
-	const finalized = await client.mutation(api.fileSync.finalizeBundleUpload, {
-		convexSecret: secret,
-		storageId: payload.storageId as never,
-		contentHash,
-		updatedAtMs,
-		sizeBytes: blob.size,
-		clientId,
-	});
-	if (!finalized.ok && finalized.reason === "stale_write") {
-		return "stale_write";
-	}
-	return "ok";
+	);
 }
 
-async function applyObsidianBundle(app: App, zipBytes: ArrayBuffer): Promise<void> {
-	await ensureAdapterFolderExists(app, OBSIDIAN_ROOT);
-	const archive = unzipSync(new Uint8Array(zipBytes));
-	const archivePaths = new Set<string>();
-	for (const [relativePath, content] of Object.entries(archive)) {
-		const cleanRelative = normalizePath(relativePath);
-		const fullPath = normalizePath(`${OBSIDIAN_ROOT}/${cleanRelative}`);
-		if (shouldIgnoreObsidianPath(fullPath)) {
-			continue;
+export async function trashRemoteVaultPaths(
+	host: FileSyncHost,
+	paths: string[],
+): Promise<void> {
+	if (paths.length === 0) {
+		return;
+	}
+	const secret = host.settings.convexSecret.trim();
+	if (!secret) {
+		return;
+	}
+	await host.getConvexHttpClient().mutation(api.fileSync.removeFilesByPath, {
+		convexSecret: secret,
+		removedPaths: paths.map((path) => normalizePath(path)),
+		clientId: resolveClientId(host),
+		deletedAtMs: Date.now(),
+		trashRetentionDays: host.settings.trashRetentionDays,
+	});
+}
+
+export async function renameRemoteVaultPath(
+	host: FileSyncHost,
+	oldPath: string,
+	newPath: string,
+): Promise<void> {
+	const secret = host.settings.convexSecret.trim();
+	if (!secret) {
+		return;
+	}
+	await host.getConvexHttpClient().mutation(api.fileSync.renamePath, {
+		convexSecret: secret,
+		oldPath: normalizePath(oldPath),
+		newPath: normalizePath(newPath),
+		clientId: resolveClientId(host),
+		updatedAtMs: Date.now(),
+	});
+}
+
+export async function applyRemoteVaultPath(
+	host: FileSyncHost,
+	path: string,
+): Promise<void> {
+	const secret = host.settings.convexSecret.trim();
+	if (!secret) {
+		return;
+	}
+	const normalizedPath = normalizePath(path);
+	const remote = await readRemoteFileBytes(
+		host.getConvexHttpClient(),
+		secret,
+		normalizedPath,
+	);
+	if (!remote) {
+		return;
+	}
+	const parent = folderPathForFile(normalizedPath);
+	if (parent) {
+		await ensureLocalFolderExists(host.app, parent, getConfigDir(host.app));
+	}
+
+	if (isObsidianPath(normalizedPath, getConfigDir(host.app))) {
+		await host.app.vault.adapter.writeBinary(normalizedPath, remote.bytes);
+		return;
+	}
+
+	if (remote.contentKind === "text") {
+		const text = new TextDecoder().decode(remote.bytes);
+		const existing = host.app.vault.getFileByPath(normalizedPath);
+		if (existing) {
+			await host.app.vault.modify(existing, text);
+			return;
 		}
-		archivePaths.add(fullPath);
-		const parent = folderPathForFile(fullPath);
+		await host.app.vault.create(normalizedPath, text);
+		return;
+	}
+
+	const existing = host.app.vault.getFileByPath(normalizedPath);
+	if (existing) {
+		await host.app.vault.modifyBinary(existing, remote.bytes);
+		return;
+	}
+	await host.app.vault.createBinary(normalizedPath, remote.bytes);
+}
+
+export async function applyRemoteDelete(
+	host: FileSyncHost,
+	path: string,
+): Promise<void> {
+	const normalizedPath = normalizePath(path);
+	if (isObsidianPath(normalizedPath, getConfigDir(host.app))) {
+		if (await host.app.vault.adapter.exists(normalizedPath)) {
+			await host.app.vault.adapter.remove(normalizedPath);
+		}
+		return;
+	}
+	const existing = host.app.vault.getAbstractFileByPath(normalizedPath);
+	if (!existing) {
+		return;
+	}
+	await host.app.vault.trash(existing, false);
+}
+
+export async function applyRemoteRename(
+	host: FileSyncHost,
+	oldPath: string,
+	newPath: string,
+): Promise<void> {
+	const normalizedOldPath = normalizePath(oldPath);
+	const normalizedNewPath = normalizePath(newPath);
+	const configDir = getConfigDir(host.app);
+
+	if (
+		isObsidianPath(normalizedOldPath, configDir) ||
+		isObsidianPath(normalizedNewPath, configDir)
+	) {
+		const parent = folderPathForFile(normalizedNewPath);
 		if (parent) {
-			await ensureAdapterFolderExists(app, parent);
+			await ensureAdapterFolderExists(host.app, parent);
 		}
-		await app.vault.adapter.writeBinary(fullPath, toArrayBuffer(content));
+		if (await host.app.vault.adapter.exists(normalizedOldPath)) {
+			await host.app.vault.adapter.rename(normalizedOldPath, normalizedNewPath);
+			return;
+		}
+		await applyRemoteVaultPath(host, normalizedNewPath);
+		return;
 	}
-	const existing = await collectDotObsidianState(app);
-	const staleFiles = existing.files
-		.map((f) => f.path)
-		.filter((path) => !archivePaths.has(path));
-	for (const filePath of staleFiles) {
-		await app.vault.adapter.remove(filePath);
+
+	const existing = host.app.vault.getAbstractFileByPath(normalizedOldPath);
+	if (!existing) {
+		await applyRemoteVaultPath(host, normalizedNewPath);
+		return;
 	}
+	const parent = folderPathForFile(normalizedNewPath);
+	if (parent) {
+		await ensureVaultFolderExists(host.app, parent);
+	}
+	await host.app.vault.rename(existing, normalizedNewPath);
 }
 
 export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
@@ -412,7 +558,11 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 	}
 
 	const client = host.getConvexHttpClient();
-	const clientId = host.getPresenceSessionId();
+	const clientId = resolveClientId(host);
+	const context = await createSyncScanContext(host);
+	await client.mutation(api.fileSync.repairFutureTimestamps, {
+		convexSecret: secret,
+	});
 	host.reportSyncProgress?.({
 		phase: "Preparing snapshot",
 		completed: 0,
@@ -421,27 +571,18 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 	const snapshot = (await client.query(api.fileSync.listSnapshot, {
 		convexSecret: secret,
 	})) as Snapshot;
-	const remoteByPath = new Map(
-		snapshot.files
-			.filter((row) => !isObsidianPath(row.path))
-			.map((row) => [row.path, row]),
-	);
+	const remoteFiles = snapshot.files.filter((row) => isPathInScope(row.path, context));
+	const remoteByPath = new Map(remoteFiles.map((row) => [row.path, row]));
 	for (const remoteFolder of snapshot.folders) {
-		if (!remoteFolder.isExplicitlyEmpty) {
+		if (!remoteFolder.isExplicitlyEmpty || !isPathInScope(remoteFolder.path, context)) {
 			continue;
 		}
-		const existing = host.app.vault.getAbstractFileByPath(remoteFolder.path);
-		if (!existing) {
-			await ensureFolderExists(host.app, remoteFolder.path);
-		}
+		await ensureLocalFolderExists(host.app, remoteFolder.path, context.configDir);
 	}
 
-	const localState = await listLocalEntries(host);
+	const localState = await listLocalEntries(host, context);
 	const localFiles = localState.files;
-	const remoteNonObsidianCount = snapshot.files.filter(
-		(file) => !isObsidianPath(file.path),
-	).length;
-	const totalSteps = localFiles.length + remoteNonObsidianCount + 3;
+	const totalSteps = localFiles.length + remoteFiles.length + 1;
 	let completedSteps = 0;
 	const tick = (phase: string): void => {
 		completedSteps += 1;
@@ -452,6 +593,7 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		});
 	};
 	const localPaths = new Set<string>();
+	const now = Date.now();
 	for (const localFile of localFiles) {
 		const path = normalizePath(localFile.path);
 		localPaths.add(path);
@@ -459,7 +601,8 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		const remote = remoteByPath.get(path);
 		if (!remote) {
 			const bytes = await localFile.readBytes();
-			await uploadLocalFile(
+			await uploadBytesAtPath(
+				host.settings,
 				client,
 				secret,
 				clientId,
@@ -467,12 +610,17 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 				bytes,
 				localUpdatedAtMs,
 			);
-			tick("Uploading local files");
+				tick("Uploading local files");
 			continue;
 		}
-		if (localUpdatedAtMs > remote.updatedAtMs) {
+		const remoteComparableUpdatedAtMs = Math.min(remote.updatedAtMs, now);
+		const isWithinSkewTolerance =
+			Math.abs(localUpdatedAtMs - remoteComparableUpdatedAtMs) <=
+			RECONCILE_CLOCK_SKEW_TOLERANCE_MS;
+		if (!isWithinSkewTolerance && localUpdatedAtMs > remoteComparableUpdatedAtMs) {
 			const bytes = await localFile.readBytes();
-			const result = await uploadLocalFile(
+			const result = await uploadBytesAtPath(
+				host.settings,
 				client,
 				secret,
 				clientId,
@@ -481,21 +629,13 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 				localUpdatedAtMs,
 			);
 			if (result === "stale_write") {
-				const remotePayload = await readRemoteFileBytes(client, secret, path);
-				if (remotePayload) {
-					await localFile.writeBytes(remotePayload.bytes);
-				}
+				await applyRemoteVaultPath(host, path);
 			}
 			tick("Reconciling newer local files");
 			continue;
 		}
-		if (remote.updatedAtMs > localUpdatedAtMs) {
-			const remotePayload = await readRemoteFileBytes(client, secret, path);
-			if (!remotePayload) {
-				tick("Skipping unavailable remote updates");
-				continue;
-			}
-			await localFile.writeBytes(remotePayload.bytes);
+		if (!isWithinSkewTolerance && remoteComparableUpdatedAtMs > localUpdatedAtMs) {
+			await applyRemoteVaultPath(host, path);
 			tick("Pulling newer remote files");
 			continue;
 		}
@@ -507,7 +647,8 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		}
 		const localWins = clientId.localeCompare(remote.updatedByClientId) <= 0;
 		if (localWins) {
-			await uploadLocalFile(
+			await uploadBytesAtPath(
+				host.settings,
 				client,
 				secret,
 				clientId,
@@ -516,97 +657,19 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 				localUpdatedAtMs,
 			);
 		} else {
-			const remotePayload = await readRemoteFileBytes(client, secret, path);
-			if (remotePayload) {
-				await localFile.writeBytes(remotePayload.bytes);
-			}
+			await applyRemoteVaultPath(host, path);
 		}
 		tick("Resolving equal-timestamp conflicts");
 	}
 
-	for (const remoteFile of snapshot.files) {
-		if (isObsidianPath(remoteFile.path)) {
-			continue;
-		}
+	for (const remoteFile of remoteFiles) {
 		if (localPaths.has(remoteFile.path)) {
 			tick("Skipping existing remote files");
 			continue;
 		}
-		const remotePayload = await readRemoteFileBytes(
-			client,
-			secret,
-			remoteFile.path,
-		);
-		if (!remotePayload) {
-			tick("Skipping unavailable remote files");
-			continue;
-		}
-		const parent = folderPathForFile(remoteFile.path);
-		if (parent) {
-			await ensureFolderExists(host.app, parent);
-		}
-		await host.app.vault.createBinary(remoteFile.path, remotePayload.bytes);
+		await applyRemoteVaultPath(host, remoteFile.path);
 		tick("Creating missing local files");
 	}
-
-	const localBundle = await buildObsidianBundle(host.app);
-	const remoteBundle = snapshot.obsidianBundle;
-	if (localBundle.zipBytes && !remoteBundle) {
-		await uploadObsidianBundle(
-			client,
-			secret,
-			clientId,
-			localBundle.zipBytes,
-			localBundle.updatedAtMs,
-		);
-	} else if (localBundle.zipBytes && remoteBundle) {
-		if (localBundle.updatedAtMs > remoteBundle.updatedAtMs) {
-			const result = await uploadObsidianBundle(
-				client,
-				secret,
-				clientId,
-				localBundle.zipBytes,
-				localBundle.updatedAtMs,
-			);
-			if (result === "stale_write") {
-				const remote = await readRemoteObsidianBundle(client, secret);
-				if (remote) {
-					await applyObsidianBundle(host.app, remote.bytes);
-				}
-			}
-		} else if (remoteBundle.updatedAtMs > localBundle.updatedAtMs) {
-			const remote = await readRemoteObsidianBundle(client, secret);
-			if (remote) {
-				await applyObsidianBundle(host.app, remote.bytes);
-			}
-		} else {
-			const localHash = await sha256Bytes(localBundle.zipBytes);
-			if (localHash !== remoteBundle.contentHash) {
-				const localWins =
-					clientId.localeCompare(remoteBundle.updatedByClientId) <= 0;
-				if (localWins) {
-					await uploadObsidianBundle(
-						client,
-						secret,
-						clientId,
-						localBundle.zipBytes,
-						localBundle.updatedAtMs,
-					);
-				} else {
-					const remote = await readRemoteObsidianBundle(client, secret);
-					if (remote) {
-						await applyObsidianBundle(host.app, remote.bytes);
-					}
-				}
-			}
-		}
-	} else if (!localBundle.zipBytes && remoteBundle) {
-		const remote = await readRemoteObsidianBundle(client, secret);
-		if (remote) {
-			await applyObsidianBundle(host.app, remote.bytes);
-		}
-	}
-	tick("Syncing .obsidian bundle");
 
 	await client.mutation(api.fileSync.syncFolderState, {
 		convexSecret: secret,
@@ -615,18 +678,6 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		emptyFolderPaths: localState.emptyFolders,
 	});
 	tick("Syncing folder state");
-
-	const removedRemotePaths = snapshot.files
-		.map((file) => file.path)
-		.filter((path) => !localPaths.has(path));
-	for (let i = 0; i < removedRemotePaths.length; i += ARG_CHUNK_SIZE) {
-		const chunk = removedRemotePaths.slice(i, i + ARG_CHUNK_SIZE);
-		await client.mutation(api.fileSync.removeFilesByPath, {
-			convexSecret: secret,
-			removedPaths: chunk,
-		});
-	}
-	tick("Pruning remote deletions");
 
 	new Notice("Convex sync: vault files synchronized.", 5000);
 }

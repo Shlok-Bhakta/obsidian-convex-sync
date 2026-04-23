@@ -8,6 +8,7 @@ import {
 } from "./clients-presence";
 import { ConvexClientManager } from "./convex/client-manager";
 import { runVaultFileSync } from "./file-sync";
+import { startLiveSync } from "./live-sync";
 import {
 	ensureVaultSecretRegisteredWithDeployment,
 	mintVaultApiSecretFromConvexSite,
@@ -24,14 +25,15 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 	private presenceSessionId = "";
 	private convex = new ConvexClientManager(() => this.settings);
 	private syncStatusBarItemEl: HTMLElement | null = null;
+	private stopLiveSync: (() => void) | null = null;
 
-	getPresenceSessionId(): string {
-		return this.presenceSessionId;
-	}
-
+	getPresenceSessionId = (): string => this.presenceSessionId;
 	getConvexHttpClient = () => this.convex.getHttp();
 	getConvexRealtimeClient = () => this.convex.getRealtime();
 	getKeepaliveHttpClient = () => this.convex.getKeepaliveHttp();
+	setSyncStatus = (text: string) => {
+		this.syncStatusBarItemEl?.setText(text);
+	};
 
 	async onload() {
 		await this.loadSettings();
@@ -62,7 +64,7 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "sync-vault-files",
-			name: "Sync vault files with Convex",
+			name: "Reconcile vault files with Convex",
 			callback: () => {
 				this.syncStatusBarItemEl?.setText("Convex sync: starting...");
 				void runVaultFileSync({
@@ -102,10 +104,12 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 		this.syncStatusBarItemEl = this.addStatusBarItem();
 		this.syncStatusBarItemEl.setText("Convex sync: idle");
 		this.addSettingTab(new ConvexSyncSettingTab(this.app, this));
-
+		await this.reloadLiveSync();
 	}
 
 	onunload() {
+		this.stopLiveSync?.();
+		this.stopLiveSync = null;
 		void leaveClientsPresence(this);
 		this.convex.dispose();
 	}
@@ -126,6 +130,16 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async reloadLiveSync(): Promise<void> {
+		this.stopLiveSync?.();
+		this.stopLiveSync = null;
+		if (!this.settings.enableLiveSync) {
+			this.syncStatusBarItemEl?.setText("Convex sync: live sync disabled");
+			return;
+		}
+		this.stopLiveSync = startLiveSync(this);
 	}
 
 	async ensureConvexSecretRegisteredWithDeployment(): Promise<void> {

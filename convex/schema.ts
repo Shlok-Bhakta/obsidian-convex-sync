@@ -12,11 +12,34 @@ export default defineSchema({
 		storageId: v.id("_storage"),
 		contentHash: v.string(),
 		sizeBytes: v.number(),
+		contentKind: v.union(v.literal("text"), v.literal("binary")),
 		updatedAtMs: v.number(),
 		updatedByClientId: v.string(),
 	})
 		.index("by_path", ["path"])
 		.index("by_updatedAtMs", ["updatedAtMs"]),
+	vaultFileTrash: defineTable({
+		path: v.string(),
+		storageId: v.id("_storage"),
+		contentHash: v.string(),
+		sizeBytes: v.number(),
+		contentKind: v.union(v.literal("text"), v.literal("binary")),
+		lastKnownUpdatedAtMs: v.number(),
+		deletedAtMs: v.number(),
+		deletedByClientId: v.string(),
+		expiresAtMs: v.number(),
+	})
+		.index("by_path", ["path"])
+		.index("by_expiresAtMs", ["expiresAtMs"]),
+	vaultBinaryVersions: defineTable({
+		path: v.string(),
+		storageId: v.id("_storage"),
+		contentHash: v.string(),
+		sizeBytes: v.number(),
+		createdAtMs: v.number(),
+	})
+		.index("by_path", ["path"])
+		.index("by_createdAtMs", ["createdAtMs"]),
 	vaultFolders: defineTable({
 		path: v.string(),
 		updatedAtMs: v.number(),
@@ -25,14 +48,26 @@ export default defineSchema({
 	})
 		.index("by_path", ["path"])
 		.index("by_updatedAtMs", ["updatedAtMs"]),
-	vaultBundles: defineTable({
-		scope: v.string(),
-		storageId: v.id("_storage"),
-		contentHash: v.string(),
-		sizeBytes: v.number(),
+	vaultOperations: defineTable({
+		clientId: v.string(),
+		kind: v.union(
+			v.literal("file_upsert"),
+			v.literal("file_delete"),
+			v.literal("path_rename"),
+		),
+		entryType: v.union(
+			v.literal("file"),
+			v.literal("folder"),
+		),
+		path: v.string(),
+		oldPath: v.optional(v.string()),
+		contentHash: v.optional(v.string()),
+		contentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		sizeBytes: v.optional(v.number()),
 		updatedAtMs: v.number(),
-		updatedByClientId: v.string(),
-	}).index("by_scope", ["scope"]),
+	})
+		.index("by_updatedAtMs", ["updatedAtMs"])
+		.index("by_path", ["path"]),
 	vaultBootstraps: defineTable({
 		status: v.union(
 			v.literal("building"),
