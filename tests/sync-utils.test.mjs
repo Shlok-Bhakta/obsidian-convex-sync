@@ -4,6 +4,7 @@ import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
 const { detectContentKind } = jiti("../src/sync/binary.ts");
+const { hasSameCachedContent } = jiti("../src/file-sync.ts");
 const { parseIgnoreRules, isPathIgnored, shouldSyncPath } = jiti(
 	"../src/sync/policy.ts",
 );
@@ -46,4 +47,11 @@ test("shouldSyncPath rejects ignored and symlinked descendants", () => {
 	assert.equal(shouldSyncPath({ ...options, path: "notes/file.md" }), true);
 	assert.equal(shouldSyncPath({ ...options, path: "ignored/path/file.md" }), false);
 	assert.equal(shouldSyncPath({ ...options, path: "linked/file.md" }), false);
+});
+
+test("hasSameCachedContent only trusts matching content hashes", () => {
+	assert.equal(hasSameCachedContent({ contentHash: "abc" }, "abc"), true);
+	assert.equal(hasSameCachedContent({ contentHash: "abc" }, "def"), false);
+	assert.equal(hasSameCachedContent({ contentHash: null }, "abc"), false);
+	assert.equal(hasSameCachedContent(null, "abc"), false);
 });

@@ -6,6 +6,7 @@ import {
 	startBootstrapBuild,
 	type BootstrapUiState,
 } from "../bootstrap/service";
+import { clearSyncDebugEvents, getSyncDebugReport } from "../sync/debug";
 import { DEFAULT_IGNORE_PATHS } from "./index";
 
 function formatBytes(value: number): string {
@@ -157,6 +158,36 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 				text.inputEl.rows = 8;
 				text.inputEl.cols = 40;
 			});
+
+		new Setting(containerEl)
+			.setName("Enable sync debug logging")
+			.setDesc(
+				"Capture recent sync events in memory and print them to the developer console. Leave this off unless you are debugging.",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.enableDebugLogging)
+					.onChange(async (value) => {
+						this.plugin.settings.enableDebugLogging = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Sync debug report")
+			.setDesc("Copy the buffered debug events and current sync settings for troubleshooting.")
+			.addButton((button) =>
+				button.setButtonText("Copy report").onClick(async () => {
+					await navigator.clipboard.writeText(getSyncDebugReport(this.app, this.plugin.settings));
+					new Notice("Convex sync debug report copied.");
+				}),
+			)
+			.addButton((button) =>
+				button.setButtonText("Clear log").onClick(() => {
+					clearSyncDebugEvents();
+					new Notice("Convex sync debug log cleared.");
+				}),
+			);
 
 		new Setting(containerEl)
 			.setName("Convex URL")

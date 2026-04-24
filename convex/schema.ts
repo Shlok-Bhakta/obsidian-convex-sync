@@ -7,6 +7,93 @@ export default defineSchema({
 		text: v.string(),
 		isCompleted: v.boolean(),
 	}),
+	fileManifests: defineTable({
+		fileId: v.string(),
+		path: v.string(),
+		revision: v.number(),
+		deleted: v.boolean(),
+		storageId: v.optional(v.id("_storage")),
+		contentHash: v.optional(v.string()),
+		sizeBytes: v.optional(v.number()),
+		contentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		latestSnapshotRevision: v.optional(v.number()),
+		updatedAtMs: v.number(),
+		updatedByClientId: v.string(),
+	})
+		.index("by_fileId", ["fileId"])
+		.index("by_path", ["path"]),
+	fileRevisions: defineTable({
+		fileId: v.string(),
+		revision: v.number(),
+		globalCursor: v.number(),
+		kind: v.union(v.literal("upsert"), v.literal("rename"), v.literal("delete")),
+		path: v.string(),
+		previousPath: v.optional(v.string()),
+		baseRevision: v.number(),
+		storageId: v.optional(v.id("_storage")),
+		contentHash: v.optional(v.string()),
+		sizeBytes: v.optional(v.number()),
+		contentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		clientId: v.string(),
+		idempotencyKey: v.string(),
+		createdAtMs: v.number(),
+	})
+		.index("by_file_revision", ["fileId", "revision"])
+		.index("by_idempotencyKey", ["idempotencyKey"]),
+	fileSnapshots: defineTable({
+		fileId: v.string(),
+		revision: v.number(),
+		path: v.string(),
+		storageId: v.id("_storage"),
+		contentHash: v.string(),
+		sizeBytes: v.number(),
+		contentKind: v.union(v.literal("text"), v.literal("binary")),
+		createdAtMs: v.number(),
+	})
+		.index("by_file_revision", ["fileId", "revision"]),
+	globalChanges: defineTable({
+		cursor: v.number(),
+		fileId: v.string(),
+		revision: v.number(),
+		kind: v.union(v.literal("upsert"), v.literal("rename"), v.literal("delete")),
+		path: v.string(),
+		previousPath: v.optional(v.string()),
+		contentHash: v.optional(v.string()),
+		sizeBytes: v.optional(v.number()),
+		contentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		clientId: v.string(),
+		createdAtMs: v.number(),
+	})
+		.index("by_cursor", ["cursor"])
+		.index("by_fileId", ["fileId"]),
+	conflicts: defineTable({
+		fileId: v.string(),
+		status: v.union(v.literal("open"), v.literal("resolved")),
+		type: v.union(
+			v.literal("text"),
+			v.literal("binary"),
+			v.literal("rename"),
+			v.literal("delete"),
+			v.literal("stale_base"),
+		),
+		baseRevision: v.number(),
+		headRevision: v.number(),
+		path: v.string(),
+		serverPath: v.string(),
+		clientId: v.string(),
+		attemptedStorageId: v.optional(v.id("_storage")),
+		attemptedContentHash: v.optional(v.string()),
+		attemptedSizeBytes: v.optional(v.number()),
+		attemptedContentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		createdAtMs: v.number(),
+	})
+		.index("by_status", ["status"])
+		.index("by_fileId", ["fileId"]),
+	syncHead: defineTable({
+		singletonKey: v.string(),
+		cursor: v.number(),
+		updatedAtMs: v.number(),
+	}).index("by_singletonKey", ["singletonKey"]),
 	vaultFiles: defineTable({
 		path: v.string(),
 		storageId: v.id("_storage"),
@@ -104,5 +191,7 @@ export default defineSchema({
 		openFilePath: v.string(),
 		cursor: editorCursor,
 		lastHeartbeatAt: v.number(),
+		lastSeenCursor: v.optional(v.number()),
+		lastCursorSeenAt: v.optional(v.number()),
 	}).index("by_clientId", ["clientId"]),
 });

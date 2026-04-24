@@ -9,6 +9,7 @@ export interface MyPluginSettings {
 	editorBatchWindowMs: number;
 	syncIgnorePaths: string;
 	syncDotObsidian: boolean;
+	enableDebugLogging: boolean;
 }
 
 export const DEFAULT_IGNORE_PATHS = [
@@ -30,6 +31,7 @@ export const DEFAULT_SETTINGS: MyPluginSettings = {
 	editorBatchWindowMs: 75,
 	syncIgnorePaths: DEFAULT_IGNORE_PATHS,
 	syncDotObsidian: true,
+	enableDebugLogging: false,
 };
 
 export function normalizeLoadedSettings(raw: unknown): MyPluginSettings {
@@ -54,5 +56,6 @@ export function normalizeLoadedSettings(raw: unknown): MyPluginSettings {
 	if (typeof merged.syncIgnorePaths !== "string") {
 		merged.syncIgnorePaths = DEFAULT_IGNORE_PATHS;
 	}
+	merged.enableDebugLogging = merged.enableDebugLogging === true;
 	return merged;
 }

@@ -21,36 +21,54 @@ const defaultDevPluginDir = path.resolve(
 	"plugins",
 	manifest.id,
 );
-const devPluginDir =
+const defaultDevPluginDirs = [
+	defaultDevPluginDir,
+	path.resolve(
+		process.env.HOME ?? "/home/shlok",
+		"Downloads",
+		"convex-sync",
+		".obsidian",
+		"plugins",
+		manifest.id,
+	),
+];
+const devPluginDirs = (
+	process.env.OBSIDIAN_PLUGIN_DEV_DIRS ??
 	process.env.OBSIDIAN_PLUGIN_DEV_DIR ??
-	defaultDevPluginDir;
+	defaultDevPluginDirs.join(path.delimiter)
+)
+	.split(path.delimiter)
+	.map((pluginDir) => pluginDir.trim())
+	.filter((pluginDir) => pluginDir.length > 0);
 
 async function copyArtifactsToVault() {
-	if (!devPluginDir) {
+	if (devPluginDirs.length === 0) {
 		return;
 	}
-	await mkdir(devPluginDir, { recursive: true });
-	for (const artifact of ["main.js", "manifest.json", "styles.css"]) {
-		const destination = path.join(devPluginDir, artifact);
-		try {
-			const stat = await lstat(destination).catch(() => null);
-			if (stat?.isSymbolicLink()) {
-				await unlink(destination);
+	for (const devPluginDir of devPluginDirs) {
+		await mkdir(devPluginDir, { recursive: true });
+		for (const artifact of ["main.js", "manifest.json", "styles.css"]) {
+			const destination = path.join(devPluginDir, artifact);
+			try {
+				const stat = await lstat(destination).catch(() => null);
+				if (stat?.isSymbolicLink()) {
+					await unlink(destination);
+				}
+				await copyFile(artifact, destination);
+			} catch (error) {
+				if (
+					error &&
+					typeof error === "object" &&
+					"code" in error &&
+					error.code === "ENOENT"
+				) {
+					continue;
+				}
+				throw error;
 			}
-			await copyFile(artifact, destination);
-		} catch (error) {
-			if (
-				error &&
-				typeof error === "object" &&
-				"code" in error &&
-				error.code === "ENOENT"
-			) {
-				continue;
-			}
-			throw error;
 		}
+		console.log(`[obsidian-convex-sync] copied artifacts to ${devPluginDir}`);
 	}
-	console.log(`[obsidian-convex-sync] copied artifacts to ${devPluginDir}`);
 }
 
 const context = await esbuild.context({

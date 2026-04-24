@@ -86,6 +86,25 @@ npm run build
   ```
 - Reload Obsidian and enable the plugin in **Settings → Community plugins**.
 
+### Local sync smoke test
+
+- The local Convex deployment is configured in `.env.local` as `CONVEX_URL=http://127.0.0.1:3210` and `CONVEX_SITE_URL=http://127.0.0.1:3211`.
+- If `obsidian --help` fails with `Cannot find module 'electron'`, run Obsidian CLI commands with `ELECTRON_RUN_AS_NODE` unset: `env -u ELECTRON_RUN_AS_NODE obsidian help`.
+- Known local test vaults can be listed with `env -u ELECTRON_RUN_AS_NODE obsidian vaults verbose`.
+- There are two vaults named `convex-sync`; `vault=convex-sync` currently resolves to `/home/shlok/Documents/Programming/Sandbox/convex-sync`.
+- The build copies plugin artifacts into both local dev vaults by default: `/home/shlok/Documents/Programming/Sandbox/convex-sync/.obsidian/plugins/obsidian-convex-sync` and `/home/shlok/Downloads/convex-sync/.obsidian/plugins/obsidian-convex-sync`.
+- To reset local Convex data for a destructive smoke test, run the guarded debug mutation in batches: `npx convex run --push debug:wipeBatch '{"confirm":"WIPE_LOCAL_DEV_DB"}'` until it returns `{"deleted":0}`. Only do this against the local dev deployment unless the user explicitly requests otherwise.
+- After wiping Convex and deleting plugin data, disable and enable the plugin with `env -u ELECTRON_RUN_AS_NODE obsidian plugin:disable id=obsidian-convex-sync filter=community vault=convex-sync` and `env -u ELECTRON_RUN_AS_NODE obsidian plugin:enable id=obsidian-convex-sync filter=community vault=convex-sync`.
+- The plugin API key can be minted without UI using Obsidian eval: `env -u ELECTRON_RUN_AS_NODE obsidian eval vault=convex-sync code="(async()=>{const p=app.plugins.plugins['obsidian-convex-sync']; await p.mintVaultSecretFromDeployment(); return JSON.stringify(p.settings);})()"`.
+- If the plugin was enabled before the key existed, reload live sync after minting: `env -u ELECTRON_RUN_AS_NODE obsidian eval vault=convex-sync code="(async()=>{const p=app.plugins.plugins['obsidian-convex-sync']; await p.reloadLiveSync(); return 'reloaded';})()"`.
+- Trigger a local edit with the CLI, for example `env -u ELECTRON_RUN_AS_NODE obsidian append path="First Note.md" content="smoke test" vault=convex-sync`, then run the plugin command with `env -u ELECTRON_RUN_AS_NODE obsidian command id=obsidian-convex-sync:sync-vault-files vault=convex-sync` if live sync does not fire immediately.
+- Inspect sync state with `npx convex data fileManifests --limit 20 --format json`, `npx convex data globalChanges --limit 20 --format json`, and `npx convex logs --history 20`.
+- Attach CLI console capture before debugging plugin runtime errors: `env -u ELECTRON_RUN_AS_NODE obsidian dev:debug on vault=convex-sync`, then read logs with `env -u ELECTRON_RUN_AS_NODE obsidian dev:console limit=100 vault=convex-sync` and `env -u ELECTRON_RUN_AS_NODE obsidian dev:errors vault=convex-sync`.
+- Trigger bootstrap from the plugin settings tab with `env -u ELECTRON_RUN_AS_NODE obsidian eval vault=convex-sync code="(async()=>{const tab=app.setting.pluginTabs.find(t=>t.plugin?.manifest?.id==='obsidian-convex-sync'); await tab.startBootstrapFlow(); return JSON.stringify(tab.bootstrapState);})()"`.
+- Check bootstrap status with `npx convex run bootstrap:getStatus '{"convexSecret":"<secret>"}'`. Download a ready archive from `http://127.0.0.1:3211` plus the returned `downloadUrl`.
+- To register an extracted bootstrap vault with the Obsidian CLI, add it to `~/.config/obsidian/obsidian.json` and run `env -u ELECTRON_RUN_AS_NODE obsidian restart`; after restart, `obsidian vaults verbose` should show the folder name as a unique vault.
+- A wipe exposed and fixed an important backend invariant: public queries cannot insert documents. `fileSync:listChangesSince` must tolerate a missing `syncHead` by returning `headCursor: 0`; mutations that advance cursors create `syncHead` via `nextCursor`.
+
 ## Commands & settings
 
 - Any user-facing commands should be added via `this.addCommand(...)`.

@@ -14,6 +14,11 @@ import {
 	mintVaultApiSecretFromConvexSite,
 } from "./security";
 import {
+	clearSyncDebugEvents,
+	getSyncDebugReport,
+	recordSyncDebugEvent,
+} from "./sync/debug";
+import {
 	normalizeLoadedSettings,
 	DEFAULT_SETTINGS,
 	ConvexSyncSettingTab,
@@ -33,6 +38,9 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 	getKeepaliveHttpClient = () => this.convex.getKeepaliveHttp();
 	setSyncStatus = (text: string) => {
 		this.syncStatusBarItemEl?.setText(text);
+	};
+	recordSyncDebug = (area: string, message: string, data?: Record<string, unknown>) => {
+		recordSyncDebugEvent(this.settings, area, message, data);
 	};
 
 	async onload() {
@@ -66,12 +74,14 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			id: "sync-vault-files",
 			name: "Reconcile vault files with Convex",
 			callback: () => {
+				this.recordSyncDebug("command", "manual full sync started");
 				this.syncStatusBarItemEl?.setText("Convex sync: starting...");
 				void runVaultFileSync({
 					app: this.app,
 					settings: this.settings,
 					getConvexHttpClient: () => this.getConvexHttpClient(),
 					getPresenceSessionId: () => this.getPresenceSessionId(),
+					recordSyncDebug: this.recordSyncDebug,
 					reportSyncProgress: ({ phase, completed, total }) => {
 						const percent = total <= 0 ? 0 : Math.min(100, Math.round((completed / total) * 100));
 						this.syncStatusBarItemEl?.setText(
@@ -88,6 +98,26 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 						this.syncStatusBarItemEl?.setText("Convex sync: failed");
 						console.error(err);
 					});
+			},
+		});
+		this.addCommand({
+			id: "copy-sync-debug-report",
+			name: "Copy sync debug report",
+			callback: () => {
+				void navigator.clipboard.writeText(getSyncDebugReport(this.app, this.settings))
+					.then(() => new Notice("Convex sync debug report copied."))
+					.catch((error: unknown) => {
+						console.error(error);
+						new Notice("Convex sync: failed to copy debug report. Check the console.", 8000);
+					});
+			},
+		});
+		this.addCommand({
+			id: "clear-sync-debug-log",
+			name: "Clear sync debug log",
+			callback: () => {
+				clearSyncDebugEvents();
+				new Notice("Convex sync debug log cleared.");
 			},
 		});
 		this.addCommand({
@@ -136,9 +166,11 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 		this.stopLiveSync?.();
 		this.stopLiveSync = null;
 		if (!this.settings.enableLiveSync) {
+			this.recordSyncDebug("live", "live sync disabled");
 			this.syncStatusBarItemEl?.setText("Convex sync: live sync disabled");
 			return;
 		}
+		this.recordSyncDebug("live", "live sync starting");
 		this.stopLiveSync = startLiveSync(this);
 	}
 

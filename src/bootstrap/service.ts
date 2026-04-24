@@ -1,5 +1,6 @@
 import type { ConvexHttpClient } from "convex/browser";
-import { runVaultFileSync } from "../file-sync";
+import { zipSync } from "fflate";
+import { TFile } from "obsidian";
 import type { MyPluginSettings } from "../settings";
 import { resolveClientId } from "../sync/client-id";
 
@@ -59,30 +60,140 @@ type BootstrapStatus = {
 	archiveName?: string | null;
 };
 
+type LocalArchive = {
+	bytes: Uint8Array;
+	filesTotal: number;
+	bytesTotal: number;
+};
+
+function toHex(buffer: ArrayBuffer): string {
+	const bytes = new Uint8Array(buffer);
+	return Array.from(bytes)
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
+async function sha256Bytes(bytes: Uint8Array): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return toHex(digest);
+}
+
+async function collectConfigEntries(
+	app: import("obsidian").App,
+	configDir: string,
+): Promise<Array<{ path: string; bytes: Uint8Array }>> {
+	if (!(await app.vault.adapter.exists(configDir))) {
+		return [];
+	}
+	const results: Array<{ path: string; bytes: Uint8Array }> = [];
+	const queue: string[] = [configDir];
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (!current) {
+			continue;
+		}
+		const listed = await app.vault.adapter.list(current);
+		for (const filePath of listed.files) {
+			const bytes = new Uint8Array(await app.vault.adapter.readBinary(filePath));
+			results.push({ path: filePath, bytes });
+		}
+		for (const folderPath of listed.folders) {
+			queue.push(folderPath);
+		}
+	}
+	return results;
+}
+
+async function buildLocalArchive(
+	host: BootstrapHost,
+	onState: (state: BootstrapUiState) => void,
+): Promise<LocalArchive> {
+	const archiveEntries: Record<string, Uint8Array> = {};
+	const loadedFiles = host.app.vault
+		.getAllLoadedFiles()
+		.filter((entry): entry is TFile => entry instanceof TFile);
+	const configDir = host.app.vault.configDir;
+	const configFiles = await collectConfigEntries(host.app, configDir);
+	const totalFiles = loadedFiles.length + configFiles.length;
+	let completed = 0;
+	let bytesTotal = 0;
+	for (const file of loadedFiles) {
+		const bytes = new Uint8Array(await host.app.vault.readBinary(file));
+		archiveEntries[file.path] = bytes;
+		completed += 1;
+		bytesTotal += bytes.byteLength;
+		onState({
+			kind: "syncing",
+			phase: `Packing local vault (${completed}/${Math.max(totalFiles, 1)})`,
+			completed,
+			total: Math.max(totalFiles, 1),
+		});
+	}
+	for (const file of configFiles) {
+		archiveEntries[file.path] = file.bytes;
+		completed += 1;
+		bytesTotal += file.bytes.byteLength;
+		onState({
+			kind: "syncing",
+			phase: `Packing local vault (${completed}/${Math.max(totalFiles, 1)})`,
+			completed,
+			total: Math.max(totalFiles, 1),
+		});
+	}
+	const zipped = zipSync(archiveEntries, { level: 6 });
+	return {
+		bytes: zipped,
+		filesTotal: totalFiles,
+		bytesTotal,
+	};
+}
+
 export async function startBootstrapBuild(
 	host: BootstrapHost,
 	onState: (state: BootstrapUiState) => void,
 ): Promise<void> {
 	const client = host.getConvexHttpClient();
-	onState({ kind: "syncing", phase: "Syncing vault to Convex", completed: 0, total: 1 });
-	await runVaultFileSync({
-		app: host.app,
-		settings: host.settings,
-		getConvexHttpClient: host.getConvexHttpClient,
-		getPresenceSessionId: host.getPresenceSessionId,
-		reportSyncProgress: ({ phase, completed, total }) => {
-			onState({
-				kind: "syncing",
-				phase,
-				completed,
-				total,
-			});
-		},
-	});
-	await (client.mutation as any)("bootstrap:startBuild", {
+	onState({ kind: "syncing", phase: "Preparing local vault archive", completed: 0, total: 1 });
+	const archive = await buildLocalArchive(host, onState);
+	onState({ kind: "syncing", phase: "Requesting upload URL", completed: 1, total: 3 });
+	const started = await (client.mutation as any)("bootstrap:startBuild", {
 		convexSecret: host.settings.convexSecret,
 		clientId: resolveClientId(host),
 		vaultName: host.app.vault.getName(),
+	});
+	onState({ kind: "syncing", phase: "Uploading archive", completed: 2, total: 3 });
+	const uploadResponse = await fetch(started.uploadUrl, {
+		method: "POST",
+		headers: { "Content-Type": "application/zip" },
+		body: new Blob([archive.bytes], { type: "application/zip" }),
+	});
+	if (!uploadResponse.ok) {
+		await (client.mutation as any)("bootstrap:failUpload", {
+			convexSecret: host.settings.convexSecret,
+			bootstrapId: started.bootstrapId,
+			message: `Archive upload failed with HTTP ${uploadResponse.status}`,
+		});
+		throw new Error(`Bootstrap upload failed: HTTP ${uploadResponse.status}`);
+	}
+	const payload = (await uploadResponse.json()) as { storageId?: string };
+	if (!payload.storageId) {
+		await (client.mutation as any)("bootstrap:failUpload", {
+			convexSecret: host.settings.convexSecret,
+			bootstrapId: started.bootstrapId,
+			message: "Archive upload did not return a storageId.",
+		});
+		throw new Error("Bootstrap upload did not return a storageId.");
+	}
+	const contentHash = await sha256Bytes(archive.bytes);
+	onState({ kind: "syncing", phase: "Finalizing archive", completed: 3, total: 3 });
+	await (client.mutation as any)("bootstrap:finalizeUploadedArchive", {
+		convexSecret: host.settings.convexSecret,
+		bootstrapId: started.bootstrapId,
+		storageId: payload.storageId,
+		contentHash,
+		sizeBytes: archive.bytes.byteLength,
+		filesTotal: archive.filesTotal,
+		bytesTotal: archive.bytesTotal,
 	});
 }
 

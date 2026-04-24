@@ -35,11 +35,13 @@ export async function collectSymlinkedPaths(
 
 	if (settings.syncDotObsidian) {
 		const queue: string[] = [configDir];
+		const visited = new Set<string>();
 		while (queue.length > 0) {
 			const current = queue.shift();
-			if (!current) {
+			if (!current || visited.has(current)) {
 				continue;
 			}
+			visited.add(current);
 			if (
 				!shouldSyncPath({
 					path: current,
@@ -51,6 +53,15 @@ export async function collectSymlinkedPaths(
 				continue;
 			}
 			candidatePaths.add(current);
+			const fullPath = app.vault.adapter.getFullPath(current);
+			try {
+				const linkStat = await lstatPath(fullPath);
+				if (linkStat.isSymbolicLink()) {
+					continue;
+				}
+			} catch {
+				continue;
+			}
 			const stat = await app.vault.adapter.stat(current);
 			if (!stat || stat.type !== "folder") {
 				continue;

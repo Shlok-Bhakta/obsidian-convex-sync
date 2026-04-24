@@ -61,9 +61,6 @@ export const startBuild = mutation({
 			await ctx.db.delete(existing._id);
 		}
 
-		const allFiles = await ctx.db.query("vaultFiles").collect();
-		const bytesTotal = allFiles.reduce((sum, file) => sum + file.sizeBytes, 0);
-
 		const cleanVaultName = args.vaultName
 			.trim()
 			.replace(/[^\w.-]+/g, "-")
@@ -72,19 +69,86 @@ export const startBuild = mutation({
 		const archiveName = `${cleanVaultName || "obsidian-vault"}.zip`;
 		const rowId = await ctx.db.insert("vaultBootstraps", {
 			status: "building",
-			phase: "Queued",
+			phase: "Waiting for local archive upload",
 			filesProcessed: 0,
-			filesTotal: allFiles.length,
+			filesTotal: 0,
 			bytesProcessed: 0,
-			bytesTotal,
+			bytesTotal: 0,
 			archiveName,
 			startedAtMs: Date.now(),
 			createdByClientId: args.clientId,
 		});
-
-		await ctx.scheduler.runAfter(0, internal.bootstrap.buildArchive, {
+		const uploadUrl = await ctx.storage.generateUploadUrl();
+		return {
+			ok: true as const,
 			bootstrapId: rowId,
-			convexSecret: args.convexSecret,
+			uploadUrl,
+			archiveName,
+		};
+	},
+});
+
+export const finalizeUploadedArchive = mutation({
+	args: {
+		convexSecret: v.string(),
+		bootstrapId: v.id("vaultBootstraps"),
+		storageId: v.id("_storage"),
+		contentHash: v.string(),
+		sizeBytes: v.number(),
+		filesTotal: v.number(),
+		bytesTotal: v.number(),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const row = await ctx.db.get(args.bootstrapId);
+		if (!row) {
+			await ctx.storage.delete(args.storageId);
+			throw new ConvexError("Bootstrap row not found.");
+		}
+		if (row.storageId && row.storageId !== args.storageId) {
+			await ctx.storage.delete(row.storageId);
+		}
+		await ctx.db.patch(args.bootstrapId, {
+			status: "ready",
+			phase: "Ready",
+			storageId: args.storageId,
+			downloadToken: crypto.randomUUID(),
+			contentHash: args.contentHash,
+			sizeBytes: args.sizeBytes,
+			filesProcessed: args.filesTotal,
+			filesTotal: args.filesTotal,
+			bytesProcessed: args.bytesTotal,
+			bytesTotal: args.bytesTotal,
+			readyAtMs: Date.now(),
+			expiresAtMs: Date.now() + TEN_MINUTES_MS,
+			errorMessage: undefined,
+		});
+		await ctx.scheduler.runAfter(TEN_MINUTES_MS, internal.bootstrap.expireBootstrap, {
+			bootstrapId: args.bootstrapId,
+		});
+		return { ok: true as const };
+	},
+});
+
+export const failUpload = mutation({
+	args: {
+		convexSecret: v.string(),
+		bootstrapId: v.id("vaultBootstraps"),
+		message: v.string(),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const row = await ctx.db.get(args.bootstrapId);
+		if (!row) {
+			return { ok: true as const };
+		}
+		await cleanupBootstrapStorage(ctx, row);
+		await ctx.db.patch(args.bootstrapId, {
+			status: "failed",
+			phase: "Failed",
+			storageId: undefined,
+			downloadToken: undefined,
+			errorMessage: args.message,
 		});
 		return { ok: true as const };
 	},
@@ -327,12 +391,14 @@ export const _readSnapshot = internalQuery({
 	args: { convexSecret: v.string() },
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const files = await ctx.db.query("vaultFiles").collect();
+		const files = (await ctx.db.query("fileManifests").collect()).filter(
+			(row) => !row.deleted && row.storageId && typeof row.sizeBytes === "number",
+		);
 		return {
 			files: files.map((row) => ({
 				path: row.path,
-				storageId: row.storageId,
-				sizeBytes: row.sizeBytes,
+				storageId: row.storageId as never,
+				sizeBytes: row.sizeBytes as number,
 			})),
 		};
 	},
