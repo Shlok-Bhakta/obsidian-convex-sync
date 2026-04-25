@@ -12,6 +12,7 @@ import type * as _lib_auth from "../_lib/auth.js";
 import type * as _lib_constants from "../_lib/constants.js";
 import type * as _lib_storage_finalize from "../_lib/storage_finalize.js";
 import type * as _lib_validators from "../_lib/validators.js";
+import type * as automergeSync from "../automergeSync.js";
 import type * as bootstrap from "../bootstrap.js";
 import type * as clients from "../clients.js";
 import type * as crons from "../crons.js";
@@ -31,6 +32,7 @@ declare const fullApi: ApiFromModules<{
   "_lib/constants": typeof _lib_constants;
   "_lib/storage_finalize": typeof _lib_storage_finalize;
   "_lib/validators": typeof _lib_validators;
+  automergeSync: typeof automergeSync;
   bootstrap: typeof bootstrap;
   clients: typeof clients;
   crons: typeof crons;

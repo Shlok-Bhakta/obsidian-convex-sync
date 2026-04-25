@@ -33,6 +33,17 @@ export default defineSchema({
 		updatedAtMs: v.number(),
 		updatedByClientId: v.string(),
 	}).index("by_scope", ["scope"]),
+	automergeChanges: defineTable({
+		docId: v.string(),
+		type: v.union(v.literal("incremental"), v.literal("snapshot")),
+		hash: v.string(),
+		data: v.bytes(),
+		clientId: v.string(),
+		idempotencyKey: v.string(),
+	})
+		.index("by_docId", ["docId"])
+		.index("by_docId_type_hash", ["docId", "type", "hash"])
+		.index("by_docId_idempotencyKey", ["docId", "idempotencyKey"]),
 	vaultBootstraps: defineTable({
 		status: v.union(
 			v.literal("building"),
