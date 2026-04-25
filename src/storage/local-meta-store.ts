@@ -94,6 +94,19 @@ export class LocalMetaStore {
 		logInfo("path renamed", { oldPath: meta.path, newPath, docId });
 	}
 
+	async removePathForDoc(docId: string): Promise<void> {
+		const meta = await this.getDocMeta(docId);
+		if (!meta) {
+			return;
+		}
+		await this.withStore("readwrite", async (store) => {
+			store.delete(pathKey(meta.path));
+			store.delete(docKey(docId));
+			store.delete(cursorKey(docId));
+			store.delete(pendingKey(docId));
+		});
+	}
+
 	async getDocMeta(docId: string): Promise<DocMeta | null> {
 		return (await this.getValue<DocMeta>(docKey(docId))) ?? null;
 	}

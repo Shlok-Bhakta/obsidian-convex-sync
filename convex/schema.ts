@@ -44,6 +44,15 @@ export default defineSchema({
 		.index("by_docId", ["docId"])
 		.index("by_docId_type_hash", ["docId", "type", "hash"])
 		.index("by_docId_idempotencyKey", ["docId", "idempotencyKey"]),
+	automergeDocPaths: defineTable({
+		path: v.string(),
+		docId: v.string(),
+		createdByClientId: v.string(),
+		updatedAtMs: v.number(),
+		deletedAtMs: v.optional(v.number()),
+	})
+		.index("by_path", ["path"])
+		.index("by_docId", ["docId"]),
 	vaultBootstraps: defineTable({
 		status: v.union(
 			v.literal("building"),

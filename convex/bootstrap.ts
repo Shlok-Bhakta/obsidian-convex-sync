@@ -1,5 +1,5 @@
 import { ConvexError, v } from "convex/values";
-import { unzipSync, zipSync } from "fflate";
+import { zipSync } from "fflate";
 import { internal } from "./_generated/api";
 import {
 	internalAction,
@@ -8,7 +8,6 @@ import {
 	mutation,
 	query,
 } from "./_generated/server";
-import { OBSIDIAN_BUNDLE_SCOPE } from "./_lib/constants";
 import { requirePluginSecret } from "./security";
 
 const TEN_MINUTES_MS = 10 * 60_000;
@@ -63,11 +62,7 @@ export const startBuild = mutation({
 		}
 
 		const allFiles = await ctx.db.query("vaultFiles").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q: any) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		const bytesTotal = allFiles.reduce((sum, file) => sum + file.sizeBytes, 0) + (bundle?.sizeBytes ?? 0);
+		const bytesTotal = allFiles.reduce((sum, file) => sum + file.sizeBytes, 0);
 
 		const cleanVaultName = args.vaultName
 			.trim()
@@ -79,7 +74,7 @@ export const startBuild = mutation({
 			status: "building",
 			phase: "Queued",
 			filesProcessed: 0,
-			filesTotal: allFiles.length + (bundle ? 1 : 0),
+			filesTotal: allFiles.length,
 			bytesProcessed: 0,
 			bytesTotal,
 			archiveName,
@@ -299,24 +294,6 @@ export const buildArchive = internalAction({
 				}
 			}
 
-			if (snapshot.bundle) {
-				const bundleBlob = await ctx.storage.get(snapshot.bundle.storageId);
-				if (bundleBlob) {
-					const archive = unzipSync(new Uint8Array(await bundleBlob.arrayBuffer()));
-					for (const [relativePath, content] of Object.entries(archive)) {
-						archiveEntries[`.obsidian/${relativePath}`] = content;
-					}
-					filesProcessed += 1;
-					bytesProcessed += snapshot.bundle.sizeBytes;
-					await ctx.runMutation(internal.bootstrap.updateProgress, {
-						bootstrapId: args.bootstrapId,
-						phase: "Merged .obsidian bundle",
-						filesProcessed,
-						bytesProcessed,
-					});
-				}
-			}
-
 			await ctx.runMutation(internal.bootstrap.updateProgress, {
 				bootstrapId: args.bootstrapId,
 				phase: "Compressing archive",
@@ -351,22 +328,12 @@ export const _readSnapshot = internalQuery({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const files = await ctx.db.query("vaultFiles").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
 		return {
 			files: files.map((row) => ({
 				path: row.path,
 				storageId: row.storageId,
 				sizeBytes: row.sizeBytes,
 			})),
-			bundle: bundle
-				? {
-						storageId: bundle.storageId,
-						sizeBytes: bundle.sizeBytes,
-				  }
-				: null,
 		};
 	},
 });

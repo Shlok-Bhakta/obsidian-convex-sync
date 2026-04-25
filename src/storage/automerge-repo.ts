@@ -1,4 +1,4 @@
-import * as Automerge from "@automerge/automerge/next";
+import * as Automerge from "@automerge/automerge/slim/next";
 import {
 	Repo,
 	type DocHandle,

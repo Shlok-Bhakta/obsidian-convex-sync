@@ -17,6 +17,9 @@ const context = await esbuild.context({
 	},
 	entryPoints: ["src/main.ts"],
 	bundle: true,
+	platform: "neutral",
+	conditions: ["import"],
+	mainFields: ["module", "main"],
 	external: [
 		"obsidian",
 		"electron",

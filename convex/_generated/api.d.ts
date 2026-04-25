@@ -10,6 +10,7 @@
 
 import type * as _lib_auth from "../_lib/auth.js";
 import type * as _lib_constants from "../_lib/constants.js";
+import type * as _lib_path from "../_lib/path.js";
 import type * as _lib_storage_finalize from "../_lib/storage_finalize.js";
 import type * as _lib_validators from "../_lib/validators.js";
 import type * as automergeSync from "../automergeSync.js";
@@ -30,6 +31,7 @@ import type {
 declare const fullApi: ApiFromModules<{
   "_lib/auth": typeof _lib_auth;
   "_lib/constants": typeof _lib_constants;
+  "_lib/path": typeof _lib_path;
   "_lib/storage_finalize": typeof _lib_storage_finalize;
   "_lib/validators": typeof _lib_validators;
   automergeSync: typeof automergeSync;

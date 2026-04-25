@@ -18,6 +18,13 @@ export type PulledAutomergeChange = {
 	clientId: string;
 };
 
+export type DocPathChange = {
+	path: string;
+	docId: string;
+	updatedAtMs: number;
+	deletedAtMs: number | null;
+};
+
 export class ConvexAutomergeTransport {
 	private connectionStatus: ConnectionStatus = "offline";
 	private readonly unsubscribeConnection: () => void;
@@ -40,42 +47,57 @@ export class ConvexAutomergeTransport {
 		docId: string,
 		onChanges: (changes: PulledAutomergeChange[]) => void,
 	): () => void {
-		let latestCursor = 0;
+		let pulledThroughCursor = 0;
+		let pullQueue = Promise.resolve();
 		const seen = new Set<string>();
 		const unsubscribe = this.options.client.onUpdate(
-			api.automergeSync.pullChanges,
+			api.automergeSync.getLatestCursor,
 			{
 				convexSecret: this.options.convexSecret,
 				docId,
-				sinceCursor: 0,
-				numItems: 100,
 			},
-			(result) => {
-				const changes = result.page
-					.filter((change) => !seen.has(change.hash))
-					.map((change) => {
-						seen.add(change.hash);
-						latestCursor = Math.max(latestCursor, change.serverCursor);
-						return {
-							hash: change.hash,
-							type: change.type,
-							data: new Uint8Array(change.data),
-							serverCursor: change.serverCursor,
-							clientId: change.clientId,
-						};
-					});
-				if (changes.length > 0) {
-					onChanges(changes);
+			(latestCursor) => {
+				if (latestCursor <= pulledThroughCursor) {
+					return;
 				}
+				pullQueue = pullQueue
+					.catch(() => undefined)
+					.then(async () => {
+						const changes = await this.pullMissingChanges(
+							docId,
+							pulledThroughCursor,
+						);
+						const unseen = changes.filter((change) => {
+							const identity = changeIdentity(change.type, change.hash);
+							if (seen.has(identity)) {
+								return false;
+							}
+							seen.add(identity);
+							return true;
+						});
+						for (const change of unseen) {
+							pulledThroughCursor = Math.max(
+								pulledThroughCursor,
+								change.serverCursor,
+							);
+						}
+						if (unseen.length > 0) {
+							onChanges(unseen);
+						}
+					})
+					.catch((error: unknown) => {
+						console.warn("[transport] watch pull failed", {
+							docId,
+							message: error instanceof Error ? error.message : String(error),
+						});
+					});
 			},
 		);
 
 		return () => {
-			void latestCursor;
 			unsubscribe();
 		};
 	}
-
 	async pushChanges(docId: string, changes: Uint8Array[]): Promise<number> {
 		if (changes.length === 0) {
 			return 0;
@@ -103,6 +125,47 @@ export class ConvexAutomergeTransport {
 						type: "incremental" as const,
 						data: toArrayBuffer(change),
 					})),
+				}),
+			{
+				maxAttempts: 4,
+				shouldRetry: isRetryableTransportError,
+			},
+		);
+
+		console.info("[transport] push ack", {
+			docId,
+			serverCursor: result.serverCursor,
+		});
+		return result.serverCursor;
+	}
+
+	async pushSnapshot(docId: string, snapshot: Uint8Array): Promise<number> {
+		const idempotencyKey = await derivePushIdempotencyKey(
+			this.options.clientId,
+			docId,
+			[snapshot],
+		);
+
+		console.info("[transport] push sent", {
+			docId,
+			changeCount: 1,
+			idempotencyKeyPrefix: idempotencyKey.slice(0, 8),
+			type: "snapshot",
+		});
+
+		const result = await retry(
+			() =>
+				this.options.client.mutation(api.automergeSync.submitChanges, {
+					convexSecret: this.options.convexSecret,
+					docId,
+					clientId: this.options.clientId,
+					idempotencyKey,
+					changes: [
+						{
+							type: "snapshot" as const,
+							data: toArrayBuffer(snapshot),
+						},
+					],
 				}),
 			{
 				maxAttempts: 4,
@@ -153,6 +216,68 @@ export class ConvexAutomergeTransport {
 		return received;
 	}
 
+	async getOrCreateDocIdForPath(
+		path: string,
+		candidateDocId: string,
+	): Promise<string> {
+		const result = await this.options.client.mutation(
+			api.automergeSync.getOrCreateDocIdForPath,
+			{
+				convexSecret: this.options.convexSecret,
+				path,
+				candidateDocId,
+				clientId: this.options.clientId,
+				updatedAtMs: Date.now(),
+			},
+		);
+		return result.docId;
+	}
+
+	async deleteDocPath(path: string): Promise<void> {
+		await this.options.client.mutation(api.automergeSync.deleteDocPath, {
+			convexSecret: this.options.convexSecret,
+			path,
+			clientId: this.options.clientId,
+			deletedAtMs: Date.now(),
+		});
+	}
+
+	async renameDocPath(oldPath: string, newPath: string): Promise<void> {
+		await this.options.client.mutation(api.automergeSync.renameDocPath, {
+			convexSecret: this.options.convexSecret,
+			oldPath,
+			newPath,
+			clientId: this.options.clientId,
+			updatedAtMs: Date.now(),
+		});
+	}
+
+	watchDocPathChanges(
+		onChanges: (changes: DocPathChange[]) => void,
+	): () => void {
+		let latestUpdatedAtMs = 0;
+		const unsubscribe = this.options.client.onUpdate(
+			api.automergeSync.listDocPathChanges,
+			{
+				convexSecret: this.options.convexSecret,
+				sinceUpdatedAtMs: 0,
+				numItems: 100,
+			},
+			(result) => {
+				const changes = result.page.filter(
+					(change) => change.updatedAtMs > latestUpdatedAtMs,
+				);
+				for (const change of changes) {
+					latestUpdatedAtMs = Math.max(latestUpdatedAtMs, change.updatedAtMs);
+				}
+				if (changes.length > 0) {
+					onChanges(changes);
+				}
+			},
+		);
+		return () => unsubscribe();
+	}
+
 	getConnectionState(): ConnectionStatus {
 		return this.connectionStatus;
 	}
@@ -160,6 +285,10 @@ export class ConvexAutomergeTransport {
 	dispose(): void {
 		this.unsubscribeConnection();
 	}
+}
+
+function changeIdentity(type: "incremental" | "snapshot", hash: string): string {
+	return `${type}:${hash}`;
 }
 
 export async function derivePushIdempotencyKey(
@@ -209,5 +338,5 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 	return bytes.buffer.slice(
 		bytes.byteOffset,
 		bytes.byteOffset + bytes.byteLength,
-	) as ArrayBuffer;
+	);
 }

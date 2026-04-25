@@ -1,15 +1,7 @@
-import { ConvexError, v } from "convex/values";
+import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { OBSIDIAN_BUNDLE_SCOPE } from "./_lib/constants";
+import { normalizeVaultPath } from "./_lib/path";
 import { requirePluginSecret } from "./security";
-
-function normalizePath(input: string): string {
-	const normalized = input.trim().replace(/\\/g, "/").replace(/^\/+/, "");
-	if (normalized.includes("..")) {
-		throw new ConvexError("Path traversal is not allowed.");
-	}
-	return normalized;
-}
 
 export const issueUploadUrl = mutation({
 	args: {
@@ -19,10 +11,12 @@ export const issueUploadUrl = mutation({
 		updatedAtMs: v.number(),
 		sizeBytes: v.number(),
 		clientId: v.string(),
+		fileId: v.optional(v.string()),
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const path = normalizePath(args.path);
+		void args.fileId;
+		const path = normalizeVaultPath(args.path);
 		const existing = await ctx.db
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -53,10 +47,12 @@ export const finalizeUpload = mutation({
 		updatedAtMs: v.number(),
 		sizeBytes: v.number(),
 		clientId: v.string(),
+		fileId: v.optional(v.string()),
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const path = normalizePath(args.path);
+		void args.fileId;
+		const path = normalizeVaultPath(args.path);
 		const existing = await ctx.db
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -105,10 +101,6 @@ export const listSnapshot = query({
 		await requirePluginSecret(ctx, args.convexSecret);
 		const files = await ctx.db.query("vaultFiles").collect();
 		const folders = await ctx.db.query("vaultFolders").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
 		return {
 			files: files.map((file) => ({
 				path: file.path,
@@ -123,15 +115,6 @@ export const listSnapshot = query({
 				isExplicitlyEmpty: folder.isExplicitlyEmpty,
 				updatedByClientId: folder.updatedByClientId ?? "",
 			})),
-			obsidianBundle:
-				bundle === null
-					? null
-					: {
-							contentHash: bundle.contentHash,
-							sizeBytes: bundle.sizeBytes,
-							updatedAtMs: bundle.updatedAtMs,
-							updatedByClientId: bundle.updatedByClientId,
-						},
 		};
 	},
 });
@@ -140,7 +123,7 @@ export const getDownloadUrl = query({
 	args: { convexSecret: v.string(), path: v.string() },
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const path = normalizePath(args.path);
+		const path = normalizeVaultPath(args.path);
 		const row = await ctx.db
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -171,7 +154,7 @@ export const syncFolderState = mutation({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const normalizedEmpty = new Set(
-			args.emptyFolderPaths.map((path) => normalizePath(path)),
+			args.emptyFolderPaths.map((path) => normalizeVaultPath(path)),
 		);
 		const existing = await ctx.db.query("vaultFolders").collect();
 		for (const folder of existing) {
@@ -202,7 +185,7 @@ export const removeFilesByPath = mutation({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const normalizedPaths = new Set(
-			args.removedPaths.map((path) => normalizePath(path)),
+			args.removedPaths.map((path) => normalizeVaultPath(path)),
 		);
 		for (const path of normalizedPaths) {
 			const row = await ctx.db
@@ -229,8 +212,7 @@ export const issueBundleUploadUrl = mutation({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		void args;
-		const uploadUrl = await ctx.storage.generateUploadUrl();
-		return { uploadUrl };
+		return { uploadUrl: await ctx.storage.generateUploadUrl() };
 	},
 });
 
@@ -245,41 +227,7 @@ export const finalizeBundleUpload = mutation({
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const existing = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		if (existing && existing.updatedAtMs > args.updatedAtMs) {
-			await ctx.storage.delete(args.storageId);
-			return {
-				ok: false as const,
-				reason: "stale_write" as const,
-				remoteUpdatedAtMs: existing.updatedAtMs,
-			};
-		}
-		let previousStorageId: typeof args.storageId | null = null;
-		if (existing) {
-			previousStorageId = existing.storageId;
-			await ctx.db.patch(existing._id, {
-				storageId: args.storageId,
-				contentHash: args.contentHash,
-				sizeBytes: args.sizeBytes,
-				updatedAtMs: args.updatedAtMs,
-				updatedByClientId: args.clientId,
-			});
-		} else {
-			await ctx.db.insert("vaultBundles", {
-				scope: OBSIDIAN_BUNDLE_SCOPE,
-				storageId: args.storageId,
-				contentHash: args.contentHash,
-				sizeBytes: args.sizeBytes,
-				updatedAtMs: args.updatedAtMs,
-				updatedByClientId: args.clientId,
-			});
-		}
-		if (previousStorageId !== null && previousStorageId !== args.storageId) {
-			await ctx.storage.delete(previousStorageId);
-		}
+		await ctx.storage.delete(args.storageId);
 		return { ok: true as const };
 	},
 });
@@ -288,23 +236,6 @@ export const getBundleDownloadUrl = query({
 	args: { convexSecret: v.string() },
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const row = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		if (!row) {
-			return null;
-		}
-		const url = await ctx.storage.getUrl(row.storageId);
-		if (!url) {
-			return null;
-		}
-		return {
-			url,
-			contentHash: row.contentHash,
-			sizeBytes: row.sizeBytes,
-			updatedAtMs: row.updatedAtMs,
-			updatedByClientId: row.updatedByClientId,
-		};
+		return null;
 	},
 });

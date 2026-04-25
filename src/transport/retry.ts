@@ -62,14 +62,14 @@ function sleep(delayMs: number): Promise<void> {
 	const controller = new AbortController();
 	pendingTimers.add(controller);
 	return new Promise((resolve, reject) => {
-		const timeout = window.setTimeout(() => {
+		const timeout = globalThis.setTimeout(() => {
 			pendingTimers.delete(controller);
 			resolve();
 		}, delayMs);
 		controller.signal.addEventListener(
 			"abort",
 			() => {
-				window.clearTimeout(timeout);
+				globalThis.clearTimeout(timeout);
 				reject(new Error("Retry cancelled"));
 			},
 			{ once: true },

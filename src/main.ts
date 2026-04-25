@@ -9,6 +9,10 @@ import {
 import { ConvexClientManager } from "./convex/client-manager";
 import { runVaultFileSync } from "./file-sync";
 import {
+	startObsidianLiveSync,
+	type LiveSyncController,
+} from "./obsidian/live-sync";
+import {
 	ensureVaultSecretRegisteredWithDeployment,
 	mintVaultApiSecretFromConvexSite,
 } from "./security";
@@ -24,6 +28,7 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 	private presenceSessionId = "";
 	private convex = new ConvexClientManager(() => this.settings);
 	private syncStatusBarItemEl: HTMLElement | null = null;
+	private liveSync: LiveSyncController | null = null;
 
 	getPresenceSessionId(): string {
 		return this.presenceSessionId;
@@ -47,6 +52,9 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 		this.register(() => {
 			stopClientsPresence();
 		});
+		this.syncStatusBarItemEl = this.addStatusBarItem();
+		this.syncStatusBarItemEl.setText("Convex sync: idle");
+		await this.reloadLiveSync();
 
 		this.addRibbonIcon("users", "Open connected clients", () => {
 			void revealClientsPresenceView(this.app);
@@ -98,15 +106,21 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 				);
 			},
 		});
+		this.addCommand({
+			id: "reload-live-sync",
+			name: "Reload live sync",
+			callback: () => {
+				void this.reloadLiveSync();
+			},
+		});
 
-		this.syncStatusBarItemEl = this.addStatusBarItem();
-		this.syncStatusBarItemEl.setText("Convex sync: idle");
 		this.addSettingTab(new ConvexSyncSettingTab(this.app, this));
 
 	}
 
 	onunload() {
 		void leaveClientsPresence(this);
+		void this.liveSync?.dispose();
 		this.convex.dispose();
 	}
 
@@ -126,6 +140,23 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async reloadLiveSync(): Promise<void> {
+		await this.liveSync?.dispose();
+		this.liveSync = null;
+		if (!this.convex.isConfigured()) {
+			this.syncStatusBarItemEl?.setText("Convex sync: not configured");
+			return;
+		}
+		this.liveSync = startObsidianLiveSync({
+			app: this.app,
+			settings: this.settings,
+			getRealtimeClient: () => this.getConvexRealtimeClient(),
+			registerEvent: (ref) => this.registerEvent(ref),
+			register: (cleanup) => this.register(cleanup),
+			setStatus: (text) => this.syncStatusBarItemEl?.setText(text),
+		});
 	}
 
 	async ensureConvexSecretRegisteredWithDeployment(): Promise<void> {

@@ -20,7 +20,7 @@ export class PathMap {
 		private readonly createDocId: () => string = createAutomergeDocumentId,
 	) {}
 
-	async getOrCreate(path: string): Promise<string> {
+	async getOrCreate(path: string, preferredDocId?: string): Promise<string> {
 		const existing = await this.metaStore.getDocIdForPath(path);
 		if (existing) {
 			return existing;
@@ -31,7 +31,7 @@ export class PathMap {
 			return pending;
 		}
 
-		const created = this.createMapping(path);
+		const created = this.createMapping(path, preferredDocId);
 		this.pendingCreates.set(path, created);
 		try {
 			return await created;
@@ -61,28 +61,52 @@ export class PathMap {
 		logInfo("rename", { oldPath, newPath, docId });
 	}
 
+	async updatePathForDoc(docId: string, newPath: string): Promise<void> {
+		await this.metaStore.updatePathForDoc(docId, newPath);
+		logInfo("rename", { newPath, docId });
+	}
+
 	async getDocId(path: string): Promise<string | null> {
 		return this.metaStore.getDocIdForPath(path);
+	}
+
+	async getPathForDocId(docId: string): Promise<string | null> {
+		const mappings = await this.getAllMappings();
+		for (const [path, mappedDocId] of Object.entries(mappings)) {
+			if (mappedDocId === docId) {
+				return path;
+			}
+		}
+		return null;
+	}
+
+	async remove(path: string): Promise<string | null> {
+		const docId = await this.metaStore.getDocIdForPath(path);
+		if (!docId) {
+			return null;
+		}
+		await this.metaStore.removePathForDoc(docId);
+		return docId;
 	}
 
 	async getAllMappings(): Promise<Record<string, string>> {
 		return { ...(await this.metaStore.getPathMappings()) };
 	}
 
-	private async createMapping(path: string): Promise<string> {
+	private async createMapping(path: string, preferredDocId?: string): Promise<string> {
 		const existing = await this.metaStore.getDocIdForPath(path);
 		if (existing) {
 			return existing;
 		}
 
-		const docId = this.createDocId();
+		const docId = preferredDocId ?? this.createDocId();
 		await this.metaStore.setDocIdForPath(path, docId);
 		logInfo("created mapping", { path, docId });
 		return docId;
 	}
 }
 
-function createAutomergeDocumentId(): string {
+export function createAutomergeDocumentId(): string {
 	return parseAutomergeUrl(generateAutomergeUrl()).documentId;
 }
 

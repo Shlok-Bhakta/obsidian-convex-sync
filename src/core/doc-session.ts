@@ -1,4 +1,4 @@
-import * as Automerge from "@automerge/automerge/next";
+import * as Automerge from "@automerge/automerge/slim/next";
 import type { DocHandle } from "@automerge/automerge-repo";
 import { mergeArrays } from "@automerge/automerge-repo/helpers/mergeArrays.js";
 import {
@@ -14,6 +14,7 @@ export type TextSplice = {
 
 export type DocSessionTransport = {
 	pushChanges(docId: string, changes: Uint8Array[]): Promise<number>;
+	pushSnapshot?(docId: string, snapshot: Uint8Array): Promise<number>;
 };
 
 export type DocSessionOptions = {
@@ -83,10 +84,17 @@ export class DocSession {
 	}
 
 	async applyRemoteChanges(changes: Uint8Array[]): Promise<void> {
+		if (this.closed) {
+			return;
+		}
 		if (changes.length === 0) {
 			return;
 		}
-		const handle = await this.requireHandle();
+		await this.open();
+		if (this.closed || !this.handle) {
+			return;
+		}
+		const handle = this.handle;
 		handle.update((doc) => Automerge.loadIncremental(doc, mergeArrays(changes)));
 		await this.options.repo.ensureFlushed(this.options.docId);
 		const text = this.getTextSnapshot();
@@ -123,6 +131,16 @@ export class DocSession {
 			textLength: text.length,
 		});
 		this.options.onStateChange?.(text);
+		if (this.options.transport.pushSnapshot) {
+			void this.options.transport
+				.pushSnapshot(this.options.docId, Automerge.save(this.handle.doc()))
+				.catch((error: unknown) => {
+					console.warn("[session] snapshot push failed", {
+						docId: this.options.docId,
+						message: error instanceof Error ? error.message : String(error),
+					});
+				});
+		}
 	}
 
 	private async requireHandle(): Promise<DocHandle<AutomergeTextDoc>> {
