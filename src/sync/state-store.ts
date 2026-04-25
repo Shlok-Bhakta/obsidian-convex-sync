@@ -50,13 +50,13 @@ function normalizePathKey(path: string): string {
 class IndexedDbBackedSyncStateStore implements SyncStateStore {
 	private readonly dbPromise: Promise<IDBDatabase>;
 
-	constructor() {
+	constructor(private readonly dbName = DB_NAME) {
 		this.dbPromise = this.openWithRecovery();
 	}
 
 	private openDatabase(version: number): Promise<IDBDatabase> {
 		return new Promise((resolve, reject) => {
-			const request = indexedDB.open(DB_NAME, version);
+			const request = indexedDB.open(this.dbName, version);
 			request.onerror = () => reject(request.error);
 			request.onupgradeneeded = () => {
 				const db = request.result;
@@ -77,7 +77,7 @@ class IndexedDbBackedSyncStateStore implements SyncStateStore {
 
 	private async recreateDatabase(): Promise<IDBDatabase> {
 		await new Promise<void>((resolve, reject) => {
-			const deleteRequest = indexedDB.deleteDatabase(DB_NAME);
+			const deleteRequest = indexedDB.deleteDatabase(this.dbName);
 			deleteRequest.onerror = () => reject(deleteRequest.error);
 			deleteRequest.onblocked = () => reject(new Error("IndexedDB reset was blocked."));
 			deleteRequest.onsuccess = () => resolve();
@@ -354,16 +354,20 @@ export class InMemorySyncStateStore implements SyncStateStore {
 	}
 }
 
-let sharedStore: SyncStateStore | null = null;
+const sharedStores = new Map<string, SyncStateStore>();
 
-export function getSyncStateStore(): SyncStateStore {
-	if (sharedStore) {
-		return sharedStore;
+export function getSyncStateStore(namespace = "default"): SyncStateStore {
+	const key = namespace.trim() || "default";
+	const existing = sharedStores.get(key);
+	if (existing) {
+		return existing;
 	}
+	let store: SyncStateStore;
 	if (typeof indexedDB === "undefined") {
-		sharedStore = new InMemorySyncStateStore();
-		return sharedStore;
+		store = new InMemorySyncStateStore();
+	} else {
+		store = new IndexedDbBackedSyncStateStore(`${DB_NAME}:${key}`);
 	}
-	sharedStore = new IndexedDbBackedSyncStateStore();
-	return sharedStore;
+	sharedStores.set(key, store);
+	return store;
 }

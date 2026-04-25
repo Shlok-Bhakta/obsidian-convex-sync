@@ -2,6 +2,7 @@ import { Notice, TAbstractFile, TFolder } from "obsidian";
 import {
 	pushVaultPathUpdate,
 	pushVaultTextUpdate,
+	isApplyingRemoteVaultPath,
 	renameRemoteVaultPath,
 	runQueuedFileSync,
 	runRemoteFileSync,
@@ -25,7 +26,8 @@ type LiveSyncHost = {
 type Cleanup = () => void;
 
 const CONFIG_SCAN_INTERVAL_MS = 400;
-const REMOTE_POLL_INTERVAL_MS = 5000;
+/** How often idle clients pull remote edits. Lower = snappier cross-device sync; more Convex queries. */
+const REMOTE_POLL_INTERVAL_MS = 200;
 
 type SyncReason = "change" | "full" | "poll";
 
@@ -182,42 +184,63 @@ export function startLiveSync(host: LiveSyncHost): Cleanup {
 	};
 
 	const queuePathEvent = (path: string): void => {
-		if (stopped || shouldIgnorePath(host, path)) {
+		if (stopped || shouldIgnorePath(host, path) || isApplyingRemoteVaultPath(path)) {
 			return;
 		}
 		host.recordSyncDebug?.("queue", "path update", { path });
-		void pushVaultPathUpdate(host as never, path);
-		scheduleSync(host.settings.editorBatchWindowMs, "change");
+		void pushVaultPathUpdate(host as never, path)
+			.then(() => scheduleSync(host.settings.editorBatchWindowMs, "change"))
+			.catch((error) => {
+				console.error("Convex sync: failed to queue path update", error);
+			});
 	};
 
 	const queueEditorText = (path: string, text: string): void => {
-		if (stopped || shouldIgnorePath(host, path) || isConfigPath(host, path)) {
+		if (
+			stopped ||
+			shouldIgnorePath(host, path) ||
+			isConfigPath(host, path) ||
+			isApplyingRemoteVaultPath(path)
+		) {
 			return;
 		}
 		host.recordSyncDebug?.("queue", "editor text update", { path, length: text.length });
-		void pushVaultTextUpdate(host as never, path, text, Date.now());
-		scheduleSync(host.settings.editorBatchWindowMs, "change");
+		void pushVaultTextUpdate(host as never, path, text, Date.now())
+			.then(() => scheduleSync(host.settings.editorBatchWindowMs, "change"))
+			.catch((error) => {
+				console.error("Convex sync: failed to queue editor update", error);
+			});
 	};
 
 	const queueDelete = (path: string): void => {
-		if (stopped || shouldIgnorePath(host, path)) {
+		if (stopped || shouldIgnorePath(host, path) || isApplyingRemoteVaultPath(path)) {
 			return;
 		}
 		host.recordSyncDebug?.("queue", "delete", { path });
-		void trashRemoteVaultPaths(host as never, [path]);
-		scheduleSync(host.settings.editorBatchWindowMs, "change");
+		void trashRemoteVaultPaths(host as never, [path])
+			.then(() => scheduleSync(host.settings.editorBatchWindowMs, "change"))
+			.catch((error) => {
+				console.error("Convex sync: failed to queue delete", error);
+			});
 	};
 
 	const queueRename = (file: TAbstractFile, oldPath: string): void => {
 		if (stopped) {
 			return;
 		}
-		if (shouldIgnorePath(host, oldPath) && shouldIgnorePath(host, file.path)) {
+		if (
+			(shouldIgnorePath(host, oldPath) && shouldIgnorePath(host, file.path)) ||
+			isApplyingRemoteVaultPath(oldPath) ||
+			isApplyingRemoteVaultPath(file.path)
+		) {
 			return;
 		}
 		host.recordSyncDebug?.("queue", "rename", { oldPath, newPath: file.path });
-		void renameRemoteVaultPath(host as never, oldPath, file.path);
-		scheduleSync(host.settings.editorBatchWindowMs, "change");
+		void renameRemoteVaultPath(host as never, oldPath, file.path)
+			.then(() => scheduleSync(host.settings.editorBatchWindowMs, "change"))
+			.catch((error) => {
+				console.error("Convex sync: failed to queue rename", error);
+			});
 	};
 
 	host.registerEvent(host.app.vault.on("create", (file) => {

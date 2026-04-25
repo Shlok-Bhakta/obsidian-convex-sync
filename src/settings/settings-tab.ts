@@ -126,10 +126,12 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Filesystem batch window (ms)")
-			.setDesc("Debounce non-editor file-change bursts before pushing them to Convex. Open editor text changes are pushed much more aggressively.")
+			.setDesc(
+				"Delay after local edits before uploading (0 = next tick). Applies to editor typing and vault file events. Lower is faster but more uploads.",
+			)
 			.addText((text) =>
 				text
-					.setPlaceholder("75")
+					.setPlaceholder("50")
 					.setValue(String(this.plugin.settings.editorBatchWindowMs))
 					.onChange(async (value) => {
 						const parsed = Number.parseInt(value, 10);

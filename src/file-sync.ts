@@ -86,6 +86,13 @@ type RemoteDelta = {
 	}>;
 };
 
+const remoteApplyingPaths = new Set<string>();
+const REMOTE_APPLY_SUPPRESSION_MS = 10_000;
+
+export function isApplyingRemoteVaultPath(path: string): boolean {
+	return remoteApplyingPaths.has(normalizePath(path));
+}
+
 type CommitResponse =
 	| {
 		status: "committed";
@@ -204,6 +211,12 @@ function isPathInScope(path: string, context: SyncScanContext): boolean {
 	});
 }
 
+function getHostSyncStateStore(host: Pick<FileSyncHost, "app" | "settings">): SyncStateStore {
+	const adapter = host.app.vault.adapter as { getBasePath?: () => string };
+	const vaultKey = adapter.getBasePath?.() ?? host.app.vault.getName();
+	return getSyncStateStore(`${host.settings.convexUrl.trim()}|${vaultKey}`);
+}
+
 async function collectConfigEntries(
 	app: App,
 	context: SyncScanContext,
@@ -301,6 +314,11 @@ async function readLocalPathSnapshot(
 	return { bytes, updatedAtMs: file.stat.mtime };
 }
 
+async function adapterFileExists(app: App, path: string): Promise<boolean> {
+	const stat = await app.vault.adapter.stat(normalizePath(path));
+	return stat?.type === "file";
+}
+
 function toMetadata(manifest: RemoteManifest): SyncFileMetadata {
 	return {
 		fileId: manifest.fileId,
@@ -328,31 +346,83 @@ async function applyRemoteBytes(
 	contentKind: ContentKind,
 ): Promise<void> {
 	const normalizedPath = normalizePath(path);
-	const configDir = getConfigDir(host.app);
-	const parent = folderPathForFile(normalizedPath);
-	if (parent) {
-		await ensureLocalFolderExists(host.app, parent, configDir);
-	}
-	if (isObsidianPath(normalizedPath, configDir)) {
-		await host.app.vault.adapter.writeBinary(normalizedPath, bytes);
-		return;
-	}
-	if (contentKind === "text") {
-		const text = new TextDecoder().decode(bytes);
-		const existing = host.app.vault.getFileByPath(normalizedPath);
-		if (existing) {
-			await host.app.vault.modify(existing, text);
+	remoteApplyingPaths.add(normalizedPath);
+	try {
+		const configDir = getConfigDir(host.app);
+		const parent = folderPathForFile(normalizedPath);
+		if (parent) {
+			await ensureLocalFolderExists(host.app, parent, configDir);
+		}
+		if (isObsidianPath(normalizedPath, configDir)) {
+			await host.app.vault.adapter.writeBinary(normalizedPath, bytes);
 			return;
 		}
-		await host.app.vault.create(normalizedPath, text);
+		if (contentKind === "text") {
+			const text = new TextDecoder().decode(bytes);
+			const existing = host.app.vault.getFileByPath(normalizedPath);
+			if (existing) {
+				await host.app.vault.modify(existing, text);
+				return;
+			}
+			await host.app.vault.create(normalizedPath, text);
+			return;
+		}
+		const existing = host.app.vault.getFileByPath(normalizedPath);
+		if (existing) {
+			await host.app.vault.modifyBinary(existing, bytes);
+			return;
+		}
+		await host.app.vault.createBinary(normalizedPath, bytes);
+	} finally {
+		window.setTimeout(
+			() => remoteApplyingPaths.delete(normalizedPath),
+			REMOTE_APPLY_SUPPRESSION_MS,
+		);
+	}
+}
+
+function markRemotePathApplying(path: string): void {
+	const normalizedPath = normalizePath(path);
+	remoteApplyingPaths.add(normalizedPath);
+	window.setTimeout(() => remoteApplyingPaths.delete(normalizedPath), REMOTE_APPLY_SUPPRESSION_MS);
+}
+
+async function clearRemoteAppliedOutbox(
+	store: SyncStateStore,
+	manifest: RemoteManifest,
+): Promise<void> {
+	await store.deleteOutbox(`upsert:${manifest.fileId}`);
+	await store.deleteOutbox(`upsert:${normalizePath(manifest.path)}`);
+}
+
+async function hasPendingLocalOutbox(
+	store: SyncStateStore,
+	manifest: RemoteManifest,
+): Promise<boolean> {
+	const path = normalizePath(manifest.path);
+	const entries = await store.listOutbox();
+	return entries.some((entry) =>
+		entry.fileId === manifest.fileId || normalizePath(entry.path) === path,
+	);
+}
+
+export async function applyRemoteDelete(
+	host: FileSyncHost,
+	path: string,
+): Promise<void> {
+	const normalizedPath = normalizePath(path);
+	markRemotePathApplying(normalizedPath);
+	if (isObsidianPath(normalizedPath, getConfigDir(host.app))) {
+		if (await host.app.vault.adapter.exists(normalizedPath)) {
+			await host.app.vault.adapter.remove(normalizedPath);
+		}
 		return;
 	}
-	const existing = host.app.vault.getFileByPath(normalizedPath);
-	if (existing) {
-		await host.app.vault.modifyBinary(existing, bytes);
+	const existing = host.app.vault.getAbstractFileByPath(normalizedPath);
+	if (!existing) {
 		return;
 	}
-	await host.app.vault.createBinary(normalizedPath, bytes);
+	await host.app.vault.trash(existing, false);
 }
 
 async function getLocalContentHash(
@@ -374,8 +444,35 @@ async function hasDirtyLocalChanges(
 	if (!metadata || metadata.deleted || !metadata.contentHash) {
 		return false;
 	}
-	const localHash = await getLocalContentHash(host, metadata.path);
-	return localHash !== null && localHash !== metadata.contentHash;
+	const context = await createSyncScanContext(host);
+	const local = await readLocalPathSnapshot(host.app, metadata.path, context);
+	if (!local) {
+		return false;
+	}
+	const localHash = await sha256Bytes(local.bytes);
+	return localHash !== metadata.contentHash && local.updatedAtMs > metadata.updatedAtMs;
+}
+
+async function getLocalSnapshotForPath(
+	host: FileSyncHost,
+	path: string,
+): Promise<{ contentHash: string; updatedAtMs: number } | null> {
+	const context = await createSyncScanContext(host);
+	const local = await readLocalPathSnapshot(host.app, path, context);
+	if (!local) {
+		return null;
+	}
+	return {
+		contentHash: await sha256Bytes(local.bytes),
+		updatedAtMs: local.updatedAtMs,
+	};
+}
+
+function isRemoteFileNotFound(error: unknown): boolean {
+	if (!(error instanceof Error)) {
+		return false;
+	}
+	return error.message.includes("File not found.");
 }
 
 async function commitFileChange(
@@ -485,6 +582,9 @@ async function scanLocalChanges(host: FileSyncHost, store: SyncStateStore): Prom
 	}
 	for (const row of metadata) {
 		if (!row.deleted && !localPaths.has(row.path)) {
+			if (await adapterFileExists(host.app, row.path)) {
+				continue;
+			}
 			await store.queueDelete({
 				fileId: row.fileId,
 				path: row.path,
@@ -617,14 +717,31 @@ async function flushOutbox(host: FileSyncHost, store: SyncStateStore): Promise<n
 			skipped += 1;
 			continue;
 		}
-		const result = (await (host.getConvexHttpClient().mutation as any)("fileSync:commitDelete", {
-			convexSecret: host.settings.convexSecret,
-			fileId: metadata.fileId,
-			baseRevision: metadata.revision,
-			clientId: resolveClientId(host),
-			idempotencyKey: `delete:${metadata.fileId}:${metadata.revision}`,
-			updatedAtMs: entry.updatedAtMs,
-		})) as CommitResponse;
+		let result: CommitResponse;
+		try {
+			result = (await (host.getConvexHttpClient().mutation as any)("fileSync:commitDelete", {
+				convexSecret: host.settings.convexSecret,
+				fileId: metadata.fileId,
+				baseRevision: metadata.revision,
+				clientId: resolveClientId(host),
+				idempotencyKey: `delete:${metadata.fileId}:${metadata.revision}`,
+				updatedAtMs: entry.updatedAtMs,
+			})) as CommitResponse;
+		} catch (error) {
+			if (!isRemoteFileNotFound(error)) {
+				throw error;
+			}
+			await store.putMetadata({
+				...metadata,
+				deleted: true,
+				updatedAtMs: entry.updatedAtMs,
+				contentHash: null,
+				contentKind: null,
+			});
+			await store.deleteOutbox(entry.opId);
+			skipped += 1;
+			continue;
+		}
 		if (result.status === "committed") {
 			await store.putMetadata(toMetadata(result.manifest));
 			await store.setLastSeenCursor(result.cursor);
@@ -647,8 +764,16 @@ async function flushOutbox(host: FileSyncHost, store: SyncStateStore): Promise<n
 }
 
 async function applyRemoteDelta(host: FileSyncHost, store: SyncStateStore, delta: RemoteDelta): Promise<void> {
-	const existing = await store.getMetadataByFileId(delta.manifest.fileId);
-	if (await hasDirtyLocalChanges(host, existing)) {
+	const existing =
+		await store.getMetadataByFileId(delta.manifest.fileId) ??
+		await store.getMetadataByPath(delta.manifest.path);
+	if (existing && existing.revision >= delta.manifest.revision) {
+		await clearRemoteAppliedOutbox(store, delta.manifest);
+	}
+	if (
+		await hasDirtyLocalChanges(host, existing) &&
+		await hasPendingLocalOutbox(store, delta.manifest)
+	) {
 		await store.queueUpsert({
 			fileId: existing?.fileId,
 			path: existing?.path ?? delta.manifest.path,
@@ -656,11 +781,20 @@ async function applyRemoteDelta(host: FileSyncHost, store: SyncStateStore, delta
 		});
 		return;
 	}
+	if (!existing && !delta.manifest.deleted && delta.manifest.contentHash) {
+		const local = await getLocalSnapshotForPath(host, delta.manifest.path);
+		if (local?.contentHash === delta.manifest.contentHash) {
+			await store.putMetadata(toMetadata(delta.manifest));
+			await clearRemoteAppliedOutbox(store, delta.manifest);
+			return;
+		}
+	}
 	if (delta.manifest.deleted) {
 		if (existing) {
 			await applyRemoteDelete(host, existing.path);
 		}
 		await store.putMetadata(toMetadata(delta.manifest));
+		await clearRemoteAppliedOutbox(store, delta.manifest);
 		return;
 	}
 
@@ -676,12 +810,18 @@ async function applyRemoteDelta(host: FileSyncHost, store: SyncStateStore, delta
 		await applyRemoteBytes(host, delta.manifest.path, bytes, latestWithBytes.contentKind);
 	}
 	await store.putMetadata(toMetadata(delta.manifest));
+	await clearRemoteAppliedOutbox(store, delta.manifest);
 }
 
-async function syncRemoteChanges(host: FileSyncHost, store: SyncStateStore): Promise<void> {
+async function syncRemoteChanges(
+	host: FileSyncHost,
+	store: SyncStateStore,
+	startCursor?: number,
+): Promise<void> {
 	const client = host.getConvexHttpClient();
 	const localClientId = resolveClientId(host);
-	let cursor = await store.getLastSeenCursor();
+	const context = await createSyncScanContext(host);
+	let cursor = startCursor ?? await store.getLastSeenCursor();
 	let batches = 0;
 	let changesSeen = 0;
 	let changesApplied = 0;
@@ -710,6 +850,9 @@ async function syncRemoteChanges(host: FileSyncHost, store: SyncStateStore): Pro
 		for (const change of response.changes) {
 			cursor = Math.max(cursor, change.cursor);
 			await store.setLastSeenCursor(cursor);
+			if (!isPathInScope(change.path, context)) {
+				continue;
+			}
 			if (change.clientId === localClientId) {
 				continue;
 			}
@@ -717,7 +860,7 @@ async function syncRemoteChanges(host: FileSyncHost, store: SyncStateStore): Pro
 			const delta = (await (client.query as any)("fileSync:getFileSnapshotOrOps", {
 				convexSecret: host.settings.convexSecret,
 				fileId: change.fileId,
-				fromRevision: metadata?.revision ?? 0,
+				fromRevision: Math.max(0, (metadata?.revision ?? 0) - 1),
 			})) as RemoteDelta | null;
 			if (!delta) {
 				continue;
@@ -753,8 +896,9 @@ export async function pushVaultPathUpdate(
 	if (!isPathInScope(normalizedPath, context)) {
 		return;
 	}
-	const metadata = await getSyncStateStore().getMetadataByPath(normalizedPath);
-	await getSyncStateStore().queueUpsert({
+	const store = getHostSyncStateStore(host);
+	const metadata = await store.getMetadataByPath(normalizedPath);
+	await store.queueUpsert({
 		fileId: metadata?.fileId,
 		path: normalizedPath,
 		updatedAtMs: Date.now(),
@@ -772,8 +916,9 @@ export async function pushVaultTextUpdate(
 		return;
 	}
 	const normalizedPath = normalizePath(path);
-	const metadata = await getSyncStateStore().getMetadataByPath(normalizedPath);
-	await getSyncStateStore().queueUpsert({
+	const store = getHostSyncStateStore(host);
+	const metadata = await store.getMetadataByPath(normalizedPath);
+	await store.queueUpsert({
 		fileId: metadata?.fileId,
 		path: normalizedPath,
 		textContent: text,
@@ -785,7 +930,7 @@ export async function trashRemoteVaultPaths(
 	host: FileSyncHost,
 	paths: string[],
 ): Promise<void> {
-	const store = getSyncStateStore();
+	const store = getHostSyncStateStore(host);
 	for (const path of paths) {
 		const normalizedPath = normalizePath(path);
 		const metadata = await store.getMetadataByPath(normalizedPath);
@@ -802,7 +947,7 @@ export async function renameRemoteVaultPath(
 	oldPath: string,
 	newPath: string,
 ): Promise<void> {
-	const store = getSyncStateStore();
+	const store = getHostSyncStateStore(host);
 	const metadata = await store.getMetadataByPath(oldPath);
 	await store.queueRename({
 		fileId: metadata?.fileId,
@@ -817,7 +962,12 @@ export async function applyRemoteVaultPath(
 	path: string,
 ): Promise<void> {
 	const normalizedPath = normalizePath(path);
-	const metadata = await getSyncStateStore().getMetadataByPath(normalizedPath);
+	const context = await createSyncScanContext(host);
+	if (!isPathInScope(normalizedPath, context)) {
+		return;
+	}
+	const store = getHostSyncStateStore(host);
+	const metadata = await store.getMetadataByPath(normalizedPath);
 	if (!metadata) {
 		return;
 	}
@@ -829,25 +979,7 @@ export async function applyRemoteVaultPath(
 	if (!delta) {
 		return;
 	}
-	await applyRemoteDelta(host, getSyncStateStore(), delta);
-}
-
-export async function applyRemoteDelete(
-	host: FileSyncHost,
-	path: string,
-): Promise<void> {
-	const normalizedPath = normalizePath(path);
-	if (isObsidianPath(normalizedPath, getConfigDir(host.app))) {
-		if (await host.app.vault.adapter.exists(normalizedPath)) {
-			await host.app.vault.adapter.remove(normalizedPath);
-		}
-		return;
-	}
-	const existing = host.app.vault.getAbstractFileByPath(normalizedPath);
-	if (!existing) {
-		return;
-	}
-	await host.app.vault.trash(existing, false);
+	await applyRemoteDelta(host, store, delta);
 }
 
 export async function applyRemoteRename(
@@ -857,6 +989,8 @@ export async function applyRemoteRename(
 ): Promise<void> {
 	const normalizedOldPath = normalizePath(oldPath);
 	const normalizedNewPath = normalizePath(newPath);
+	markRemotePathApplying(normalizedOldPath);
+	markRemotePathApplying(normalizedNewPath);
 	const configDir = getConfigDir(host.app);
 	if (
 		isObsidianPath(normalizedOldPath, configDir) ||
@@ -890,11 +1024,11 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		return;
 	}
 	host.recordSyncDebug?.("sync", "full sync started");
-	const store = getSyncStateStore();
+	const store = getHostSyncStateStore(host);
 	host.reportSyncProgress?.({ phase: "Backfilling legacy file state", completed: 0, total: 5 });
 	await backfillLegacyFiles(host);
 	host.reportSyncProgress?.({ phase: "Fetching remote changes", completed: 1, total: 5 });
-	await syncRemoteChanges(host, store);
+	await syncRemoteChanges(host, store, 0);
 	host.reportSyncProgress?.({ phase: "Scanning local files", completed: 2, total: 5 });
 	await scanLocalChanges(host, store);
 	host.reportSyncProgress?.({ phase: "Uploading local outbox", completed: 3, total: 5 });
@@ -915,7 +1049,12 @@ export async function runRemoteFileSync(host: FileSyncHost): Promise<void> {
 		return;
 	}
 	host.recordSyncDebug?.("sync", "remote sync started");
-	await syncRemoteChanges(host, getSyncStateStore());
+	const store = getHostSyncStateStore(host);
+	const latestCommittedCursor = await flushOutbox(host, store);
+	if (latestCommittedCursor !== null) {
+		await reportCursor(host, latestCommittedCursor);
+	}
+	await syncRemoteChanges(host, store);
 }
 
 export async function runQueuedFileSync(host: FileSyncHost): Promise<void> {
@@ -925,7 +1064,7 @@ export async function runQueuedFileSync(host: FileSyncHost): Promise<void> {
 		return;
 	}
 	host.recordSyncDebug?.("sync", "queued sync started");
-	const store = getSyncStateStore();
+	const store = getHostSyncStateStore(host);
 	const latestCommittedCursor = await flushOutbox(host, store);
 	if (latestCommittedCursor !== null) {
 		await reportCursor(host, latestCommittedCursor);
