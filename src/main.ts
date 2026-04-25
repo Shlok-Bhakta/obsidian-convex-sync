@@ -130,12 +130,16 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 
 	/** Delegates to {@link mintVaultApiSecretFromConvexSite} for settings UI. */
 	async mintVaultSecretFromDeployment(): Promise<boolean> {
-		return mintVaultApiSecretFromConvexSite({
+		const minted = await mintVaultApiSecretFromConvexSite({
 			settings: this.settings,
 			saveSettings: () => this.saveSettings(),
 			ensureRegistered: () =>
 				this.ensureConvexSecretRegisteredWithDeployment(),
 		});
+		if (minted) {
+			await this.reloadLiveSync();
+		}
+		return minted;
 	}
 
 	async saveSettings() {

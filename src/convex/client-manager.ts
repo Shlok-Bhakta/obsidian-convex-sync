@@ -20,13 +20,7 @@ export class ConvexClientManager {
 	}
 
 	getHttp(): ConvexHttpClient {
-		const settings = this.readSettings();
-		const url = settings.convexUrl.trim();
-		if (!url) {
-			throw new Error(
-				"Convex URL is empty. Open plugin settings and set Convex URL (deployment URL).",
-			);
-		}
+		const url = this.getConfiguredUrl();
 		if (!this.convexHttpClientCache || this.convexHttpClientCache.url !== url) {
 			this.convexHttpClientCache = { client: new ConvexHttpClient(url), url };
 		}
@@ -49,8 +43,7 @@ export class ConvexClientManager {
 	}
 
 	getKeepaliveHttp(): ConvexHttpClient {
-		const settings = this.readSettings();
-		const url = settings.convexUrl.trim();
+		const url = this.getConfiguredUrl();
 		return new ConvexHttpClient(url, {
 			fetch: (input, init) =>
 				globalThis.fetch(input, {
@@ -64,5 +57,15 @@ export class ConvexClientManager {
 		void this.convexRealtimeClientCache?.client.close();
 		this.convexRealtimeClientCache = null;
 		this.convexHttpClientCache = null;
+	}
+
+	private getConfiguredUrl(): string {
+		const url = this.readSettings().convexUrl.trim();
+		if (!url) {
+			throw new Error(
+				"Convex URL is empty. Open plugin settings and set Convex URL (deployment URL).",
+			);
+		}
+		return url;
 	}
 }

@@ -3,7 +3,6 @@ import {
 	Notice,
 	TAbstractFile,
 	TFile,
-	TFolder,
 	normalizePath,
 	type App,
 	type Editor,
@@ -19,6 +18,11 @@ import {
 } from "../core/sync-engine";
 import { createEditorAdapter, type EditorAdapter } from "./editor-adapter";
 import type { DocPathChange } from "../transport/convex-client";
+import {
+	ensureVaultFolderExists,
+	isTextSyncFile,
+} from "../lib/obsidian-vault";
+import { folderPathForFile } from "../lib/path";
 
 export type LiveSyncHost = {
 	app: App;
@@ -421,7 +425,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		this.suppressPathEvents.add(newPath);
 		try {
 			if (!newFile) {
-				await ensureFolderExists(this.host.app, folderPathForFile(newPath));
+				await ensureVaultFolderExists(this.host.app, folderPathForFile(newPath));
 				await this.host.app.vault.rename(oldFile, newPath);
 			} else if (newFile instanceof TFile && isTextSyncFile(newFile)) {
 				const [oldText, newText] = await Promise.all([
@@ -463,7 +467,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 				}
 				return;
 			}
-			await ensureFolderExists(this.host.app, folderPathForFile(path));
+			await ensureVaultFolderExists(this.host.app, folderPathForFile(path));
 			try {
 				await this.host.app.vault.create(path, text);
 			} catch (error) {
@@ -516,26 +520,4 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 		return docId === undefined || this.current.session.docId === docId;
 	}
-}
-
-function isTextSyncFile(file: TFile): boolean {
-	const extension = file.extension.toLowerCase();
-	return extension === "md" || extension === "markdown" || extension === "txt";
-}
-
-function folderPathForFile(filePath: string): string | null {
-	const slash = filePath.lastIndexOf("/");
-	return slash < 0 ? null : filePath.slice(0, slash);
-}
-
-async function ensureFolderExists(app: App, path: string | null): Promise<void> {
-	if (!path) {
-		return;
-	}
-	const existing = app.vault.getAbstractFileByPath(path);
-	if (existing instanceof TFolder) {
-		return;
-	}
-	await ensureFolderExists(app, folderPathForFile(path));
-	await app.vault.createFolder(path);
 }

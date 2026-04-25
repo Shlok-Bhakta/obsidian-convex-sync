@@ -1,4 +1,4 @@
-import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ObsidianConvexSyncPlugin from "../main";
 import {
 	cancelBootstrap,
@@ -6,44 +6,11 @@ import {
 	startBootstrapBuild,
 	type BootstrapUiState,
 } from "../bootstrap/service";
-
-function formatBytes(value: number): string {
-	if (value < 1024) {
-		return `${value} B`;
-	}
-	if (value < 1024 * 1024) {
-		return `${(value / 1024).toFixed(1)} KB`;
-	}
-	return `${(value / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-class BootstrapConfirmModal extends Modal {
-	onConfirm: (() => void) | null = null;
-
-	onOpen(): void {
-		this.contentEl.empty();
-		this.titleEl.setText("Generate bootstrap download link");
-		this.contentEl.createEl("p", {
-			text: "Do not edit files on this device until the new device has extracted the bootstrap zip and opened the vault.",
-		});
-		this.contentEl.createEl("p", {
-			text: "The bootstrap is a point-in-time snapshot. Edits during setup can be lost or create conflicts.",
-		});
-		const row = this.contentEl.createDiv();
-		row.style.display = "flex";
-		row.style.gap = "8px";
-		const confirmButton = row.createEl("button", {
-			text: "I won't touch files - generate",
-		});
-		confirmButton.addEventListener("click", () => {
-			this.close();
-			this.onConfirm?.();
-		});
-		row.createEl("button", { text: "Cancel" }).addEventListener("click", () => {
-			this.close();
-		});
-	}
-}
+import { BootstrapConfirmModal } from "./bootstrap-confirm-modal";
+import {
+	copyBootstrapUrl,
+	renderBootstrapSection,
+} from "./bootstrap-section";
 
 export class ConvexSyncSettingTab extends PluginSettingTab {
 	private bootstrapState: BootstrapUiState = { kind: "idle" };
@@ -71,6 +38,7 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 						this.plugin.settings.convexUrl = value;
 						await this.plugin.saveSettings();
 						await this.plugin.ensureConvexSecretRegisteredWithDeployment();
+						await this.plugin.reloadLiveSync();
 					}),
 			);
 
@@ -186,6 +154,9 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 
 	private async refreshBootstrapState(): Promise<void> {
 		if (!this.plugin.settings.convexSecret.trim()) {
+			this.stopBootstrapIntervals();
+			this.bootstrapState = { kind: "idle" };
+			this.display();
 			return;
 		}
 		try {
@@ -216,96 +187,28 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 	}
 
 	private renderBootstrapSection(containerEl: HTMLElement): void {
-		containerEl.createEl("h3", { text: "Bootstrap new device" });
-		const warning = containerEl.createDiv();
-		warning.style.padding = "8px 10px";
-		warning.style.border = "1px solid var(--color-orange)";
-		warning.style.borderRadius = "6px";
-		warning.style.marginBottom = "12px";
-		warning.setText(
-			"Important: while a bootstrap link is active, do not edit files on this device until the new device finishes extracting the zip and opens the vault.",
-		);
-
-		new Setting(containerEl)
-			.setName("Generate bootstrap link (10 min)")
-			.setDesc(
-				"Creates a full vault snapshot from Convex, including .obsidian and plugin key data, and returns a temporary download link.",
-			)
-			.addButton((button) =>
-				button.setButtonText("Generate link").onClick(() => {
-					const modal = new BootstrapConfirmModal(this.app);
-					modal.onConfirm = () => {
-						void this.startBootstrapFlow();
-					};
-					modal.open();
-				}),
-			);
-
-		if (this.bootstrapState.kind === "syncing" || this.bootstrapState.kind === "building") {
-			const phase =
-				this.bootstrapState.kind === "syncing"
-					? `Syncing: ${this.bootstrapState.phase}`
-					: `Building: ${this.bootstrapState.phase}`;
-			containerEl.createEl("p", { text: phase });
-			const progressEl = containerEl.createEl("progress");
-			const completed =
-				this.bootstrapState.kind === "syncing"
-					? this.bootstrapState.completed
-					: this.bootstrapState.filesProcessed;
-			const total =
-				this.bootstrapState.kind === "syncing"
-					? this.bootstrapState.total
-					: this.bootstrapState.filesTotal;
-			progressEl.max = Math.max(total, 1);
-			progressEl.value = Math.min(completed, progressEl.max);
-			if (this.bootstrapState.kind === "building") {
-				containerEl.createEl("p", {
-					text: `${formatBytes(this.bootstrapState.bytesProcessed)} / ${formatBytes(this.bootstrapState.bytesTotal)}`,
+		renderBootstrapSection({
+			containerEl,
+			state: this.bootstrapState,
+			onGenerate: () => {
+				const modal = new BootstrapConfirmModal(this.app);
+				modal.onConfirm = () => {
+					void this.startBootstrapFlow();
+				};
+				modal.open();
+			},
+			onCopyUrl: copyBootstrapUrl,
+			onCancelLink: async () => {
+				await cancelBootstrap({
+					app: this.app,
+					settings: this.plugin.settings,
+					getConvexHttpClient: this.plugin.getConvexHttpClient,
+					getPresenceSessionId: this.plugin.getPresenceSessionId.bind(this.plugin),
 				});
-			}
-		}
-
-		if (this.bootstrapState.kind === "ready") {
-			const readyState = this.bootstrapState;
-			const remainingMs = Math.max(0, this.bootstrapState.expiresAtMs - Date.now());
-			const minutes = Math.floor(remainingMs / 60_000);
-			const seconds = Math.floor((remainingMs % 60_000) / 1000)
-				.toString()
-				.padStart(2, "0");
-			containerEl.createEl("p", {
-				text: `Link expires in ${minutes}:${seconds}. Archive size: ${formatBytes(this.bootstrapState.sizeBytes)}.`,
-			});
-			new Setting(containerEl)
-				.setName("Download URL")
-				.addText((text) => text.setValue(readyState.url).setDisabled(true))
-				.addButton((button) =>
-					button.setButtonText("Copy").onClick(async () => {
-						await navigator.clipboard.writeText(readyState.url);
-						new Notice("Bootstrap link copied.");
-					}),
-				);
-			new Setting(containerEl).addButton((button) =>
-				button.setButtonText("Cancel link now").onClick(async () => {
-					await cancelBootstrap({
-						app: this.app,
-						settings: this.plugin.settings,
-						getConvexHttpClient: this.plugin.getConvexHttpClient,
-						getPresenceSessionId: this.plugin.getPresenceSessionId.bind(this.plugin),
-					});
-					this.bootstrapState = { kind: "expired", phase: "Cancelled" };
-					this.display();
-				}),
-			);
-		}
-
-		if (this.bootstrapState.kind === "failed") {
-			containerEl.createEl("p", {
-				text: `Bootstrap failed: ${this.bootstrapState.message}`,
-			});
-		}
-		if (this.bootstrapState.kind === "expired") {
-			containerEl.createEl("p", { text: "Bootstrap link expired." });
-		}
+				this.bootstrapState = { kind: "expired", phase: "Cancelled" };
+				this.display();
+			},
+		});
 	}
 
 	private async startBootstrapFlow(): Promise<void> {

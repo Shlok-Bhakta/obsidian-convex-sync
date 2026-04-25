@@ -74,6 +74,8 @@ export class SyncEngine {
 				),
 			));
 
+		this.closeDoc(docId);
+
 		const session = new DocSession({
 			docId,
 			repo,

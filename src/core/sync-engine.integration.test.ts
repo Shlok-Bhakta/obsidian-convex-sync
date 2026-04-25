@@ -190,6 +190,20 @@ describe("SyncEngine integration scenarios", () => {
 		await clientA.dispose();
 		await clientB.dispose();
 	});
+
+	test("reopening_same_doc_replaces_previous_subscription", async () => {
+		const client = await SimulatedClient.boot(clientId(runId, "solo"), server);
+		const first = await client.open(PATH);
+		expect(client.subscriptionCount()).toBe(1);
+
+		const second = await client.open(PATH);
+
+		expect(second.docId).toBe(first.docId);
+		expect(client.subscriptionCount()).toBe(1);
+
+		second.close();
+		await client.dispose();
+	});
 });
 
 function clientId(runId: string, name: string): string {
@@ -242,6 +256,10 @@ class SimulatedClient {
 	async dispose(): Promise<void> {
 		await this.engine.dispose();
 		this.fakeClient.kill();
+	}
+
+	subscriptionCount(): number {
+		return this.fakeClient.subscriptionCount();
 	}
 }
 
@@ -486,6 +504,10 @@ class FakeConvexClient {
 			return this.server.getOrCreateDocIdForPath(args);
 		}
 		return this.server.submit(args);
+	}
+
+	subscriptionCount(): number {
+		return this.subscribers.size;
 	}
 }
 
