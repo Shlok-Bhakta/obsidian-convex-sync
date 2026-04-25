@@ -823,6 +823,21 @@ export const commitDelete = mutation({
 	},
 });
 
+/** Tiny reactive query so Convex clients can subscribe and wake when any vault commit advances the global cursor. */
+export const watchSyncHead = query({
+	args: {
+		convexSecret: v.string(),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const head = await getSyncHead(ctx);
+		return {
+			headCursor: head?.cursor ?? 0,
+			updatedAtMs: head?.updatedAtMs ?? 0,
+		};
+	},
+});
+
 export const listChangesSince = query({
 	args: {
 		convexSecret: v.string(),

@@ -1,4 +1,6 @@
+import type { ConvexClient } from "convex/browser";
 import { Notice, TAbstractFile, TFolder } from "obsidian";
+import { api } from "../convex/_generated/api";
 import {
 	pushVaultPathUpdate,
 	pushVaultTextUpdate,
@@ -16,6 +18,7 @@ type LiveSyncHost = {
 	app: import("obsidian").App;
 	settings: MyPluginSettings;
 	getConvexHttpClient: import("./file-sync").FileSyncHost["getConvexHttpClient"];
+	getConvexRealtimeClient(): ConvexClient | null;
 	getPresenceSessionId: import("./file-sync").FileSyncHost["getPresenceSessionId"];
 	registerEvent: import("obsidian").Plugin["registerEvent"];
 	registerInterval: import("obsidian").Plugin["registerInterval"];
@@ -26,8 +29,8 @@ type LiveSyncHost = {
 type Cleanup = () => void;
 
 const CONFIG_SCAN_INTERVAL_MS = 400;
-/** How often idle clients pull remote edits. Lower = snappier cross-device sync; more Convex queries. */
-const REMOTE_POLL_INTERVAL_MS = 200;
+/** Slow safety net if the WebSocket subscription misses updates (sleep, flaky network). */
+const REMOTE_FALLBACK_POLL_INTERVAL_MS = 120_000;
 
 type SyncReason = "change" | "full" | "poll";
 
@@ -100,6 +103,8 @@ export function startLiveSync(host: LiveSyncHost): Cleanup {
 	let running = false;
 	let flushTimer: number | null = null;
 	let pendingReason: SyncReason | null = null;
+	/** Remote head moved while a local edit batch was debouncing; run a poll after that change sync. */
+	let coalesceRemotePullAfterLocalEdit = false;
 	let lastConfigScan = new Map<string, number>();
 
 	const runSync = async (reason: SyncReason): Promise<void> => {
@@ -160,11 +165,19 @@ export function startLiveSync(host: LiveSyncHost): Cleanup {
 				pendingReason = null;
 				scheduleSync(0, nextReason);
 			}
+			if (coalesceRemotePullAfterLocalEdit && !stopped) {
+				coalesceRemotePullAfterLocalEdit = false;
+				scheduleSync(0, "poll");
+			}
 		}
 	};
 
 	const scheduleSync = (delayMs: number, reason: SyncReason): void => {
-		if (pendingReason === "full" || (pendingReason === "change" && reason === "poll")) {
+		if (pendingReason === "full") {
+			return;
+		}
+		if (pendingReason === "change" && reason === "poll") {
+			coalesceRemotePullAfterLocalEdit = true;
 			return;
 		}
 		pendingReason = reason === "full"
@@ -307,10 +320,31 @@ export function startLiveSync(host: LiveSyncHost): Cleanup {
 	}, CONFIG_SCAN_INTERVAL_MS);
 	host.registerInterval(configPollInterval);
 
-	const remotePollInterval = window.setInterval(() => {
+	const realtimeClient = host.getConvexRealtimeClient();
+	let stopHeadSubscription: (() => void) | null = null;
+	if (realtimeClient) {
+		const headSub = realtimeClient.onUpdate(
+			api.fileSync.watchSyncHead,
+			{ convexSecret: secret },
+			() => {
+				if (stopped) {
+					return;
+				}
+				host.recordSyncDebug?.("live", "sync head subscription tick");
+				scheduleSync(0, "poll");
+			},
+			(err) => {
+				console.error("Convex sync: watchSyncHead subscription error", err);
+				host.recordSyncDebug?.("live", "watchSyncHead error", { message: err.message });
+			},
+		);
+		stopHeadSubscription = typeof headSub === "function" ? headSub : () => headSub.unsubscribe();
+	}
+
+	const remoteFallbackPoll = window.setInterval(() => {
 		scheduleSync(0, "poll");
-	}, REMOTE_POLL_INTERVAL_MS);
-	host.registerInterval(remotePollInterval);
+	}, REMOTE_FALLBACK_POLL_INTERVAL_MS);
+	host.registerInterval(remoteFallbackPoll);
 
 	void scanConfigFileMtims(host).then((scan) => {
 		lastConfigScan = scan;
@@ -320,6 +354,8 @@ export function startLiveSync(host: LiveSyncHost): Cleanup {
 	return () => {
 		stopped = true;
 		host.recordSyncDebug?.("live", "stopped");
+		stopHeadSubscription?.();
+		stopHeadSubscription = null;
 		if (flushTimer !== null) {
 			window.clearTimeout(flushTimer);
 		}
