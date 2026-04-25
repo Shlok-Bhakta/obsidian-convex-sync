@@ -36,6 +36,7 @@ export type ReconcilePathOptions = {
 		localText: string;
 		remoteText: string;
 	}) => Promise<void>;
+	preferRemoteOnMissingBase?: boolean;
 };
 
 export type ReconcilePathResult = {
@@ -130,6 +131,17 @@ export class SyncEngine {
 						path: entry.path,
 						text: localText,
 						changed: false,
+						usedFallbackBackup: false,
+					};
+				}
+
+				if (options.preferRemoteOnMissingBase) {
+					await metaStore.setLastReconciledText(docId, remote);
+					return {
+						docId,
+						path: entry.path,
+						text: remote,
+						changed: true,
 						usedFallbackBackup: false,
 					};
 				}
@@ -268,6 +280,10 @@ export class SyncEngine {
 		return this.requireTransport().watchDocPathChanges(onChanges);
 	}
 
+	async listRemotePathChanges(): Promise<DocPathChange[]> {
+		return this.requireTransport().listDocPathChanges(0);
+	}
+
 	closeDoc(docId: string): void {
 		void this.disposeEntry(docId);
 	}
@@ -278,7 +294,7 @@ export class SyncEngine {
 			Array.from(this.sessions.keys(), (docId) => this.disposeEntry(docId)),
 		);
 		this.transport?.dispose();
-		await this.repo?.dispose();
+		await this.repo?.dispose({ closeStorage: true });
 		this.metaStore?.dispose();
 		this.transport = null;
 		this.repo = null;

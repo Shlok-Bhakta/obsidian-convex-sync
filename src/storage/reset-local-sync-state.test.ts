@@ -12,7 +12,7 @@ describe("resetLocalSyncState", () => {
 		meta.dispose();
 
 		const repo = await AutomergeRepoStore.open({ vaultId });
-		await repo.dispose();
+		await repo.dispose({ closeStorage: true });
 
 		const result = await resetLocalSyncState(vaultId);
 

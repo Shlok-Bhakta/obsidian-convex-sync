@@ -1,5 +1,11 @@
 import { v } from "convex/values";
-import { action, internalQuery, mutation, query } from "./_generated/server";
+import {
+	action,
+	internalMutation,
+	internalQuery,
+	mutation,
+	query,
+} from "./_generated/server";
 import { internal } from "./_generated/api";
 import { normalizeOptionalVaultPath, normalizeVaultPath } from "./_lib/path";
 import { requirePluginSecret } from "./security";
@@ -17,6 +23,10 @@ type FileBytesResult = {
 	sizeBytes: number;
 	updatedAtMs: number;
 } | null;
+
+type UploadBytesResult =
+	| { ok: true }
+	| { ok: false; reason: "stale_write"; remoteUpdatedAtMs: number };
 
 export const issueUploadUrl = mutation({
 	args: {
@@ -68,6 +78,60 @@ export const finalizeUpload = mutation({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		void args.fileId;
+		const path = normalizeVaultPath(args.path);
+		const existing = await ctx.db
+			.query("vaultFiles")
+			.withIndex("by_path", (q) => q.eq("path", path))
+			.unique();
+		if (existing && !args.force && existing.updatedAtMs > args.updatedAtMs) {
+			await ctx.storage.delete(args.storageId);
+			return {
+				ok: false as const,
+				reason: "stale_write" as const,
+				remoteUpdatedAtMs: existing.updatedAtMs,
+			};
+		}
+
+		let previousStorageId: typeof args.storageId | null = null;
+		if (existing) {
+			previousStorageId = existing.storageId;
+			await ctx.db.patch(existing._id, {
+				storageId: args.storageId,
+				contentHash: args.contentHash,
+				sizeBytes: args.sizeBytes,
+				updatedAtMs: args.updatedAtMs,
+				updatedByClientId: args.clientId,
+			});
+		} else {
+			await ctx.db.insert("vaultFiles", {
+				path,
+				storageId: args.storageId,
+				contentHash: args.contentHash,
+				sizeBytes: args.sizeBytes,
+				updatedAtMs: args.updatedAtMs,
+				updatedByClientId: args.clientId,
+			});
+		}
+
+		if (previousStorageId !== null && previousStorageId !== args.storageId) {
+			await ctx.storage.delete(previousStorageId);
+		}
+
+		return { ok: true as const };
+	},
+});
+
+export const finalizeActionUpload = internalMutation({
+	args: {
+		path: v.string(),
+		storageId: v.id("_storage"),
+		contentHash: v.string(),
+		updatedAtMs: v.number(),
+		sizeBytes: v.number(),
+		clientId: v.string(),
+		force: v.optional(v.boolean()),
+	},
+	handler: async (ctx, args) => {
 		const path = normalizeVaultPath(args.path);
 		const existing = await ctx.db
 			.query("vaultFiles")
@@ -229,6 +293,39 @@ export const getFileBytes = action({
 			sizeBytes: descriptor.sizeBytes,
 			updatedAtMs: descriptor.updatedAtMs,
 		};
+	},
+});
+
+export const uploadFileBytes = action({
+	args: {
+		convexSecret: v.string(),
+		path: v.string(),
+		bytes: v.bytes(),
+		contentHash: v.string(),
+		updatedAtMs: v.number(),
+		sizeBytes: v.number(),
+		clientId: v.string(),
+		force: v.optional(v.boolean()),
+	},
+	handler: async (ctx, args): Promise<UploadBytesResult> => {
+		const auth = await ctx.runQuery(internal.security.validatePluginSecret, {
+			secret: args.convexSecret,
+		});
+		if (!auth.ok) {
+			throw new Error("The vault API key is invalid for this Convex deployment.");
+		}
+		const storageId = await ctx.storage.store(
+			new Blob([args.bytes], { type: "application/octet-stream" }),
+		);
+		return (await ctx.runMutation((internal as any).fileSync.finalizeActionUpload, {
+			path: args.path,
+			storageId,
+			contentHash: args.contentHash,
+			updatedAtMs: args.updatedAtMs,
+			sizeBytes: args.sizeBytes,
+			clientId: args.clientId,
+			force: args.force,
+		})) as UploadBytesResult;
 	},
 });
 

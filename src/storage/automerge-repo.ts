@@ -87,8 +87,11 @@ export class AutomergeRepoStore {
 		});
 	}
 
-	async dispose(): Promise<void> {
+	async dispose(options: { closeStorage?: boolean } = {}): Promise<void> {
 		await this.repo.shutdown();
+		if (options.closeStorage) {
+			await closeIndexedDbStorageAdapter(this.storageAdapter);
+		}
 		this.handles.clear();
 	}
 
@@ -119,4 +122,14 @@ export class AutomergeRepoStore {
 
 function isUnavailableError(error: unknown): boolean {
 	return error instanceof Error && error.message.includes("is unavailable");
+}
+
+async function closeIndexedDbStorageAdapter(
+	storageAdapter: StorageAdapterInterface,
+): Promise<void> {
+	const maybeIndexedDbAdapter = storageAdapter as {
+		dbPromise?: Promise<IDBDatabase>;
+	};
+	const db = await maybeIndexedDbAdapter.dbPromise?.catch(() => null);
+	db?.close();
 }

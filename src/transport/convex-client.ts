@@ -268,7 +268,7 @@ export class ConvexAutomergeTransport {
 				numItems: 100,
 			},
 			(result) => {
-				const changes = result.page.filter((change) => {
+				const changes = result.page.filter((change: DocPathChange) => {
 					const identity = pathChangeIdentity(change);
 					if (seen.has(identity)) {
 						return false;
@@ -282,6 +282,28 @@ export class ConvexAutomergeTransport {
 			},
 		);
 		return () => unsubscribe();
+	}
+
+	async listDocPathChanges(sinceUpdatedAtMs = 0): Promise<DocPathChange[]> {
+		const received: DocPathChange[] = [];
+		let cursor: string | undefined;
+		for (;;) {
+			const result = await this.options.client.query(
+				api.automergeSync.listDocPathChanges,
+				{
+					convexSecret: this.options.convexSecret,
+					sinceUpdatedAtMs,
+					numItems: 100,
+					cursor,
+				},
+			);
+			received.push(...result.page);
+			if (result.isDone) {
+				break;
+			}
+			cursor = result.continueCursor;
+		}
+		return received;
 	}
 
 	getConnectionState(): ConnectionStatus {

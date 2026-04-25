@@ -46,6 +46,31 @@ describe("SyncEngine integration", () => {
 		await engine.dispose();
 		client.kill();
 	});
+
+	test("remote update can win when desktop has no reconciled base", async () => {
+		const mobileClient = new FakeConvexClient(server);
+		const mobileEngine = await SyncEngine.boot({
+			vaultId: crypto.randomUUID(),
+			convexClient: mobileClient as unknown as ConvexClient,
+			convexSecret: SECRET,
+		});
+		await mobileEngine.reconcilePath(PATH, "old content");
+		await sleep(80);
+		await mobileEngine.reconcilePath(PATH, "");
+		await sleep(80);
+
+		const result = await engine.reconcilePath(PATH, "old content", {
+			preferRemoteOnMissingBase: true,
+		});
+
+		expect(result.text).toBe("");
+		expect(result.changed).toBe(true);
+		expect(result.usedFallbackBackup).toBe(false);
+		await mobileEngine.dispose();
+		mobileClient.kill();
+		await engine.dispose();
+		client.kill();
+	});
 });
 
 class SharedAutomergeServer {
@@ -274,3 +299,7 @@ type FakeUnsubscribe = (() => void) & {
 	unsubscribe: () => void;
 	getCurrentValue: () => PullResult | number;
 };
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}

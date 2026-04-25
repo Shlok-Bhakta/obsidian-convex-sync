@@ -1,9 +1,17 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import type { DocPathChange } from "../transport/convex-client";
 
 const openDocMock = vi.fn();
 const reconcilePathMock = vi.fn();
 const engineDisposeMock = vi.fn();
 const watchPathChangesMock = vi.fn(() => () => undefined);
+const listRemotePathChangesMock = vi.fn<() => Promise<DocPathChange[]>>(
+	async () => [],
+);
+const getLocalPathForDocIdMock = vi.fn(async () => null);
+const bindRemotePathMock = vi.fn(async () => undefined);
+const getClientIdMock = vi.fn(() => "desktop-client");
+const readRemoteFileBytesMock = vi.hoisted(() => vi.fn());
 const uploadLocalFileMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../core/sync-engine", () => ({
@@ -12,12 +20,17 @@ vi.mock("../core/sync-engine", () => ({
 			openDoc: openDocMock,
 			reconcilePath: reconcilePathMock,
 			watchPathChanges: watchPathChangesMock,
+			listRemotePathChanges: listRemotePathChangesMock,
+			getLocalPathForDocId: getLocalPathForDocIdMock,
+			bindRemotePath: bindRemotePathMock,
+			getClientId: getClientIdMock,
 			dispose: engineDisposeMock,
 		})),
 	},
 }));
 
 vi.mock("../file-sync/remote-transfer", () => ({
+	readRemoteFileBytes: readRemoteFileBytesMock,
 	uploadLocalFile: uploadLocalFileMock,
 }));
 
@@ -83,8 +96,17 @@ describe("startObsidianLiveSync", () => {
 		reconcilePathMock.mockReset();
 		engineDisposeMock.mockReset();
 		watchPathChangesMock.mockReset();
+		listRemotePathChangesMock.mockReset();
+		getLocalPathForDocIdMock.mockReset();
+		bindRemotePathMock.mockReset();
+		getClientIdMock.mockReset();
+		readRemoteFileBytesMock.mockReset();
 		uploadLocalFileMock.mockReset();
 		watchPathChangesMock.mockReturnValue(() => undefined);
+		listRemotePathChangesMock.mockResolvedValue([]);
+		getLocalPathForDocIdMock.mockResolvedValue(null);
+		bindRemotePathMock.mockResolvedValue(undefined);
+		getClientIdMock.mockReturnValue("desktop-client");
 	});
 
 	test("active remote patch updates editor without vault modify", async () => {
@@ -273,6 +295,131 @@ describe("startObsidianLiveSync", () => {
 		await controller.dispose();
 	});
 
+	test("editor change waits for mobile editor value to settle", async () => {
+		vi.useFakeTimers();
+		try {
+			const editor = createEditor("");
+			const file = new TFileCtor("note.md");
+			const app = createApp(new MarkdownViewCtor(file, editor), [[file.path, file]]);
+			openDocMock.mockResolvedValue(createSession());
+			reconcilePathMock.mockResolvedValue({
+				docId: "doc-1",
+				path: file.path,
+				text: "Banana",
+				changed: false,
+				usedFallbackBackup: false,
+			});
+
+			const controller = startObsidianLiveSync({
+				app: app as never,
+				settings: { convexSecret: "secret" } as never,
+				getRealtimeClient: () => ({}) as never,
+				setStatus: () => undefined,
+			});
+			await vi.waitFor(() => expect(reconcilePathMock).toHaveBeenCalledTimes(1));
+
+			editor.setValue("Banan");
+			app.workspace.emit("editor-change", editor, { file });
+			await flushPromises();
+			editor.setValue("Banana");
+			await vi.advanceTimersByTimeAsync(100);
+
+			await vi.waitFor(() => expect(reconcilePathMock).toHaveBeenCalledTimes(2));
+			expect(reconcilePathMock.mock.calls[1]?.[1]).toBe("Banana");
+			await controller.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("startup bootstraps remote paths after local reset", async () => {
+		const editor = createEditor("active text");
+		const activeFile = new TFileCtor("a.md");
+		const remoteFile = new TFileCtor("b.md");
+		const fileContents = new Map([
+			[activeFile.path, "active text"],
+			[remoteFile.path, "old local text"],
+		]);
+		const app = createApp(
+			new MarkdownViewCtor(activeFile, editor),
+			[
+				[activeFile.path, activeFile],
+				[remoteFile.path, remoteFile],
+			],
+			fileContents,
+		);
+		listRemotePathChangesMock.mockResolvedValue([
+			{
+				path: remoteFile.path,
+				docId: "doc-b",
+				updatedAtMs: 10,
+				updatedByClientId: "phone-client",
+				deletedAtMs: null,
+			},
+		]);
+		openDocMock.mockResolvedValue(createSession("doc-a", activeFile.path));
+		reconcilePathMock.mockImplementation(async (path: string) => ({
+			docId: path === remoteFile.path ? "doc-b" : "doc-a",
+			path,
+			text: path === remoteFile.path ? "" : "active text",
+			changed: path === remoteFile.path,
+			usedFallbackBackup: false,
+		}));
+
+		const controller = startObsidianLiveSync({
+			app: app as never,
+			settings: { convexSecret: "secret" } as never,
+			getRealtimeClient: () => ({}) as never,
+			setStatus: () => undefined,
+		});
+
+		await vi.waitFor(() =>
+			expect(reconcilePathMock).toHaveBeenCalledWith(
+				remoteFile.path,
+				"old local text",
+				{ preferRemoteOnMissingBase: true },
+			),
+		);
+		expect(bindRemotePathMock).toHaveBeenCalledWith("doc-b", remoteFile.path);
+		expect(app.vault.modify).toHaveBeenCalledWith(remoteFile, "");
+		await controller.dispose();
+	});
+
+	test("remote empty file creates missing local file after reset", async () => {
+		const editor = createEditor("active text");
+		const activeFile = new TFileCtor("a.md");
+		const app = createApp(new MarkdownViewCtor(activeFile, editor), [
+			[activeFile.path, activeFile],
+		]);
+		listRemotePathChangesMock.mockResolvedValue([
+			{
+				path: "AGH.md",
+				docId: "doc-agh",
+				updatedAtMs: 10,
+				updatedByClientId: "phone-client",
+				deletedAtMs: null,
+			},
+		]);
+		openDocMock.mockResolvedValue(createSession("doc-a", activeFile.path));
+		reconcilePathMock.mockImplementation(async (path: string) => ({
+			docId: path === "AGH.md" ? "doc-agh" : "doc-a",
+			path,
+			text: path === "AGH.md" ? "" : "active text",
+			changed: false,
+			usedFallbackBackup: false,
+		}));
+
+		const controller = startObsidianLiveSync({
+			app: app as never,
+			settings: { convexSecret: "secret" } as never,
+			getRealtimeClient: () => ({}) as never,
+			setStatus: () => undefined,
+		});
+
+		await vi.waitFor(() => expect(app.vault.create).toHaveBeenCalledWith("AGH.md", ""));
+		await controller.dispose();
+	});
+
 	test("active editor reconcile mirrors text into vaultFiles snapshot", async () => {
 		const editor = createEditor("local");
 		const file = new TFileCtor("note.md");
@@ -417,11 +564,11 @@ function createEditor(initialValue: string) {
 	};
 }
 
-function createSession(docId = "doc-1", path = "note.md") {
+function createSession(docId = "doc-1", path = "note.md", text = "") {
 	return {
 		docId,
 		path,
-		getTextSnapshot: () => "",
+		getTextSnapshot: () => text,
 		applyLocalChange: vi.fn(async () => undefined),
 		close: vi.fn(),
 	};

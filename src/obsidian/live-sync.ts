@@ -25,7 +25,10 @@ import {
 } from "../lib/obsidian-vault";
 import { isMergeBackupPath } from "../lib/merge-backups";
 import { folderPathForFile } from "../lib/path";
-import { uploadLocalFile } from "../file-sync/remote-transfer";
+import {
+	readRemoteFileBytes,
+	uploadLocalFile,
+} from "../file-sync/remote-transfer";
 import { listLocalEntries } from "../file-sync/local-entries";
 import { isDotObsidianPath, shouldIgnoreVaultPath } from "../file-sync/path-rules";
 import {
@@ -63,6 +66,7 @@ type FolderSnapshotRow = {
 };
 
 const FOLDER_SYNC_DEBOUNCE_MS = 250;
+const EDITOR_CHANGE_DEBOUNCE_MS = 75;
 
 export function startObsidianLiveSync(host: LiveSyncHost): LiveSyncController {
 	const controller = new ObsidianLiveSyncController(host);
@@ -84,6 +88,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	private configSnapshotUnsubscribe: (() => void) | null = null;
 	private folderSyncTimer: number | null = null;
 	private configSnapshotTimer: number | null = null;
+	private editorChangeTimer: number | null = null;
 	private remoteFolders: Map<string, FolderSnapshotRow> | null = null;
 	private latestConfigSnapshot: Snapshot | null = null;
 	private lastConfigSnapshotSignature: string | null = null;
@@ -162,8 +167,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (!binding || binding.editor !== editor || binding.adapter.isApplyingRemote()) {
 			return;
 		}
-		await this.reconcileOpenEditor(binding);
-		this.host.setStatus(`Convex sync: synced ${file.basename}`);
+		this.scheduleOpenEditorReconcile(binding);
 	}
 
 	async handleVaultCreate(file: TAbstractFile): Promise<void> {
@@ -311,6 +315,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			clearLiveSyncTimeout(this.configSnapshotTimer);
 			this.configSnapshotTimer = null;
 		}
+		if (this.editorChangeTimer !== null) {
+			clearLiveSyncTimeout(this.editorChangeTimer);
+			this.editorChangeTimer = null;
+		}
 		this.current?.session.close();
 		this.current = null;
 		const engine =
@@ -410,6 +418,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			this.pathChangesUnsubscribe = this.engine.watchPathChanges((changes) => {
 				void this.applyRemotePathChanges(changes);
 			});
+			await this.applyRemotePathChanges(await this.engine.listRemotePathChanges());
 			this.host.setStatus("Convex sync: live");
 			return this.engine;
 		} catch (error) {
@@ -647,29 +656,56 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		const editorTextAtStart = binding.editor.getValue();
 		const localText = localTextOverride ?? editorTextAtStart;
 		const result = await engine.reconcilePath(binding.file.path, localText);
-		const expectedEditorText =
-			localTextOverride === undefined ? localText : editorTextAtStart;
-		if (this.current !== binding || binding.editor.getValue() !== expectedEditorText) {
+		if (this.current !== binding || binding.editor.getValue() !== editorTextAtStart) {
 			return;
 		}
 		this.applyRemoteText(binding.editor, result.text, binding.adapter);
 		await this.mirrorTextSnapshot(binding.file.path, result.text);
 	}
 
+	private scheduleOpenEditorReconcile(binding: OpenEditorBinding): void {
+		if (this.editorChangeTimer !== null) {
+			clearLiveSyncTimeout(this.editorChangeTimer);
+		}
+		this.editorChangeTimer = setLiveSyncTimeout(() => {
+			this.editorChangeTimer = null;
+			void this.reconcileOpenEditor(binding)
+				.then(() => {
+					if (!this.disposed && this.current === binding) {
+						this.host.setStatus(`Convex sync: synced ${binding.file.basename}`);
+					}
+				})
+				.catch((error: unknown) => {
+					console.warn("[live-sync] editor reconcile skipped", {
+						path: binding.file.path,
+						message: error instanceof Error ? error.message : String(error),
+					});
+				});
+		}, EDITOR_CHANGE_DEBOUNCE_MS);
+	}
+
 	private async reconcileClosedFile(
 		path: string,
 		localText: string,
 		file: TFile | null,
+		options: {
+			preferRemoteOnMissingBase?: boolean;
+			mirrorSnapshot?: boolean;
+		} = {},
 	): Promise<void> {
 		const engine = await this.getEngine();
 		if (!engine || this.disposed) {
 			return;
 		}
-		const result = await engine.reconcilePath(path, localText);
-		if (result.text !== localText) {
+		const result = await engine.reconcilePath(path, localText, {
+			preferRemoteOnMissingBase: options.preferRemoteOnMissingBase,
+		});
+		if (file === null || result.text !== localText) {
 			await this.writePathText(path, result.text);
 		}
-		await this.mirrorTextSnapshot(path, result.text);
+		if (options.mirrorSnapshot ?? true) {
+			await this.mirrorTextSnapshot(path, result.text);
+		}
 	}
 
 	private async syncModifiedFile(file: TFile): Promise<void> {
@@ -749,7 +785,14 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		const existing = this.host.app.vault.getAbstractFileByPath(path);
 		const file = existing instanceof TFile && isTextSyncFile(existing) ? existing : null;
 		const localText = file ? await this.host.app.vault.cachedRead(file) : "";
-		await this.reconcileClosedFile(path, localText, file);
+		const isPeerUpdate = change.updatedByClientId !== engine.getClientId();
+		await this.reconcileClosedFile(path, localText, file, {
+			preferRemoteOnMissingBase: isPeerUpdate,
+			mirrorSnapshot: !isPeerUpdate,
+		});
+		if (isPeerUpdate) {
+			await this.recoverFromRemoteSnapshot(path);
+		}
 	}
 
 	private async applyRemoteRename(
@@ -825,6 +868,40 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			queueMicrotask(() => {
 				this.suppressPathEvents.delete(path);
 			});
+		}
+	}
+
+	private async recoverFromRemoteSnapshot(path: string): Promise<void> {
+		const client = this.host.getFileSyncClient?.() ?? null;
+		const convexSecret = this.host.settings.convexSecret.trim();
+		if (!client || convexSecret.length === 0 || this.disposed) {
+			return;
+		}
+		const existing = this.host.app.vault.getAbstractFileByPath(path);
+		if (!(existing instanceof TFile) || !isTextSyncFile(existing)) {
+			return;
+		}
+		const localText = await this.host.app.vault.cachedRead(existing);
+		const remote = await readRemoteFileBytes(client, convexSecret, path);
+		if (!remote) {
+			return;
+		}
+		const remoteText = new TextDecoder().decode(remote.bytes);
+		if (remoteText === localText) {
+			return;
+		}
+		console.info("[live-sync] recovering text from vaultFiles snapshot", {
+			path,
+			localLength: localText.length,
+			remoteLength: remoteText.length,
+		});
+		const engine = await this.getEngine();
+		if (!engine || this.disposed) {
+			return;
+		}
+		const result = await engine.reconcilePath(path, remoteText);
+		if (result.text !== localText) {
+			await this.writePathText(path, result.text);
 		}
 	}
 

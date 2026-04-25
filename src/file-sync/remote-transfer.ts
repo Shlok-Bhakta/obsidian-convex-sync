@@ -18,6 +18,24 @@ export async function readRemoteFileBytes(
 	secret: string,
 	path: string,
 ): Promise<{ bytes: ArrayBuffer; updatedAtMs: number } | null> {
+	try {
+		const payload = await client.action(api.fileSync.getFileBytes, {
+			convexSecret: secret,
+			path,
+		});
+		if (payload) {
+			return {
+				bytes: payload.bytes,
+				updatedAtMs: payload.updatedAtMs,
+			};
+		}
+	} catch (error) {
+		console.warn("[file-sync] Convex action download failed, falling back to signed URL", {
+			path,
+			message: error instanceof Error ? error.message : String(error),
+		});
+	}
+
 	const signed = await client.query(api.fileSync.getDownloadUrl, {
 		convexSecret: secret,
 		path,
@@ -56,34 +74,52 @@ export async function uploadLocalFile(
 		sizeBytes: blob.size,
 		clientId,
 	});
-	const uploadResponse = await fetchWithPathContext(
-		issued.uploadUrl,
-		{
-			method: "POST",
-			headers: {
-				"Content-Type": "application/octet-stream",
+	let finalized: FinalizeUploadResult;
+	try {
+		const uploadResponse = await fetchWithPathContext(
+			issued.uploadUrl,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "application/octet-stream",
+				},
+				body: blob,
 			},
-			body: blob,
-		},
-		`Upload failed for ${path}`,
-	);
-	if (!uploadResponse.ok) {
-		throw new Error(`Upload failed for ${path}: HTTP ${uploadResponse.status}`);
+			`Upload failed for ${path}`,
+		);
+		if (!uploadResponse.ok) {
+			throw new Error(`Upload failed for ${path}: HTTP ${uploadResponse.status}`);
+		}
+		const payload = (await uploadResponse.json()) as { storageId?: string };
+		if (!payload.storageId) {
+			throw new Error(`Upload did not return storageId for ${path}`);
+		}
+		finalized = await finalizeUploadedFile(client, {
+			convexSecret: secret,
+			path,
+			storageId: payload.storageId as never,
+			contentHash,
+			updatedAtMs,
+			sizeBytes: blob.size,
+			clientId,
+			force: options.force,
+		});
+	} catch (error) {
+		console.warn("[file-sync] signed upload failed, falling back to Convex action", {
+			path,
+			message: error instanceof Error ? error.message : String(error),
+		});
+		finalized = (await client.action(api.fileSync.uploadFileBytes, {
+			convexSecret: secret,
+			path,
+			bytes,
+			contentHash,
+			updatedAtMs,
+			sizeBytes: blob.size,
+			clientId,
+			force: options.force,
+		})) as FinalizeUploadResult;
 	}
-	const payload = (await uploadResponse.json()) as { storageId?: string };
-	if (!payload.storageId) {
-		throw new Error(`Upload did not return storageId for ${path}`);
-	}
-	const finalized = await finalizeUploadedFile(client, {
-		convexSecret: secret,
-		path,
-		storageId: payload.storageId as never,
-		contentHash,
-		updatedAtMs,
-		sizeBytes: blob.size,
-		clientId,
-		force: options.force,
-	});
 	if (!finalized.ok && finalized.reason === "stale_write") {
 		return "stale_write";
 	}
