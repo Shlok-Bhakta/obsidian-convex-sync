@@ -1,11 +1,11 @@
 {
-	"id": "obsidian-convex-sync",
-	"name": "Convex Sync",
-	"version": "1.0.0",
-	"minAppVersion": "0.15.0",
-	"description": "Sync your Obsidian vault with Convex.",
-	"author": "Convex",
-	"authorUrl": "https://github.com/Shlok-Bhakta/obsidian-convex-sync/tree/main",
-	"fundingUrl": "https://github.com/Shlok-Bhakta/obsidian-convex-sync/tree/main",
-	"isDesktopOnly": false
+  "id": "obsidian-convex-sync",
+  "name": "Convex Sync",
+  "version": "1.0.1",
+  "minAppVersion": "0.15.0",
+  "description": "Sync your Obsidian vault with Convex.",
+  "author": "Convex",
+  "authorUrl": "https://github.com/Shlok-Bhakta/obsidian-convex-sync/tree/main",
+  "fundingUrl": "https://github.com/Shlok-Bhakta/obsidian-convex-sync/tree/main",
+  "isDesktopOnly": false
 }

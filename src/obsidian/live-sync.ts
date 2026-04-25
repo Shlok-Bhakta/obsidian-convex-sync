@@ -111,6 +111,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (this.suppressPathEvents.has(path)) {
 			return;
 		}
+		this.cancelPendingModify(path);
 
 		const binding = await this.openEditor(file, editor);
 		if (!binding || binding.editor !== editor) {
@@ -143,6 +144,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 		const path = normalizePath(file.path);
 		if (this.suppressPathEvents.has(path)) {
+			return;
+		}
+		if (this.isCurrentOpenPath(path)) {
+			this.cancelPendingModify(path);
 			return;
 		}
 		const existingTimer = this.pendingModifyTimers.get(path);
@@ -316,6 +321,9 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (this.suppressPathEvents.has(path)) {
 			return;
 		}
+		if (this.isCurrentOpenPath(path)) {
+			return;
+		}
 		const engine = await this.getEngine();
 		if (!engine) {
 			return;
@@ -382,6 +390,9 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			await this.applyRemoteRename(existingLocalPath, path, change.docId);
 		} else {
 			await engine.bindRemotePath(change.docId, path);
+		}
+		if (this.isCurrentOpenPath(path, change.docId)) {
+			return;
 		}
 		const session = await engine.openDoc(path, this.remoteOpenOptions(path));
 		const text = session.getTextSnapshot();
@@ -488,6 +499,22 @@ class ObsidianLiveSyncController implements LiveSyncController {
 				this.suppressPathEvents.delete(path);
 			});
 		}
+	}
+
+	private cancelPendingModify(path: string): void {
+		const timer = this.pendingModifyTimers.get(path);
+		if (timer === undefined) {
+			return;
+		}
+		window.clearTimeout(timer);
+		this.pendingModifyTimers.delete(path);
+	}
+
+	private isCurrentOpenPath(path: string, docId?: string): boolean {
+		if (!this.current || normalizePath(this.current.file.path) !== path) {
+			return false;
+		}
+		return docId === undefined || this.current.session.docId === docId;
 	}
 }
 
