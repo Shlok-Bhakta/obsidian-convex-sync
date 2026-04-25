@@ -144,4 +144,28 @@ describe("LocalMetaStore", () => {
 		expect(await store.getLastSyncedCursor("doc-c")).toBe("cursor-c");
 		store.dispose();
 	});
+
+	test("reconciled_base_survives_restart", async () => {
+		const first = await LocalMetaStore.open({ vaultId });
+		await first.setDocIdForPath("notes/a.md", "doc-a");
+		await first.setLastReconciledText("doc-a", "merged text");
+		first.dispose();
+
+		const second = await LocalMetaStore.open({ vaultId });
+		const meta = await second.getDocMeta("doc-a");
+
+		expect(await second.getLastReconciledText("doc-a")).toBe("merged text");
+		expect(meta?.lastReconciledHash).toMatch(/^[0-9a-f]{64}$/);
+		expect(meta?.lastReconciledAtMs).toBeTypeOf("number");
+		second.dispose();
+	});
+
+	test("with_store_rejects_cleanly_after_dispose_starts", async () => {
+		const store = await LocalMetaStore.open({ vaultId });
+		store.dispose();
+
+		await expect(store.setLastSyncedCursor("doc-a", "cursor-a")).rejects.toThrow(
+			"is closing",
+		);
+	});
 });

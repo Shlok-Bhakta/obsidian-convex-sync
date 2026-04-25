@@ -157,8 +157,6 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			app: this.app,
 			settings: this.settings,
 			getRealtimeClient: () => this.getConvexRealtimeClient(),
-			registerEvent: (ref) => this.registerEvent(ref),
-			register: (cleanup) => this.register(cleanup),
 			setStatus: (text) => this.syncStatusBarItemEl?.setText(text),
 		});
 	}

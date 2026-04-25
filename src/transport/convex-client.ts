@@ -81,8 +81,11 @@ export class ConvexAutomergeTransport {
 								change.serverCursor,
 							);
 						}
-						if (unseen.length > 0) {
-							onChanges(unseen);
+						const deliverable = unseen.filter(
+							(change) => change.clientId !== this.options.clientId,
+						);
+						if (deliverable.length > 0) {
+							onChanges(deliverable);
 						}
 					})
 					.catch((error: unknown) => {
@@ -255,7 +258,7 @@ export class ConvexAutomergeTransport {
 	watchDocPathChanges(
 		onChanges: (changes: DocPathChange[]) => void,
 	): () => void {
-		let latestUpdatedAtMs = 0;
+		const seen = new Set<string>();
 		const unsubscribe = this.options.client.onUpdate(
 			api.automergeSync.listDocPathChanges,
 			{
@@ -264,12 +267,14 @@ export class ConvexAutomergeTransport {
 				numItems: 100,
 			},
 			(result) => {
-				const changes = result.page.filter(
-					(change) => change.updatedAtMs > latestUpdatedAtMs,
-				);
-				for (const change of changes) {
-					latestUpdatedAtMs = Math.max(latestUpdatedAtMs, change.updatedAtMs);
-				}
+				const changes = result.page.filter((change) => {
+					const identity = pathChangeIdentity(change);
+					if (seen.has(identity)) {
+						return false;
+					}
+					seen.add(identity);
+					return true;
+				});
 				if (changes.length > 0) {
 					onChanges(changes);
 				}
@@ -289,6 +294,15 @@ export class ConvexAutomergeTransport {
 
 function changeIdentity(type: "incremental" | "snapshot", hash: string): string {
 	return `${type}:${hash}`;
+}
+
+function pathChangeIdentity(change: DocPathChange): string {
+	return [
+		change.path,
+		change.docId,
+		change.updatedAtMs,
+		change.deletedAtMs ?? "live",
+	].join(":");
 }
 
 export async function derivePushIdempotencyKey(

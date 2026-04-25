@@ -105,6 +105,57 @@ describe("ConvexAutomergeTransport", () => {
 			"snapshot",
 		]);
 	});
+
+	test("watch_doc_ignores_self_originated_changes_but_advances_cursor", async () => {
+		const client = new FakeConvexClient();
+		const transport = createTransport(client);
+		const onChanges = vi.fn();
+		client.queryPages = [
+			{
+				page: [
+					remoteChange("self", "incremental", 1, [1], CLIENT_ID),
+					remoteChange("remote", "incremental", 2, [2], "peer-client"),
+				],
+				isDone: true,
+				continueCursor: "",
+				splitCursor: "",
+				pageStatus: "SplitRecommended",
+			},
+		];
+
+		transport.watchDoc(DOC_ID, onChanges);
+		client.emitUpdate(2);
+		await vi.waitFor(() => expect(onChanges).toHaveBeenCalledTimes(1));
+
+		const emitted = onChanges.mock.calls[0]?.[0] as RemoteChange[];
+		expect(emitted).toHaveLength(1);
+		expect(emitted[0]?.clientId).toBe("peer-client");
+	});
+
+	test("watch_doc_path_changes_keeps_same_millisecond_updates", async () => {
+		const client = new FakePathWatchClient();
+		const transport = createTransport(client as unknown as FakeConvexClient);
+		const onChanges = vi.fn();
+
+		transport.watchDocPathChanges(onChanges);
+		client.emitPathChanges([
+			pathChange("a.md", "doc-a", 1000, null),
+			pathChange("b.md", "doc-b", 1000, null),
+		]);
+
+		await vi.waitFor(() => expect(onChanges).toHaveBeenCalledTimes(1));
+		const emitted = onChanges.mock.calls[0]?.[0] as Array<{ path: string }>;
+		expect(emitted.map((change) => change.path)).toEqual(["a.md", "b.md"]);
+
+		client.emitPathChanges([
+			pathChange("a.md", "doc-a", 1000, null),
+			pathChange("b.md", "doc-b", 1000, null),
+			pathChange("c.md", "doc-c", 1000, null),
+		]);
+		await vi.waitFor(() => expect(onChanges).toHaveBeenCalledTimes(2));
+		const secondBatch = onChanges.mock.calls[1]?.[0] as Array<{ path: string }>;
+		expect(secondBatch.map((change) => change.path)).toEqual(["c.md"]);
+	});
 });
 
 function createTransport(client: FakeConvexClient): ConvexAutomergeTransport {
@@ -120,6 +171,7 @@ function remoteChange(
 	type: "incremental" | "snapshot",
 	serverCursor: number,
 	data: number[],
+	clientId = "remote-client",
 ): RemoteChange {
 	return {
 		id: `${type}:${hash}:${serverCursor}`,
@@ -127,10 +179,19 @@ function remoteChange(
 		type,
 		hash,
 		data: new Uint8Array(data).buffer,
-		clientId: "remote-client",
+		clientId,
 		idempotencyKey: "remote-key",
 		serverCursor,
 	};
+}
+
+function pathChange(
+	path: string,
+	docId: string,
+	updatedAtMs: number,
+	deletedAtMs: number | null,
+) {
+	return { path, docId, updatedAtMs, deletedAtMs };
 }
 
 class FakeConvexClient {
@@ -174,6 +235,55 @@ class FakeConvexClient {
 
 	emitUpdate(result: number): void {
 		this.updateCallback?.(result);
+	}
+}
+
+class FakePathWatchClient {
+	private pathUpdateCallback:
+		| ((result: {
+				page: Array<{ path: string; docId: string; updatedAtMs: number; deletedAtMs: number | null }>;
+				isDone: boolean;
+				continueCursor: string;
+				splitCursor: string;
+				pageStatus: "SplitRecommended";
+			}) => void)
+		| null = null;
+
+	connectionState() {
+		return { isWebSocketConnected: true, hasEverConnected: true };
+	}
+
+	subscribeToConnectionState(): () => void {
+		return () => undefined;
+	}
+
+	onUpdate(
+		_query: unknown,
+		_args: unknown,
+		callback: (result: {
+			page: Array<{ path: string; docId: string; updatedAtMs: number; deletedAtMs: number | null }>;
+			isDone: boolean;
+			continueCursor: string;
+			splitCursor: string;
+			pageStatus: "SplitRecommended";
+		}) => void,
+	): () => void {
+		this.pathUpdateCallback = callback;
+		return () => {
+			this.pathUpdateCallback = null;
+		};
+	}
+
+	emitPathChanges(
+		changes: Array<{ path: string; docId: string; updatedAtMs: number; deletedAtMs: number | null }>,
+	): void {
+		this.pathUpdateCallback?.({
+			page: changes,
+			isDone: true,
+			continueCursor: "",
+			splitCursor: "",
+			pageStatus: "SplitRecommended",
+		});
 	}
 }
 

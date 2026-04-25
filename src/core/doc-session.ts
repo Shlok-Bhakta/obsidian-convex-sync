@@ -25,11 +25,17 @@ export type DocSessionOptions = {
 	onRemotePatch?: (text: string) => void;
 };
 
+const LOCAL_PUSH_BATCH_DELAY_MS = 50;
+
 export class DocSession {
 	private handle: DocHandle<AutomergeTextDoc> | null = null;
 	private opening: Promise<void> | null = null;
 	private closed = false;
-	private readonly pendingPushes: Promise<unknown>[] = [];
+	private readonly inFlightWork = new Set<Promise<unknown>>();
+	private pendingLocalChanges: Uint8Array[] = [];
+	private pendingLocalChangeCount = 0;
+	private pendingLocalPushTimer: ReturnType<typeof setTimeout> | null = null;
+	private localPushQueue: Promise<void> = Promise.resolve();
 
 	constructor(private readonly options: DocSessionOptions) {}
 
@@ -42,6 +48,47 @@ export class DocSession {
 	}
 
 	async applyLocalChange(splices: TextSplice[]): Promise<void> {
+		if (this.closed) {
+			throw new Error(`Document session ${this.options.docId} is closing`);
+		}
+		await this.trackWork(this.doApplyLocalChange(splices));
+	}
+
+	async applyLocalText(text: string): Promise<void> {
+		if (this.closed) {
+			throw new Error(`Document session ${this.options.docId} is closing`);
+		}
+		await this.trackWork(this.doApplyLocalText(text));
+	}
+
+	async applyRemoteChanges(changes: Uint8Array[]): Promise<void> {
+		if (this.closed) {
+			return;
+		}
+		await this.trackWork(this.doApplyRemoteChanges(changes));
+	}
+
+	async pushSnapshot(): Promise<void> {
+		if (this.closed || !this.options.transport.pushSnapshot) {
+			return;
+		}
+		await this.trackWork(this.doPushSnapshot());
+	}
+
+	async waitForIdle(): Promise<void> {
+		await this.flushPendingLocalPushes();
+		while (this.inFlightWork.size > 0) {
+			await Promise.allSettled(Array.from(this.inFlightWork));
+		}
+	}
+
+	async dispose(): Promise<void> {
+		this.close();
+		await this.waitForIdle();
+		this.handle = null;
+	}
+
+	private async doApplyLocalChange(splices: TextSplice[]): Promise<void> {
 		const handle = await this.requireHandle();
 		const before = handle.doc();
 		handle.change((doc) => {
@@ -51,42 +98,95 @@ export class DocSession {
 		});
 		const after = handle.doc();
 		const changes = Automerge.getChanges(before, after);
+		await this.flushAndTrackPush(handle, changes, splices.length);
+	}
+
+	private async doApplyLocalText(text: string): Promise<void> {
+		const handle = await this.requireHandle();
+		if (handle.doc().text === text) {
+			return;
+		}
+		const before = handle.doc();
+		handle.change((doc) => {
+			Automerge.updateText(doc, ["text"], text);
+		});
+		const after = handle.doc();
+		const changes = Automerge.getChanges(before, after);
+		await this.flushAndTrackPush(handle, changes, 1);
+	}
+
+	private async flushAndTrackPush(
+		handle: DocHandle<AutomergeTextDoc>,
+		changes: Uint8Array[],
+		changeCount: number,
+	): Promise<void> {
+		if (changes.length === 0) {
+			return;
+		}
 
 		await this.options.repo.ensureFlushed(this.options.docId);
 		console.info("[session] local change flushed", {
 			docId: this.options.docId,
-			spliceCount: splices.length,
+			spliceCount: changeCount,
 			newHead: latestHead(handle.heads()),
 		});
 
-		const push = this.options.transport
-			.pushChanges(this.options.docId, changes)
-			.then((serverCursor) => {
-				console.info("[session] push enqueued", {
-					docId: this.options.docId,
-					queueDepth: this.pendingPushes.length,
-					serverCursor,
-				});
-			})
-			.catch((error: unknown) => {
-				console.warn("[session] push failed", {
-					docId: this.options.docId,
-					message: error instanceof Error ? error.message : String(error),
-				});
-			});
-		this.pendingPushes.push(push);
-		void push.finally(() => {
-			const index = this.pendingPushes.indexOf(push);
-			if (index >= 0) {
-				this.pendingPushes.splice(index, 1);
-			}
-		});
-	}
-
-	async applyRemoteChanges(changes: Uint8Array[]): Promise<void> {
-		if (this.closed) {
+		this.pendingLocalChanges.push(...changes);
+		this.pendingLocalChangeCount += changeCount;
+		if (this.pendingLocalPushTimer !== null) {
 			return;
 		}
+		this.pendingLocalPushTimer = setTimeout(() => {
+			this.pendingLocalPushTimer = null;
+			void this.flushPendingLocalPushes();
+		}, LOCAL_PUSH_BATCH_DELAY_MS);
+	}
+
+	private async flushPendingLocalPushes(): Promise<void> {
+		if (this.pendingLocalPushTimer !== null) {
+			clearTimeout(this.pendingLocalPushTimer);
+			this.pendingLocalPushTimer = null;
+		}
+		if (this.pendingLocalChanges.length === 0) {
+			await this.localPushQueue.catch(() => undefined);
+			return;
+		}
+
+		const changes = this.pendingLocalChanges;
+		const changeCount = this.pendingLocalChangeCount;
+		this.pendingLocalChanges = [];
+		this.pendingLocalChangeCount = 0;
+
+		const pushWork = this.localPushQueue
+			.catch(() => undefined)
+			.then(async () => {
+				try {
+					const serverCursor = await this.options.transport.pushChanges(
+						this.options.docId,
+						changes,
+					);
+					console.info("[session] push enqueued", {
+						docId: this.options.docId,
+						queueDepth: this.inFlightWork.size,
+						changeCount,
+						serverCursor,
+					});
+				} catch (error: unknown) {
+					console.warn("[session] push failed", {
+						docId: this.options.docId,
+						changeCount,
+						message: error instanceof Error ? error.message : String(error),
+					});
+				}
+			});
+		this.localPushQueue = pushWork.then(
+			() => undefined,
+			() => undefined,
+		);
+		await this.trackWork(pushWork);
+	}
+
+	private async doApplyRemoteChanges(changes: Uint8Array[]): Promise<void> {
 		if (changes.length === 0) {
 			return;
 		}
@@ -95,7 +195,12 @@ export class DocSession {
 			return;
 		}
 		const handle = this.handle;
-		handle.update((doc) => Automerge.loadIncremental(doc, mergeArrays(changes)));
+		handle.update((doc) => {
+			for (const change of changes) {
+				doc = Automerge.loadIncremental(doc, change);
+			}
+			return doc;
+		});
 		await this.options.repo.ensureFlushed(this.options.docId);
 		const text = this.getTextSnapshot();
 		console.info("[session] remote change applied", {
@@ -107,6 +212,28 @@ export class DocSession {
 		this.options.onStateChange?.(text);
 	}
 
+	private async doPushSnapshot(): Promise<void> {
+		const handle = await this.requireHandle();
+		if (!this.options.transport.pushSnapshot) {
+			return;
+		}
+		try {
+			const serverCursor = await this.options.transport.pushSnapshot(
+				this.options.docId,
+				Automerge.save(handle.doc()),
+			);
+			console.info("[session] snapshot pushed", {
+				docId: this.options.docId,
+				serverCursor,
+			});
+		} catch (error: unknown) {
+			console.warn("[session] snapshot push failed", {
+				docId: this.options.docId,
+				message: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	getTextSnapshot(): string {
 		if (!this.handle) {
 			return "";
@@ -115,8 +242,10 @@ export class DocSession {
 	}
 
 	close(): void {
+		if (this.closed) {
+			return;
+		}
 		this.closed = true;
-		this.handle = null;
 		console.info("[session] closed", { docId: this.options.docId });
 	}
 
@@ -131,16 +260,6 @@ export class DocSession {
 			textLength: text.length,
 		});
 		this.options.onStateChange?.(text);
-		if (this.options.transport.pushSnapshot) {
-			void this.options.transport
-				.pushSnapshot(this.options.docId, Automerge.save(this.handle.doc()))
-				.catch((error: unknown) => {
-					console.warn("[session] snapshot push failed", {
-						docId: this.options.docId,
-						message: error instanceof Error ? error.message : String(error),
-					});
-				});
-		}
 	}
 
 	private async requireHandle(): Promise<DocHandle<AutomergeTextDoc>> {
@@ -149,6 +268,15 @@ export class DocSession {
 			throw new Error(`Document session ${this.options.docId} is not open`);
 		}
 		return this.handle;
+	}
+
+	private async trackWork<T>(work: Promise<T>): Promise<T> {
+		this.inFlightWork.add(work);
+		try {
+			return await work;
+		} finally {
+			this.inFlightWork.delete(work);
+		}
 	}
 }
 

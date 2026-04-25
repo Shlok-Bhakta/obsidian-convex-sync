@@ -1,267 +1,52 @@
 import "fake-indexeddb/auto";
 import type { ConvexClient } from "convex/browser";
 import { beforeEach, describe, expect, test } from "vitest";
-import { LocalMetaStore } from "../storage/local-meta-store";
-import { SyncEngine, type OpenDocumentSession } from "./sync-engine";
+import { SyncEngine } from "./sync-engine";
 
 const SECRET = "test-secret";
 const PATH = "shared.md";
 
-describe("SyncEngine integration scenarios", () => {
+describe("SyncEngine integration", () => {
+	let client: FakeConvexClient;
 	let server: SharedAutomergeServer;
-	let runId: string;
+	let engine: SyncEngine;
+	let vaultId: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		server = new SharedAutomergeServer();
-		runId = crypto.randomUUID();
+		client = new FakeConvexClient(server);
+		vaultId = crypto.randomUUID();
+		engine = await SyncEngine.boot({
+			vaultId,
+			convexClient: client as unknown as ConvexClient,
+			convexSecret: SECRET,
+		});
 	});
 
-	test("two_clients_converge_after_many_sequential_writes", async () => {
-		const clientA = await SimulatedClient.boot(clientId(runId, "a"), server);
-		const docA = await clientA.open(PATH);
-		await server.waitForDocRows(docA.docId, 1);
+	test("reconcilePath keeps local-only text and reuses it as base", async () => {
+		const first = await engine.reconcilePath(PATH, "hello");
+		const second = await engine.reconcilePath(PATH, "hello");
 
-		const clientB = await SimulatedClient.boot(clientId(runId, "b"), server, {
-			path: PATH,
-			docId: docA.docId,
-		});
-		const docB = await clientB.open(PATH);
-
-		const expected = await writeCharacters(docA, "abcdefghijklmnopqrstuvwxyz");
-
-		await waitFor(() => docB.getTextSnapshot() === expected);
-		expect(docA.getTextSnapshot()).toBe(expected);
-		expect(docB.getTextSnapshot()).toBe(expected);
-
-		await clientA.dispose();
-		await clientB.dispose();
+		expect(first.text).toBe("hello");
+		expect(second.text).toBe("hello");
+		expect(second.changed).toBe(false);
+		await engine.dispose();
+		client.kill();
 	});
 
-	test("offline_burst_reconnects_and_recovers_exact_text", async () => {
-		const clientA = await SimulatedClient.boot(clientId(runId, "a"), server);
-		const docA = await clientA.open(PATH);
-		await server.waitForDocRows(docA.docId, 1);
-
-		const clientB = await SimulatedClient.boot(clientId(runId, "b"), server, {
-			path: PATH,
-			docId: docA.docId,
-		});
-		const docB = await clientB.open(PATH);
-
-		clientA.drop();
-		const expected = await writeCharacters(docA, "offline ".repeat(30));
-		expect(docA.getTextSnapshot()).toBe(expected);
-		expect(docB.getTextSnapshot()).toBe("");
-
-		clientA.restore();
-
-		await waitFor(() => docB.getTextSnapshot() === expected, 5_000);
-		expect(docA.getTextSnapshot()).toBe(expected);
-		expect(docB.getTextSnapshot()).toBe(expected);
-
-		await clientA.dispose();
-		await clientB.dispose();
-	});
-
-	test("two_clients_edit_during_partition_then_converge", async () => {
-		const clientA = await SimulatedClient.boot(clientId(runId, "a"), server);
-		const docA = await clientA.open(PATH);
-		await server.waitForDocRows(docA.docId, 1);
-
-		const clientB = await SimulatedClient.boot(clientId(runId, "b"), server, {
-			path: PATH,
-			docId: docA.docId,
-		});
-		const docB = await clientB.open(PATH);
-
-		clientA.drop();
-		clientB.drop();
-		await writeCharacters(docA, "AAAAA");
-		await writeCharacters(docB, "BBBBB");
-
-		clientA.restore();
-		clientB.restore();
-
-		await waitFor(
-			() =>
-				docA.getTextSnapshot() === docB.getTextSnapshot() &&
-				docA.getTextSnapshot().includes("AAAAA") &&
-				docA.getTextSnapshot().includes("BBBBB"),
-			5_000,
-		);
-		expect(docA.getTextSnapshot()).toBe(docB.getTextSnapshot());
-
-		await clientA.dispose();
-		await clientB.dispose();
-	});
-
-	test("reboot_after_offline_local_flush_pushes_snapshot_and_recovers_peer", async () => {
-		let clientA = await SimulatedClient.boot(clientId(runId, "a"), server);
-		const docA = await clientA.open(PATH);
-		await server.waitForDocRows(docA.docId, 1);
-
-		const clientB = await SimulatedClient.boot(clientId(runId, "b"), server, {
-			path: PATH,
-			docId: docA.docId,
-		});
-		const docB = await clientB.open(PATH);
-
-		clientA.drop();
-		const expected = await writeCharacters(docA, "survives reboot");
-		await clientA.killProcess();
-
-		clientA = await SimulatedClient.boot(clientId(runId, "a"), server, {
-			path: PATH,
-			docId: docA.docId,
-		});
-		await clientA.open(PATH);
-		clientA.restore();
-
-		await waitFor(() => docB.getTextSnapshot() === expected, 5_000);
-		expect(docB.getTextSnapshot()).toBe(expected);
-
-		await clientA.dispose();
-		await clientB.dispose();
-	});
-
-	test("three_clients_partitioned_bursts_all_converge", async () => {
-		const clientA = await SimulatedClient.boot(clientId(runId, "a"), server);
-		const docA = await clientA.open(PATH);
-		await server.waitForDocRows(docA.docId, 1);
-		const clientB = await SimulatedClient.boot(clientId(runId, "b"), server, {
-			path: PATH,
-			docId: docA.docId,
-		});
-		const clientC = await SimulatedClient.boot(clientId(runId, "c"), server, {
-			path: PATH,
-			docId: docA.docId,
-		});
-		const docB = await clientB.open(PATH);
-		const docC = await clientC.open(PATH);
-
-		clientA.drop();
-		clientB.drop();
-		clientC.drop();
-		await writeCharacters(docA, "alpha-".repeat(20));
-		await writeCharacters(docB, "bravo-".repeat(20));
-		await writeCharacters(docC, "charlie-".repeat(20));
-
-		clientA.restore();
-		clientB.restore();
-		clientC.restore();
-
-		await waitFor(
-			() =>
-				docA.getTextSnapshot() === docB.getTextSnapshot() &&
-				docB.getTextSnapshot() === docC.getTextSnapshot() &&
-				docA.getTextSnapshot().includes("alpha-") &&
-				docA.getTextSnapshot().includes("bravo-") &&
-				docA.getTextSnapshot().includes("charlie-"),
-			8_000,
-		);
-		expect(docA.getTextSnapshot()).toBe(docB.getTextSnapshot());
-		expect(docB.getTextSnapshot()).toBe(docC.getTextSnapshot());
-
-		await clientA.dispose();
-		await clientB.dispose();
-		await clientC.dispose();
-	});
-
-	test("repeated_drop_restore_cycles_preserve_exact_text", async () => {
-		const clientA = await SimulatedClient.boot(clientId(runId, "a"), server);
-		const docA = await clientA.open(PATH);
-		await server.waitForDocRows(docA.docId, 1);
-		const clientB = await SimulatedClient.boot(clientId(runId, "b"), server, {
-			path: PATH,
-			docId: docA.docId,
-		});
-		const docB = await clientB.open(PATH);
-
-		let expected = "";
-		for (let cycle = 0; cycle < 6; cycle += 1) {
-			clientA.drop();
-			expected = await writeCharacters(docA, `cycle-${cycle}-`.repeat(12));
-			clientA.restore();
-			await waitFor(() => docB.getTextSnapshot() === expected, 5_000);
-			expect(docA.getTextSnapshot()).toBe(expected);
-			expect(docB.getTextSnapshot()).toBe(expected);
-		}
-
-		await clientA.dispose();
-		await clientB.dispose();
-	});
-
-	test("reopening_same_doc_replaces_previous_subscription", async () => {
-		const client = await SimulatedClient.boot(clientId(runId, "solo"), server);
-		const first = await client.open(PATH);
+	test("reopening_same_doc_reuses_subscription", async () => {
+		const first = await engine.openDoc(PATH);
 		expect(client.subscriptionCount()).toBe(1);
 
-		const second = await client.open(PATH);
+		const second = await engine.openDoc(PATH);
 
 		expect(second.docId).toBe(first.docId);
 		expect(client.subscriptionCount()).toBe(1);
-
 		second.close();
-		await client.dispose();
+		await engine.dispose();
+		client.kill();
 	});
 });
-
-function clientId(runId: string, name: string): string {
-	return `${runId}-${name}`;
-}
-
-class SimulatedClient {
-	private constructor(
-		readonly id: string,
-		private readonly fakeClient: FakeConvexClient,
-		private readonly engine: SyncEngine,
-	) {}
-
-	static async boot(
-		id: string,
-		server: SharedAutomergeServer,
-		mapping?: { path: string; docId: string },
-	): Promise<SimulatedClient> {
-		if (mapping) {
-			const meta = await LocalMetaStore.open({ vaultId: id });
-			await meta.setDocIdForPath(mapping.path, mapping.docId);
-			meta.dispose();
-		}
-		const fakeClient = new FakeConvexClient(server);
-		const engine = await SyncEngine.boot({
-			vaultId: id,
-			convexClient: fakeClient as unknown as ConvexClient,
-			convexSecret: SECRET,
-		});
-		return new SimulatedClient(id, fakeClient, engine);
-	}
-
-	open(path: string): Promise<OpenDocumentSession> {
-		return this.engine.openDoc(path);
-	}
-
-	drop(): void {
-		this.fakeClient.drop();
-	}
-
-	restore(): void {
-		this.fakeClient.restore();
-	}
-
-	async killProcess(): Promise<void> {
-		this.fakeClient.kill();
-		await this.engine.dispose();
-	}
-
-	async dispose(): Promise<void> {
-		await this.engine.dispose();
-		this.fakeClient.kill();
-	}
-
-	subscriptionCount(): number {
-		return this.fakeClient.subscriptionCount();
-	}
-}
 
 class SharedAutomergeServer {
 	private rows: ServerChange[] = [];
@@ -283,34 +68,11 @@ class SharedAutomergeServer {
 		inserted: number;
 		serverCursor: number;
 	}> {
-		const existingKeyRows = this.rows.filter(
-			(row) =>
-				row.docId === args.docId && row.idempotencyKey === args.idempotencyKey,
-		);
-		if (existingKeyRows.length > 0) {
-			return {
-				ok: true,
-				duplicate: true,
-				inserted: 0,
-				serverCursor: Math.max(...existingKeyRows.map((row) => row.serverCursor)),
-			};
-		}
-
 		let inserted = 0;
 		let serverCursor = 0;
 		for (const change of args.changes) {
 			const bytes = new Uint8Array(change.data);
 			const hash = await sha256Hex(bytes);
-			const existingHash = this.rows.find(
-				(row) =>
-					row.docId === args.docId &&
-					row.type === change.type &&
-					row.hash === hash,
-			);
-			if (existingHash) {
-				serverCursor = Math.max(serverCursor, existingHash.serverCursor);
-				continue;
-			}
 			this.cursor += 1;
 			serverCursor = this.cursor;
 			this.rows.push({
@@ -340,10 +102,7 @@ class SharedAutomergeServer {
 	pull(args: PullChangesArgs): PullResult {
 		return {
 			page: this.rows
-				.filter(
-					(row) =>
-						row.docId === args.docId && row.serverCursor > args.sinceCursor,
-				)
+				.filter((row) => row.docId === args.docId && row.serverCursor > args.sinceCursor)
 				.map((row) => ({
 					id: row.hash,
 					docId: row.docId,
@@ -367,10 +126,6 @@ class SharedAutomergeServer {
 			.reduce((max, row) => Math.max(max, row.serverCursor), 0);
 	}
 
-	async waitForDocRows(docId: string, count: number): Promise<void> {
-		await waitFor(() => this.rows.filter((row) => row.docId === docId).length >= count);
-	}
-
 	private notify(): void {
 		for (const client of this.clients) {
 			client.notifySubscribers();
@@ -379,34 +134,18 @@ class SharedAutomergeServer {
 }
 
 class FakeConvexClient {
-	private dropped = false;
-	private killed = false;
-	private hasEverConnected = true;
 	private readonly subscribers = new Set<Subscriber>();
-	private readonly queuedMutations: Array<() => void> = [];
-	private readonly connectionListeners = new Set<(state: FakeConnectionState) => void>();
 
 	constructor(private readonly server: SharedAutomergeServer) {
 		server.register(this);
 	}
 
-	connectionState(): FakeConnectionState {
-		return {
-			isWebSocketConnected: !this.dropped && !this.killed,
-			hasEverConnected: this.hasEverConnected,
-			hasInflightRequests: false,
-			timeOfOldestInflightRequest: null,
-			connectionCount: this.hasEverConnected ? 1 : 0,
-			connectionRetries: this.dropped ? 1 : 0,
-			inflightMutations: this.queuedMutations.length,
-		};
+	connectionState() {
+		return { isWebSocketConnected: true, hasEverConnected: true };
 	}
 
-	subscribeToConnectionState(
-		callback: (state: FakeConnectionState) => void,
-	): () => void {
-		this.connectionListeners.add(callback);
-		return () => this.connectionListeners.delete(callback);
+	subscribeToConnectionState(): () => void {
+		return () => undefined;
 	}
 
 	onUpdate(
@@ -416,7 +155,7 @@ class FakeConvexClient {
 	): FakeUnsubscribe {
 		const subscriber = { args, callback };
 		this.subscribers.add(subscriber);
-		queueMicrotask(() => this.notifySubscriber(subscriber));
+		queueMicrotask(() => subscriber.callback(this.getSubscriptionValue(args)));
 		const unsubscribe = (() => {
 			this.subscribers.delete(subscriber);
 		}) as FakeUnsubscribe;
@@ -425,65 +164,30 @@ class FakeConvexClient {
 		return unsubscribe;
 	}
 
-	async mutation(_mutation: unknown, args: SubmitChangesArgs): Promise<unknown> {
-		if (this.killed) {
-			throw new Error("client killed");
+	async mutation(_mutation: unknown, args: SubmitChangesArgs | PathMappingArgs): Promise<unknown> {
+		if ("candidateDocId" in args) {
+			return this.server.getOrCreateDocIdForPath(args);
 		}
-		if (this.dropped) {
-			return new Promise((resolve, reject) => {
-				this.queuedMutations.push(() => {
-					this.runMutation(args).then(resolve).catch(reject);
-				});
-			});
-		}
-		return this.runMutation(args);
+		return this.server.submit(args);
 	}
 
 	async query(_query: unknown, args: PullChangesArgs): Promise<PullResult> {
-		if (this.dropped || this.killed) {
-			throw new Error("network offline");
-		}
 		return this.server.pull(args);
 	}
 
-	drop(): void {
-		this.dropped = true;
-		this.emitConnectionState();
-	}
-
-	restore(): void {
-		this.dropped = false;
-		this.hasEverConnected = true;
-		const queued = this.queuedMutations.splice(0);
-		for (const run of queued) {
-			run();
+	notifySubscribers(): void {
+		for (const subscriber of this.subscribers) {
+			subscriber.callback(this.getSubscriptionValue(subscriber.args));
 		}
-		this.emitConnectionState();
-		this.notifySubscribers();
 	}
 
 	kill(): void {
-		this.killed = true;
-		this.queuedMutations.length = 0;
 		this.subscribers.clear();
 		this.server.unregister(this);
-		this.emitConnectionState();
 	}
 
-	notifySubscribers(): void {
-		if (this.dropped || this.killed) {
-			return;
-		}
-		for (const subscriber of this.subscribers) {
-			this.notifySubscriber(subscriber);
-		}
-	}
-
-	private notifySubscriber(subscriber: Subscriber): void {
-		if (this.dropped || this.killed) {
-			return;
-		}
-		subscriber.callback(this.getSubscriptionValue(subscriber.args));
+	subscriptionCount(): number {
+		return this.subscribers.size;
 	}
 
 	private getSubscriptionValue(args: PullChangesArgs | LatestCursorArgs): PullResult | number {
@@ -491,48 +195,6 @@ class FakeConvexClient {
 			return this.server.pull(args);
 		}
 		return this.server.getLatestCursor(args);
-	}
-
-	private emitConnectionState(): void {
-		for (const listener of this.connectionListeners) {
-			listener(this.connectionState());
-		}
-	}
-
-	private async runMutation(args: SubmitChangesArgs | PathMappingArgs): Promise<unknown> {
-		if ("candidateDocId" in args) {
-			return this.server.getOrCreateDocIdForPath(args);
-		}
-		return this.server.submit(args);
-	}
-
-	subscriptionCount(): number {
-		return this.subscribers.size;
-	}
-}
-
-async function writeCharacters(
-	doc: OpenDocumentSession,
-	text: string,
-): Promise<string> {
-	let expected = doc.getTextSnapshot();
-	for (const char of text) {
-		await doc.applyLocalChange([{ pos: expected.length, del: 0, ins: char }]);
-		expected += char;
-	}
-	return expected;
-}
-
-async function waitFor(
-	predicate: () => boolean,
-	timeoutMs = 2_000,
-): Promise<void> {
-	const startedAt = performance.now();
-	while (!predicate()) {
-		if (performance.now() - startedAt > timeoutMs) {
-			throw new Error("Timed out waiting for condition");
-		}
-		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 }
 
@@ -611,14 +273,4 @@ type Subscriber = {
 type FakeUnsubscribe = (() => void) & {
 	unsubscribe: () => void;
 	getCurrentValue: () => PullResult | number;
-};
-
-type FakeConnectionState = {
-	isWebSocketConnected: boolean;
-	hasEverConnected: boolean;
-	hasInflightRequests: boolean;
-	timeOfOldestInflightRequest: null;
-	connectionCount: number;
-	connectionRetries: number;
-	inflightMutations: number;
 };

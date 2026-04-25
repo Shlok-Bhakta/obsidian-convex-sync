@@ -7,6 +7,9 @@ export type PendingOp = {
 export type DocMeta = {
 	path: string;
 	pendingSync: boolean;
+	lastReconciledText?: string;
+	lastReconciledHash?: string;
+	lastReconciledAtMs?: number;
 };
 
 type LocalMetaStoreOptions = {
@@ -18,6 +21,8 @@ const STORE_NAME = "meta";
 
 export class LocalMetaStore {
 	private clientId: string | null = null;
+	private disposing = false;
+	private disposed = false;
 
 	private constructor(
 		private readonly db: IDBDatabase,
@@ -33,7 +38,12 @@ export class LocalMetaStore {
 	}
 
 	dispose(): void {
+		if (this.disposing || this.disposed) {
+			return;
+		}
+		this.disposing = true;
 		this.db.close();
+		this.disposed = true;
 	}
 
 	async getClientId(): Promise<string> {
@@ -111,6 +121,36 @@ export class LocalMetaStore {
 		return (await this.getValue<DocMeta>(docKey(docId))) ?? null;
 	}
 
+	async getLastReconciledText(docId: string): Promise<string | null> {
+		return (await this.getDocMeta(docId))?.lastReconciledText ?? null;
+	}
+
+	async setLastReconciledText(docId: string, text: string): Promise<void> {
+		const meta = await this.getDocMeta(docId);
+		if (!meta) {
+			throw new Error(`Cannot persist reconciled text for unknown docId ${docId}`);
+		}
+		const hash = await sha256Hex(text);
+		if (
+			meta.lastReconciledText === text &&
+			meta.lastReconciledHash === hash
+		) {
+			return;
+		}
+
+		await this.withStore("readwrite", async (store) => {
+			store.put(
+				{
+					...meta,
+					lastReconciledText: text,
+					lastReconciledHash: hash,
+					lastReconciledAtMs: Date.now(),
+				} satisfies DocMeta,
+				docKey(docId),
+			);
+		});
+	}
+
 	async getPathMappings(): Promise<Record<string, string>> {
 		return this.withStore("readonly", async (store) => {
 			return new Promise<Record<string, string>>((resolve, reject) => {
@@ -164,6 +204,9 @@ export class LocalMetaStore {
 		mode: IDBTransactionMode,
 		callback: (store: IDBObjectStore) => T | Promise<T>,
 	): Promise<T> {
+		if (this.disposing || this.disposed) {
+			throw new LocalMetaStoreClosedError(this.databaseName);
+		}
 		const transaction = this.db.transaction(STORE_NAME, mode);
 		const store = transaction.objectStore(STORE_NAME);
 		const done = transactionDone(transaction);
@@ -181,6 +224,13 @@ export class LocalMetaStore {
 
 		await done;
 		return result;
+	}
+}
+
+export class LocalMetaStoreClosedError extends Error {
+	constructor(databaseName: string) {
+		super(`Local meta store ${databaseName} is closing`);
+		this.name = "LocalMetaStoreClosedError";
 	}
 }
 
@@ -234,6 +284,16 @@ function pendingKey(docId: string): string {
 
 function truncateUuid(uuid: string): string {
 	return uuid.slice(0, 8);
+}
+
+async function sha256Hex(input: string): Promise<string> {
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(input),
+	);
+	return Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
 }
 
 function logInfo(message: string, data: Record<string, unknown>): void {

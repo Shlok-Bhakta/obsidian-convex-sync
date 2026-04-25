@@ -14,7 +14,6 @@ import type { MyPluginSettings } from "../settings";
 import {
 	SyncEngine,
 	type OpenDocumentSession,
-	type OpenDocOptions,
 } from "../core/sync-engine";
 import { createEditorAdapter, type EditorAdapter } from "./editor-adapter";
 import type { DocPathChange } from "../transport/convex-client";
@@ -28,8 +27,6 @@ export type LiveSyncHost = {
 	app: App;
 	settings: MyPluginSettings;
 	getRealtimeClient(): ConvexClient | null;
-	registerEvent(ref: EventRef): void;
-	register(cleanup: () => void): void;
 	setStatus(text: string): void;
 };
 
@@ -47,40 +44,7 @@ type OpenEditorBinding = {
 
 export function startObsidianLiveSync(host: LiveSyncHost): LiveSyncController {
 	const controller = new ObsidianLiveSyncController(host);
-	host.registerEvent(
-		host.app.workspace.on("file-open", () => {
-			void controller.openActiveFile();
-		}),
-	);
-	host.registerEvent(
-		host.app.workspace.on("editor-change", (editor, info) => {
-			void controller.handleEditorChange(editor, info);
-		}),
-	);
-	host.registerEvent(
-		host.app.vault.on("create", (file) => {
-			void controller.handleVaultCreate(file);
-		}),
-	);
-	host.registerEvent(
-		host.app.vault.on("modify", (file) => {
-			void controller.handleVaultModify(file);
-		}),
-	);
-	host.registerEvent(
-		host.app.vault.on("delete", (file) => {
-			void controller.handleVaultDelete(file);
-		}),
-	);
-	host.registerEvent(
-		host.app.vault.on("rename", (file, oldPath) => {
-			void controller.handleVaultRename(file, oldPath);
-		}),
-	);
-	host.register(() => {
-		void controller.dispose();
-	});
-	void controller.openActiveFile();
+	controller.start();
 	return controller;
 }
 
@@ -91,11 +55,57 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	private readonly openingByPath = new Map<string, Promise<OpenEditorBinding | null>>();
 	private readonly suppressPathEvents = new Set<string>();
 	private readonly pendingModifyTimers = new Map<string, number>();
+	private readonly workspaceRefs: EventRef[] = [];
+	private readonly vaultRefs: EventRef[] = [];
 	private pathChangesUnsubscribe: (() => void) | null = null;
+	private disposing: Promise<void> | null = null;
+	private disposed = false;
+	private started = false;
 
 	constructor(private readonly host: LiveSyncHost) {}
 
+	start(): void {
+		if (this.started) {
+			return;
+		}
+		this.started = true;
+		this.workspaceRefs.push(
+			this.host.app.workspace.on("file-open", () => {
+				void this.openActiveFile();
+			}),
+		);
+		this.workspaceRefs.push(
+			this.host.app.workspace.on("editor-change", (editor, info) => {
+				void this.handleEditorChange(editor, info);
+			}),
+		);
+		this.vaultRefs.push(
+			this.host.app.vault.on("create", (file) => {
+				void this.handleVaultCreate(file);
+			}),
+		);
+		this.vaultRefs.push(
+			this.host.app.vault.on("modify", (file) => {
+				void this.handleVaultModify(file);
+			}),
+		);
+		this.vaultRefs.push(
+			this.host.app.vault.on("delete", (file) => {
+				void this.handleVaultDelete(file);
+			}),
+		);
+		this.vaultRefs.push(
+			this.host.app.vault.on("rename", (file, oldPath) => {
+				void this.handleVaultRename(file, oldPath);
+			}),
+		);
+		void this.openActiveFile();
+	}
+
 	async openActiveFile(): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
 		const view = this.host.app.workspace.getActiveViewOfType(MarkdownView);
 		if (!view?.file || view.getMode() !== "source") {
 			return;
@@ -108,7 +118,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		info: MarkdownView | MarkdownFileInfo,
 	): Promise<void> {
 		const file = info.file;
-		if (!file || !isTextSyncFile(file)) {
+		if (!file || !isTextSyncFile(file) || this.disposed) {
 			return;
 		}
 		const path = normalizePath(file.path);
@@ -118,32 +128,28 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		this.cancelPendingModify(path);
 
 		const binding = await this.openEditor(file, editor);
-		if (!binding || binding.editor !== editor) {
+		if (!binding || binding.editor !== editor || binding.adapter.isApplyingRemote()) {
 			return;
 		}
-		await binding.adapter.handleEditorChange(editor);
+		await this.reconcileOpenEditor(binding);
 		this.host.setStatus(`Convex sync: synced ${file.basename}`);
 	}
 
 	async handleVaultCreate(file: TAbstractFile): Promise<void> {
-		if (!(file instanceof TFile) || !isTextSyncFile(file)) {
+		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
 			return;
 		}
 		const path = normalizePath(file.path);
 		if (this.suppressPathEvents.has(path)) {
 			return;
 		}
-		const engine = await this.getEngine();
-		if (!engine) {
-			return;
-		}
 		const text = await this.host.app.vault.cachedRead(file);
-		await engine.syncFileText(path, text);
+		await this.reconcileClosedFile(path, text, file);
 		this.host.setStatus(`Convex sync: created ${file.basename}`);
 	}
 
 	async handleVaultModify(file: TAbstractFile): Promise<void> {
-		if (!(file instanceof TFile) || !isTextSyncFile(file)) {
+		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
 			return;
 		}
 		const path = normalizePath(file.path);
@@ -166,7 +172,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	}
 
 	async handleVaultDelete(file: TAbstractFile): Promise<void> {
-		if (!(file instanceof TFile) || !isTextSyncFile(file)) {
+		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
 			return;
 		}
 		const path = normalizePath(file.path);
@@ -186,7 +192,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	}
 
 	async handleVaultRename(file: TAbstractFile, oldPath: string): Promise<void> {
-		if (!(file instanceof TFile) || !isTextSyncFile(file)) {
+		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
 			return;
 		}
 		const normalizedOldPath = normalizePath(oldPath);
@@ -203,28 +209,50 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 		await engine.renamePath(normalizedOldPath, newPath);
 		const text = await this.host.app.vault.cachedRead(file);
-		await engine.syncFileText(newPath, text);
+		await this.reconcileClosedFile(newPath, text, file);
 		this.host.setStatus(`Convex sync: renamed ${file.basename}`);
 	}
 
 	async dispose(): Promise<void> {
+		if (this.disposing) {
+			await this.disposing;
+			return;
+		}
+		this.disposing = this.doDispose();
+		await this.disposing;
+	}
+
+	private async doDispose(): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		this.disposed = true;
 		this.pathChangesUnsubscribe?.();
 		this.pathChangesUnsubscribe = null;
+		for (const ref of this.workspaceRefs.splice(0)) {
+			this.host.app.workspace.offref(ref);
+		}
+		for (const ref of this.vaultRefs.splice(0)) {
+			this.host.app.vault.offref(ref);
+		}
 		for (const timer of this.pendingModifyTimers.values()) {
 			window.clearTimeout(timer);
 		}
 		this.pendingModifyTimers.clear();
 		this.current?.session.close();
 		this.current = null;
-		await this.engine?.dispose();
+		const engine =
+			this.engine ?? (await this.engineBoot?.catch(() => null)) ?? null;
+		await engine?.dispose();
 		this.engine = null;
+		this.engineBoot = null;
 	}
 
 	private async openEditor(
 		file: TFile,
 		editor: Editor,
 	): Promise<OpenEditorBinding | null> {
-		if (!isTextSyncFile(file)) {
+		if (!isTextSyncFile(file) || this.disposed) {
 			return null;
 		}
 		const path = normalizePath(file.path);
@@ -249,34 +277,23 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		editor: Editor,
 	): Promise<OpenEditorBinding | null> {
 		const engine = await this.getEngine();
-		if (!engine) {
+		if (!engine || this.disposed) {
 			return null;
 		}
 
 		this.current?.session.close();
-		let adapter: EditorAdapter | null = null;
+		let binding: OpenEditorBinding | null = null;
 		const session = await engine.openDoc(file.path, {
-			onInitialState: (text) => {
-				if (text.length > 0) {
-					this.applyRemoteText(file, editor, text, adapter);
+			onRemotePatch: () => {
+				if (binding) {
+					void this.reconcileOpenEditor(binding);
 				}
 			},
-			onRemotePatch: (text) => {
-				this.applyRemoteText(file, editor, text, adapter);
-			},
 		});
-		adapter = createEditorAdapter(session);
-		const binding = { file, editor, session, adapter };
+		const adapter = createEditorAdapter(session);
+		binding = { file, editor, session, adapter };
 		this.current = binding;
-
-		const localText = editor.getValue();
-		const crdtText = session.getTextSnapshot();
-		if (crdtText.length === 0 && localText.length > 0) {
-			await session.applyLocalChange([{ pos: 0, del: 0, ins: localText }]);
-		} else if (crdtText !== localText) {
-			this.applyRemoteText(file, editor, crdtText, adapter);
-		}
-
+		await this.reconcileOpenEditor(binding);
 		this.host.setStatus(`Convex sync: live ${file.basename}`);
 		return binding;
 	}
@@ -301,11 +318,16 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			return null;
 		}
 		try {
-			this.engine = await SyncEngine.boot({
+			const engine = await SyncEngine.boot({
 				vaultId: this.host.app.vault.getName(),
 				convexClient: client,
 				convexSecret,
 			});
+			if (this.disposed) {
+				await engine.dispose();
+				return null;
+			}
+			this.engine = engine;
 			this.pathChangesUnsubscribe = this.engine.watchPathChanges((changes) => {
 				void this.applyRemotePathChanges(changes);
 			});
@@ -320,36 +342,67 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 	}
 
-	private async syncModifiedFile(file: TFile): Promise<void> {
-		const path = normalizePath(file.path);
-		if (this.suppressPathEvents.has(path)) {
-			return;
-		}
-		if (this.isCurrentOpenPath(path)) {
+	private async reconcileOpenEditor(binding: OpenEditorBinding): Promise<void> {
+		if (this.disposed || this.current !== binding || binding.adapter.isApplyingRemote()) {
 			return;
 		}
 		const engine = await this.getEngine();
-		if (!engine) {
+		if (!engine || this.current !== binding) {
+			return;
+		}
+		const localText = binding.editor.getValue();
+		const result = await engine.reconcilePath(binding.file.path, localText, {
+			onBeforeFallbackMerge: async () => {
+				await this.createMergeBackup(binding.file, localText);
+			},
+		});
+		if (this.current !== binding || binding.editor.getValue() !== localText) {
+			return;
+		}
+		this.applyRemoteText(binding.editor, result.text, binding.adapter);
+	}
+
+	private async reconcileClosedFile(
+		path: string,
+		localText: string,
+		file: TFile | null,
+	): Promise<void> {
+		const engine = await this.getEngine();
+		if (!engine || this.disposed) {
+			return;
+		}
+		const result = await engine.reconcilePath(path, localText, {
+			onBeforeFallbackMerge: async () => {
+				if (file) {
+					await this.createMergeBackup(file, localText);
+				}
+			},
+		});
+		if (result.text !== localText) {
+			await this.writePathText(path, result.text);
+		}
+	}
+
+	private async syncModifiedFile(file: TFile): Promise<void> {
+		const path = normalizePath(file.path);
+		if (this.suppressPathEvents.has(path) || this.isCurrentOpenPath(path)) {
 			return;
 		}
 		const text = await this.host.app.vault.read(file);
-		await engine.syncFileText(path, text);
+		await this.reconcileClosedFile(path, text, file);
 		this.host.setStatus(`Convex sync: modified ${file.basename}`);
 	}
 
 	private applyRemoteText(
-		file: TFile,
 		editor: Editor,
 		text: string,
 		adapter: EditorAdapter | null,
 	): void {
-		const path = normalizePath(file.path);
 		if (adapter) {
 			adapter.applyRemoteText(editor, text);
 		} else if (editor.getValue() !== text) {
 			editor.setValue(text);
 		}
-		void this.writeVaultCache(path, file, text);
 	}
 
 	private async applyRemotePathChanges(changes: DocPathChange[]): Promise<void> {
@@ -385,7 +438,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 
 	private async applyRemoteCreateOrUpdate(change: DocPathChange): Promise<void> {
 		const engine = await this.getEngine();
-		if (!engine) {
+		if (!engine || this.disposed) {
 			return;
 		}
 		const path = normalizePath(change.path);
@@ -398,10 +451,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (this.isCurrentOpenPath(path, change.docId)) {
 			return;
 		}
-		const session = await engine.openDoc(path, this.remoteOpenOptions(path));
-		const text = session.getTextSnapshot();
-		session.close();
-		await this.writePathText(path, text);
+		const existing = this.host.app.vault.getAbstractFileByPath(path);
+		const file = existing instanceof TFile && isTextSyncFile(existing) ? existing : null;
+		const localText = file ? await this.host.app.vault.cachedRead(file) : "";
+		await this.reconcileClosedFile(path, localText, file);
 	}
 
 	private async applyRemoteRename(
@@ -446,14 +499,6 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 	}
 
-	private remoteOpenOptions(path: string): OpenDocOptions {
-		return {
-			onRemotePatch: (text) => {
-				void this.writePathText(path, text);
-			},
-		};
-	}
-
 	private async writePathText(path: string, text: string): Promise<void> {
 		const existing = this.host.app.vault.getAbstractFileByPath(path);
 		this.suppressPathEvents.add(path);
@@ -487,20 +532,23 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 	}
 
-	private async writeVaultCache(
-		path: string,
-		file: TFile,
-		text: string,
-	): Promise<void> {
-		this.suppressPathEvents.add(path);
+	private async createMergeBackup(file: TFile, text: string): Promise<void> {
+		const backupPath = nextBackupPath(file.path, new Date());
+		let candidatePath = backupPath;
+		this.suppressPathEvents.add(candidatePath);
 		try {
-			const current = await this.host.app.vault.cachedRead(file);
-			if (current !== text) {
-				await this.host.app.vault.modify(file, text);
+			await ensureVaultFolderExists(this.host.app, folderPathForFile(backupPath));
+			let attempt = 1;
+			while (this.host.app.vault.getAbstractFileByPath(candidatePath)) {
+				this.suppressPathEvents.delete(candidatePath);
+				candidatePath = appendBackupSuffix(backupPath, attempt);
+				this.suppressPathEvents.add(candidatePath);
+				attempt += 1;
 			}
+			await this.host.app.vault.create(candidatePath, text);
 		} finally {
 			queueMicrotask(() => {
-				this.suppressPathEvents.delete(path);
+				this.suppressPathEvents.delete(candidatePath);
 			});
 		}
 	}
@@ -520,4 +568,31 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 		return docId === undefined || this.current.session.docId === docId;
 	}
+}
+
+function nextBackupPath(path: string, now: Date): string {
+	const timestamp = [
+		now.getFullYear(),
+		pad(now.getMonth() + 1),
+		pad(now.getDate()),
+	].join("") + `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+	const extensionIndex = path.lastIndexOf(".");
+	if (extensionIndex <= 0) {
+		return `${path}.convex-merge-backup-${timestamp}.md`;
+	}
+	const stem = path.slice(0, extensionIndex);
+	const extension = path.slice(extensionIndex);
+	return `${stem}.convex-merge-backup-${timestamp}${extension}`;
+}
+
+function appendBackupSuffix(path: string, attempt: number): string {
+	const extensionIndex = path.lastIndexOf(".");
+	if (extensionIndex <= 0) {
+		return `${path}-${attempt}`;
+	}
+	return `${path.slice(0, extensionIndex)}-${attempt}${path.slice(extensionIndex)}`;
+}
+
+function pad(value: number): string {
+	return value.toString().padStart(2, "0");
 }
