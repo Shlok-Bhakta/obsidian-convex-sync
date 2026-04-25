@@ -220,6 +220,59 @@ describe("startObsidianLiveSync", () => {
 		await controller.dispose();
 	});
 
+	test("same-editor file switch reconciles the newly opened file from vault text", async () => {
+		const editor = createEditor("note A text");
+		const fileA = new TFileCtor("a.md");
+		const fileB = new TFileCtor("b.md");
+		const view = new MarkdownViewCtor(fileA, editor);
+		const app = createApp(
+			view,
+			[
+				[fileA.path, fileA],
+				[fileB.path, fileB],
+			],
+			new Map([
+				[fileA.path, "note A text"],
+				[fileB.path, "note B text"],
+			]),
+		);
+		openDocMock.mockImplementation(async (path: string) =>
+			createSession(`doc:${path}`, path),
+		);
+		reconcilePathMock
+			.mockResolvedValueOnce({
+				docId: "doc:a.md",
+				path: fileA.path,
+				text: "note A text",
+				changed: false,
+				usedFallbackBackup: false,
+			})
+			.mockResolvedValueOnce({
+				docId: "doc:b.md",
+				path: fileB.path,
+				text: "note B text",
+				changed: false,
+				usedFallbackBackup: false,
+			});
+
+		const controller = startObsidianLiveSync({
+			app: app as never,
+			settings: { convexSecret: "secret" } as never,
+			getRealtimeClient: () => ({}) as never,
+			setStatus: () => undefined,
+		});
+		await vi.waitFor(() => expect(reconcilePathMock).toHaveBeenCalledTimes(1));
+
+		view.file = fileB;
+		app.workspace.emit("file-open");
+		await vi.waitFor(() => expect(reconcilePathMock).toHaveBeenCalledTimes(2));
+
+		expect(reconcilePathMock.mock.calls[1]?.[0]).toBe(fileB.path);
+		expect(reconcilePathMock.mock.calls[1]?.[1]).toBe("note B text");
+		expect(editor.getValue()).toBe("note B text");
+		await controller.dispose();
+	});
+
 	test("active editor reconcile mirrors text into vaultFiles snapshot", async () => {
 		const editor = createEditor("local");
 		const file = new TFileCtor("note.md");
@@ -364,10 +417,10 @@ function createEditor(initialValue: string) {
 	};
 }
 
-function createSession() {
+function createSession(docId = "doc-1", path = "note.md") {
 	return {
-		docId: "doc-1",
-		path: "note.md",
+		docId,
+		path,
 		getTextSnapshot: () => "",
 		applyLocalChange: vi.fn(async () => undefined),
 		close: vi.fn(),
@@ -377,6 +430,7 @@ function createSession() {
 function createApp(
 	view: InstanceType<typeof MarkdownView>,
 	files: Array<[string, TFile | TFolder]>,
+	fileContents = new Map<string, string>(),
 ) {
 	const fileMap = new Map(files);
 	const workspace = createEventTarget();
@@ -390,11 +444,18 @@ function createApp(
 		vault: {
 			...vault,
 			getAllLoadedFiles: () => [...fileMap.values()],
-			cachedRead: vi.fn(async (_file: TFile) => view.editor.getValue()),
-			read: vi.fn(async (_file: TFile) => view.editor.getValue()),
-			modify: vi.fn(async () => undefined),
-			create: vi.fn(async (path: string, _text: string) => {
+			cachedRead: vi.fn(async (file: TFile) =>
+				fileContents.get(file.path) ?? view.editor.getValue(),
+			),
+			read: vi.fn(async (file: TFile) =>
+				fileContents.get(file.path) ?? view.editor.getValue(),
+			),
+			modify: vi.fn(async (file: TFile, text: string) => {
+				fileContents.set(file.path, text);
+			}),
+			create: vi.fn(async (path: string, text: string) => {
 				fileMap.set(path, new TFileCtor(path));
+				fileContents.set(path, text);
 			}),
 			createFolder: vi.fn(async (path: string) => {
 				const folder = new TFolderCtor(path);

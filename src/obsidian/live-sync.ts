@@ -337,9 +337,13 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			return null;
 		}
 
+		const path = normalizePath(file.path);
+		const previous = this.current;
+		const openingDifferentPathInSameEditor =
+			previous?.editor === editor && normalizePath(previous.file.path) !== path;
 		this.current?.session.close();
 		let binding: OpenEditorBinding | null = null;
-		const session = await engine.openDoc(file.path, {
+		const session = await engine.openDoc(path, {
 			onRemotePatch: () => {
 				if (binding) {
 					void this.reconcileOpenEditor(binding);
@@ -349,7 +353,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		const adapter = createEditorAdapter(session);
 		binding = { file, editor, session, adapter };
 		this.current = binding;
-		await this.reconcileOpenEditor(binding);
+		const initialLocalText = openingDifferentPathInSameEditor
+			? await this.host.app.vault.cachedRead(file)
+			: undefined;
+		await this.reconcileOpenEditor(binding, initialLocalText);
 		this.host.setStatus(`Convex sync: live ${file.basename}`);
 		return binding;
 	}
@@ -529,7 +536,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 	}
 
-	private async reconcileOpenEditor(binding: OpenEditorBinding): Promise<void> {
+	private async reconcileOpenEditor(
+		binding: OpenEditorBinding,
+		localTextOverride?: string,
+	): Promise<void> {
 		if (this.disposed || this.current !== binding || binding.adapter.isApplyingRemote()) {
 			return;
 		}
@@ -537,9 +547,12 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (!engine || this.current !== binding) {
 			return;
 		}
-		const localText = binding.editor.getValue();
+		const editorTextAtStart = binding.editor.getValue();
+		const localText = localTextOverride ?? editorTextAtStart;
 		const result = await engine.reconcilePath(binding.file.path, localText);
-		if (this.current !== binding || binding.editor.getValue() !== localText) {
+		const expectedEditorText =
+			localTextOverride === undefined ? localText : editorTextAtStart;
+		if (this.current !== binding || binding.editor.getValue() !== expectedEditorText) {
 			return;
 		}
 		this.applyRemoteText(binding.editor, result.text, binding.adapter);
