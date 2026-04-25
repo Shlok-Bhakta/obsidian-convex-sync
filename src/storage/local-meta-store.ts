@@ -19,6 +19,10 @@ type LocalMetaStoreOptions = {
 const DATABASE_VERSION = 1;
 const STORE_NAME = "meta";
 
+export function localMetaDatabaseName(vaultId: string): string {
+	return `sync-meta-${vaultId}`;
+}
+
 export class LocalMetaStore {
 	private clientId: string | null = null;
 	private disposing = false;
@@ -30,7 +34,7 @@ export class LocalMetaStore {
 	) {}
 
 	static async open(options: LocalMetaStoreOptions): Promise<LocalMetaStore> {
-		const databaseName = `sync-meta-${options.vaultId}`;
+		const databaseName = localMetaDatabaseName(options.vaultId);
 		const db = await openDatabase(databaseName);
 		const store = new LocalMetaStore(db, databaseName);
 		await store.getClientId();

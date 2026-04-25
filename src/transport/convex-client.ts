@@ -22,6 +22,7 @@ export type DocPathChange = {
 	path: string;
 	docId: string;
 	updatedAtMs: number;
+	updatedByClientId: string;
 	deletedAtMs: number | null;
 };
 
@@ -301,6 +302,7 @@ function pathChangeIdentity(change: DocPathChange): string {
 		change.path,
 		change.docId,
 		change.updatedAtMs,
+		change.updatedByClientId,
 		change.deletedAtMs ?? "live",
 	].join(":");
 }

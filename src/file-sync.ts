@@ -171,11 +171,16 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		tick("Creating missing local files");
 	}
 
+	const folderPaths = localState.folders.filter((path) => normalizePath(path).trim() !== "");
+	const emptyFolderPaths = localState.emptyFolders.filter(
+		(path) => normalizePath(path).trim() !== "",
+	);
 	await client.mutation(api.fileSync.syncFolderState, {
 		convexSecret: secret,
 		scannedAtMs: Date.now(),
 		clientId,
-		emptyFolderPaths: localState.emptyFolders,
+		folderPaths,
+		emptyFolderPaths,
 	});
 	tick("Syncing folder state");
 

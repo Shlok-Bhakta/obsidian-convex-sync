@@ -1,5 +1,6 @@
 import type { ConvexHttpClient } from "convex/browser";
 import { runVaultFileSync } from "../file-sync";
+import { uploadLocalFile } from "../file-sync/remote-transfer";
 import type { MyPluginSettings } from "../settings";
 
 type BootstrapHost = {
@@ -58,6 +59,12 @@ type BootstrapStatus = {
 	archiveName?: string | null;
 };
 
+const PLUGIN_RELEASE_ARTIFACTS = [
+	".obsidian/plugins/obsidian-convex-sync/main.js",
+	".obsidian/plugins/obsidian-convex-sync/manifest.json",
+	".obsidian/plugins/obsidian-convex-sync/styles.css",
+];
+
 export async function startBootstrapBuild(
 	host: BootstrapHost,
 	onState: (state: BootstrapUiState) => void,
@@ -78,11 +85,29 @@ export async function startBootstrapBuild(
 			});
 		},
 	});
+	onState({ kind: "syncing", phase: "Pinning plugin artifacts", completed: 1, total: 1 });
+	await uploadLocalPluginArtifacts(host);
 	await (client.mutation as any)("bootstrap:startBuild", {
 		convexSecret: host.settings.convexSecret,
 		clientId: host.getPresenceSessionId(),
 		vaultName: host.app.vault.getName(),
 	});
+}
+
+async function uploadLocalPluginArtifacts(host: BootstrapHost): Promise<void> {
+	const client = host.getConvexHttpClient();
+	const secret = host.settings.convexSecret.trim();
+	const clientId = host.getPresenceSessionId();
+	for (const path of PLUGIN_RELEASE_ARTIFACTS) {
+		const exists = await host.app.vault.adapter.exists(path);
+		if (!exists) {
+			continue;
+		}
+		const bytes = await host.app.vault.adapter.readBinary(path);
+		await uploadLocalFile(client, secret, clientId, path, bytes, Date.now(), {
+			force: true,
+		});
+	}
 }
 
 export async function readBootstrapStatus(

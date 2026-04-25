@@ -4,7 +4,36 @@ import {
 	TFolder,
 	type App,
 } from "obsidian";
+import { isMergeBackupPath } from "./merge-backups";
 import { folderPathForFile } from "./path";
+
+async function rethrowUnlessVaultFolderExists(
+	app: App,
+	path: string,
+	error: unknown,
+): Promise<void> {
+	const existing = app.vault.getAbstractFileByPath(path);
+	if (existing instanceof TFolder) {
+		return;
+	}
+	const stat = await app.vault.adapter.stat(path);
+	if (stat?.type === "folder") {
+		return;
+	}
+	throw error;
+}
+
+async function rethrowUnlessAdapterFolderExists(
+	app: App,
+	path: string,
+	error: unknown,
+): Promise<void> {
+	const stat = await app.vault.adapter.stat(path);
+	if (stat?.type === "folder") {
+		return;
+	}
+	throw error;
+}
 
 export async function ensureVaultFolderExists(
 	app: App,
@@ -19,7 +48,11 @@ export async function ensureVaultFolderExists(
 		return;
 	}
 	await ensureVaultFolderExists(app, folderPathForFile(normalized));
-	await app.vault.createFolder(normalized);
+	try {
+		await app.vault.createFolder(normalized);
+	} catch (error) {
+		await rethrowUnlessVaultFolderExists(app, normalized, error);
+	}
 }
 
 export async function ensureAdapterFolderExists(
@@ -35,10 +68,17 @@ export async function ensureAdapterFolderExists(
 		return;
 	}
 	await ensureAdapterFolderExists(app, folderPathForFile(normalized));
-	await app.vault.adapter.mkdir(normalized);
+	try {
+		await app.vault.adapter.mkdir(normalized);
+	} catch (error) {
+		await rethrowUnlessAdapterFolderExists(app, normalized, error);
+	}
 }
 
 export function isTextSyncFile(file: TFile): boolean {
 	const extension = file.extension.toLowerCase();
-	return extension === "md" || extension === "markdown" || extension === "txt";
+	return (
+		(extension === "md" || extension === "markdown" || extension === "txt") &&
+		!isMergeBackupPath(file.path)
+	);
 }

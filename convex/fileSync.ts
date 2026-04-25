@@ -1,6 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { normalizeVaultPath } from "./_lib/path";
+import { normalizeOptionalVaultPath, normalizeVaultPath } from "./_lib/path";
 import { requirePluginSecret } from "./security";
 
 export const issueUploadUrl = mutation({
@@ -48,6 +48,7 @@ export const finalizeUpload = mutation({
 		sizeBytes: v.number(),
 		clientId: v.string(),
 		fileId: v.optional(v.string()),
+		force: v.optional(v.boolean()),
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
@@ -57,7 +58,7 @@ export const finalizeUpload = mutation({
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
 			.unique();
-		if (existing && existing.updatedAtMs > args.updatedAtMs) {
+		if (existing && !args.force && existing.updatedAtMs > args.updatedAtMs) {
 			await ctx.storage.delete(args.storageId);
 			return {
 				ok: false as const,
@@ -119,6 +120,20 @@ export const listSnapshot = query({
 	},
 });
 
+export const listFolderSnapshot = query({
+	args: { convexSecret: v.string() },
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const folders = await ctx.db.query("vaultFolders").collect();
+		return folders.map((folder) => ({
+			path: folder.path,
+			updatedAtMs: folder.updatedAtMs,
+			isExplicitlyEmpty: folder.isExplicitlyEmpty,
+			updatedByClientId: folder.updatedByClientId ?? "",
+		}));
+	},
+});
+
 export const getDownloadUrl = query({
 	args: { convexSecret: v.string(), path: v.string() },
 	handler: async (ctx, args) => {
@@ -149,28 +164,69 @@ export const syncFolderState = mutation({
 		convexSecret: v.string(),
 		scannedAtMs: v.number(),
 		clientId: v.string(),
+		folderPaths: v.optional(v.array(v.string())),
 		emptyFolderPaths: v.array(v.string()),
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const normalizedEmpty = new Set(
-			args.emptyFolderPaths.map((path) => normalizeVaultPath(path)),
+			args.emptyFolderPaths
+				.map((path) => normalizeOptionalVaultPath(path))
+				.filter((path): path is string => path !== null),
 		);
 		const existing = await ctx.db.query("vaultFolders").collect();
+		if (!args.folderPaths) {
+			for (const folder of existing) {
+				const shouldBeEmpty = normalizedEmpty.has(folder.path);
+				if (folder.isExplicitlyEmpty !== shouldBeEmpty) {
+					await ctx.db.patch(folder._id, {
+						updatedAtMs: args.scannedAtMs,
+						isExplicitlyEmpty: shouldBeEmpty,
+						updatedByClientId: args.clientId,
+					});
+				}
+				normalizedEmpty.delete(folder.path);
+			}
+			for (const path of normalizedEmpty) {
+				await ctx.db.insert("vaultFolders", {
+					path,
+					updatedAtMs: args.scannedAtMs,
+					isExplicitlyEmpty: true,
+					updatedByClientId: args.clientId,
+				});
+			}
+			return;
+		}
+		const normalizedFolders = new Set(
+			args.folderPaths
+				.map((path) => normalizeOptionalVaultPath(path))
+				.filter((path): path is string => path !== null),
+		);
+		for (const path of normalizedEmpty) {
+			normalizedFolders.add(path);
+		}
 		for (const folder of existing) {
+			const stillExists = normalizedFolders.has(folder.path);
+			if (!stillExists) {
+				await ctx.db.delete(folder._id);
+				continue;
+			}
 			const shouldBeEmpty = normalizedEmpty.has(folder.path);
-			await ctx.db.patch(folder._id, {
-				updatedAtMs: args.scannedAtMs,
-				isExplicitlyEmpty: shouldBeEmpty,
-				updatedByClientId: args.clientId,
-			});
+			if (folder.isExplicitlyEmpty !== shouldBeEmpty) {
+				await ctx.db.patch(folder._id, {
+					updatedAtMs: args.scannedAtMs,
+					isExplicitlyEmpty: shouldBeEmpty,
+					updatedByClientId: args.clientId,
+				});
+			}
+			normalizedFolders.delete(folder.path);
 			normalizedEmpty.delete(folder.path);
 		}
-		for (const path of normalizedEmpty) {
+		for (const path of normalizedFolders) {
 			await ctx.db.insert("vaultFolders", {
 				path,
 				updatedAtMs: args.scannedAtMs,
-				isExplicitlyEmpty: true,
+				isExplicitlyEmpty: normalizedEmpty.has(path),
 				updatedByClientId: args.clientId,
 			});
 		}

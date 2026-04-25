@@ -3,13 +3,15 @@ import {
 	Notice,
 	TAbstractFile,
 	TFile,
+	TFolder,
 	normalizePath,
 	type App,
 	type Editor,
 	type EventRef,
 	type MarkdownFileInfo,
 } from "obsidian";
-import type { ConvexClient } from "convex/browser";
+import type { ConvexClient, ConvexHttpClient } from "convex/browser";
+import { api } from "../../convex/_generated/api";
 import type { MyPluginSettings } from "../settings";
 import {
 	SyncEngine,
@@ -21,12 +23,18 @@ import {
 	ensureVaultFolderExists,
 	isTextSyncFile,
 } from "../lib/obsidian-vault";
+import { isMergeBackupPath } from "../lib/merge-backups";
 import { folderPathForFile } from "../lib/path";
+import { uploadLocalFile } from "../file-sync/remote-transfer";
+import { listLocalEntries } from "../file-sync/local-entries";
+import { shouldIgnoreVaultPath } from "../file-sync/path-rules";
 
 export type LiveSyncHost = {
 	app: App;
 	settings: MyPluginSettings;
 	getRealtimeClient(): ConvexClient | null;
+	getFileSyncClient?(): ConvexHttpClient | null;
+	getPresenceSessionId?(): string;
 	setStatus(text: string): void;
 };
 
@@ -41,6 +49,15 @@ type OpenEditorBinding = {
 	session: OpenDocumentSession;
 	adapter: EditorAdapter;
 };
+
+type FolderSnapshotRow = {
+	path: string;
+	updatedAtMs: number;
+	isExplicitlyEmpty: boolean;
+	updatedByClientId: string;
+};
+
+const FOLDER_SYNC_DEBOUNCE_MS = 250;
 
 export function startObsidianLiveSync(host: LiveSyncHost): LiveSyncController {
 	const controller = new ObsidianLiveSyncController(host);
@@ -58,6 +75,9 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	private readonly workspaceRefs: EventRef[] = [];
 	private readonly vaultRefs: EventRef[] = [];
 	private pathChangesUnsubscribe: (() => void) | null = null;
+	private folderSnapshotUnsubscribe: (() => void) | null = null;
+	private folderSyncTimer: number | null = null;
+	private remoteFolders: Map<string, FolderSnapshotRow> | null = null;
 	private disposing: Promise<void> | null = null;
 	private disposed = false;
 	private started = false;
@@ -99,6 +119,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 				void this.handleVaultRename(file, oldPath);
 			}),
 		);
+		this.startFolderSnapshotWatch();
 		void this.openActiveFile();
 	}
 
@@ -136,10 +157,18 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	}
 
 	async handleVaultCreate(file: TAbstractFile): Promise<void> {
+		const path = normalizePath(file.path);
+		if (this.shouldIgnoreVaultEventPath(path)) {
+			return;
+		}
+		this.scheduleFolderStateSync();
+		if (file instanceof TFolder) {
+			this.host.setStatus(`Convex sync: folder created ${path}`);
+			return;
+		}
 		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
 			return;
 		}
-		const path = normalizePath(file.path);
 		if (this.suppressPathEvents.has(path)) {
 			return;
 		}
@@ -162,9 +191,9 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 		const existingTimer = this.pendingModifyTimers.get(path);
 		if (existingTimer !== undefined) {
-			window.clearTimeout(existingTimer);
+			clearLiveSyncTimeout(existingTimer);
 		}
-		const timer = window.setTimeout(() => {
+		const timer = setLiveSyncTimeout(() => {
 			this.pendingModifyTimers.delete(path);
 			void this.syncModifiedFile(file);
 		}, 250);
@@ -172,10 +201,18 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	}
 
 	async handleVaultDelete(file: TAbstractFile): Promise<void> {
+		const path = normalizePath(file.path);
+		if (this.shouldIgnoreVaultEventPath(path)) {
+			return;
+		}
+		this.scheduleFolderStateSync();
+		if (file instanceof TFolder) {
+			this.host.setStatus(`Convex sync: folder deleted ${path}`);
+			return;
+		}
 		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
 			return;
 		}
-		const path = normalizePath(file.path);
 		if (this.suppressPathEvents.has(path)) {
 			return;
 		}
@@ -188,15 +225,27 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			this.current = null;
 		}
 		await engine.deletePath(path);
+		await this.removeSnapshotPath(path);
 		this.host.setStatus(`Convex sync: deleted ${file.basename}`);
 	}
 
 	async handleVaultRename(file: TAbstractFile, oldPath: string): Promise<void> {
+		const normalizedOldPath = normalizePath(oldPath);
+		const newPath = normalizePath(file.path);
+		if (
+			this.shouldIgnoreVaultEventPath(normalizedOldPath) &&
+			this.shouldIgnoreVaultEventPath(newPath)
+		) {
+			return;
+		}
+		this.scheduleFolderStateSync();
+		if (file instanceof TFolder) {
+			this.host.setStatus(`Convex sync: folder renamed ${newPath}`);
+			return;
+		}
 		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
 			return;
 		}
-		const normalizedOldPath = normalizePath(oldPath);
-		const newPath = normalizePath(file.path);
 		if (
 			this.suppressPathEvents.has(normalizedOldPath) ||
 			this.suppressPathEvents.has(newPath)
@@ -208,6 +257,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			return;
 		}
 		await engine.renamePath(normalizedOldPath, newPath);
+		await this.removeSnapshotPath(normalizedOldPath);
 		const text = await this.host.app.vault.cachedRead(file);
 		await this.reconcileClosedFile(newPath, text, file);
 		this.host.setStatus(`Convex sync: renamed ${file.basename}`);
@@ -229,6 +279,8 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		this.disposed = true;
 		this.pathChangesUnsubscribe?.();
 		this.pathChangesUnsubscribe = null;
+		this.folderSnapshotUnsubscribe?.();
+		this.folderSnapshotUnsubscribe = null;
 		for (const ref of this.workspaceRefs.splice(0)) {
 			this.host.app.workspace.offref(ref);
 		}
@@ -236,9 +288,13 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			this.host.app.vault.offref(ref);
 		}
 		for (const timer of this.pendingModifyTimers.values()) {
-			window.clearTimeout(timer);
+			clearLiveSyncTimeout(timer);
 		}
 		this.pendingModifyTimers.clear();
+		if (this.folderSyncTimer !== null) {
+			clearLiveSyncTimeout(this.folderSyncTimer);
+			this.folderSyncTimer = null;
+		}
 		this.current?.session.close();
 		this.current = null;
 		const engine =
@@ -342,6 +398,137 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 	}
 
+	private startFolderSnapshotWatch(): void {
+		const client = this.host.getRealtimeClient();
+		const convexSecret = this.host.settings.convexSecret.trim();
+		if (!client || convexSecret.length === 0 || this.folderSnapshotUnsubscribe) {
+			return;
+		}
+		if (typeof client.onUpdate !== "function") {
+			return;
+		}
+		this.folderSnapshotUnsubscribe = client.onUpdate(
+			api.fileSync.listFolderSnapshot,
+			{ convexSecret },
+			(rows) => {
+				void this.applyRemoteFolderSnapshot(rows as FolderSnapshotRow[]);
+			},
+		);
+	}
+
+	private scheduleFolderStateSync(): void {
+		if (this.disposed) {
+			return;
+		}
+		if (this.folderSyncTimer !== null) {
+			clearLiveSyncTimeout(this.folderSyncTimer);
+		}
+		this.folderSyncTimer = setLiveSyncTimeout(() => {
+			this.folderSyncTimer = null;
+			void this.publishFolderState();
+		}, FOLDER_SYNC_DEBOUNCE_MS);
+	}
+
+	private async publishFolderState(): Promise<void> {
+		const client = this.host.getFileSyncClient?.() ?? null;
+		const convexSecret = this.host.settings.convexSecret.trim();
+		const clientId = this.host.getPresenceSessionId?.() ?? "";
+		if (!client || convexSecret.length === 0 || clientId.length === 0 || this.disposed) {
+			return;
+		}
+		try {
+			const localState = await listLocalEntries({ app: this.host.app } as never);
+			const folderPaths = localState.folders.filter(
+				(path) => normalizePath(path).trim() !== "",
+			);
+			const emptyFolderPaths = localState.emptyFolders.filter(
+				(path) => normalizePath(path).trim() !== "",
+			);
+			await client.mutation(api.fileSync.syncFolderState, {
+				convexSecret,
+				scannedAtMs: Date.now(),
+				clientId,
+				folderPaths,
+				emptyFolderPaths,
+			});
+			this.host.setStatus("Convex sync: folders synced");
+		} catch (error) {
+			console.warn("[live-sync] folder state sync skipped", {
+				message: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	private async applyRemoteFolderSnapshot(
+		rows: FolderSnapshotRow[],
+	): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		const next = new Map<string, FolderSnapshotRow>();
+		for (const row of rows) {
+			const path = normalizePath(row.path);
+			if (path.trim() === "" || shouldIgnoreVaultPath(path)) {
+				continue;
+			}
+			next.set(path, { ...row, path });
+		}
+
+		const previous = this.remoteFolders;
+		this.remoteFolders = next;
+
+		for (const row of next.values()) {
+			if (row.isExplicitlyEmpty) {
+				await this.applyRemoteFolderCreate(row.path);
+			}
+		}
+		if (!previous) {
+			return;
+		}
+		for (const path of previous.keys()) {
+			if (!next.has(path)) {
+				await this.applyRemoteFolderDelete(path);
+			}
+		}
+	}
+
+	private async applyRemoteFolderCreate(path: string): Promise<void> {
+		const existing = this.host.app.vault.getAbstractFileByPath(path);
+		if (existing instanceof TFolder) {
+			return;
+		}
+		const suppressedPaths = folderAncestry(path);
+		for (const suppressedPath of suppressedPaths) {
+			this.suppressPathEvents.add(suppressedPath);
+		}
+		try {
+			await ensureVaultFolderExists(this.host.app, path);
+			this.host.setStatus(`Convex sync: folder created ${path}`);
+		} finally {
+			queueMicrotask(() => {
+				for (const suppressedPath of suppressedPaths) {
+					this.suppressPathEvents.delete(suppressedPath);
+				}
+			});
+		}
+	}
+
+	private async applyRemoteFolderDelete(path: string): Promise<void> {
+		const existing = this.host.app.vault.getAbstractFileByPath(path);
+		if (!(existing instanceof TFolder) || !isEmptySyncedFolder(existing)) {
+			return;
+		}
+		this.suppressPathEvents.add(path);
+		try {
+			await this.host.app.vault.delete(existing);
+			this.host.setStatus(`Convex sync: folder deleted ${path}`);
+		} finally {
+			queueMicrotask(() => {
+				this.suppressPathEvents.delete(path);
+			});
+		}
+	}
+
 	private async reconcileOpenEditor(binding: OpenEditorBinding): Promise<void> {
 		if (this.disposed || this.current !== binding || binding.adapter.isApplyingRemote()) {
 			return;
@@ -351,15 +538,12 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			return;
 		}
 		const localText = binding.editor.getValue();
-		const result = await engine.reconcilePath(binding.file.path, localText, {
-			onBeforeFallbackMerge: async () => {
-				await this.createMergeBackup(binding.file, localText);
-			},
-		});
+		const result = await engine.reconcilePath(binding.file.path, localText);
 		if (this.current !== binding || binding.editor.getValue() !== localText) {
 			return;
 		}
 		this.applyRemoteText(binding.editor, result.text, binding.adapter);
+		await this.mirrorTextSnapshot(binding.file.path, result.text);
 	}
 
 	private async reconcileClosedFile(
@@ -371,16 +555,11 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (!engine || this.disposed) {
 			return;
 		}
-		const result = await engine.reconcilePath(path, localText, {
-			onBeforeFallbackMerge: async () => {
-				if (file) {
-					await this.createMergeBackup(file, localText);
-				}
-			},
-		});
+		const result = await engine.reconcilePath(path, localText);
 		if (result.text !== localText) {
 			await this.writePathText(path, result.text);
 		}
+		await this.mirrorTextSnapshot(path, result.text);
 	}
 
 	private async syncModifiedFile(file: TFile): Promise<void> {
@@ -408,6 +587,9 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	private async applyRemotePathChanges(changes: DocPathChange[]): Promise<void> {
 		for (const change of changes) {
 			const path = normalizePath(change.path);
+			if (isMergeBackupPath(path)) {
+				continue;
+			}
 			if (change.deletedAtMs !== null) {
 				await this.applyRemoteDelete(path);
 			} else {
@@ -449,6 +631,9 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			await engine.bindRemotePath(change.docId, path);
 		}
 		if (this.isCurrentOpenPath(path, change.docId)) {
+			if (change.updatedByClientId === engine.getClientId() && this.current) {
+				await this.mirrorTextSnapshot(path, this.current.editor.getValue());
+			}
 			return;
 		}
 		const existing = this.host.app.vault.getAbstractFileByPath(path);
@@ -490,6 +675,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 				}
 			}
 			await engine.bindRemotePath(docId, newPath);
+			await this.removeSnapshotPath(oldPath);
 			this.host.setStatus(`Convex sync: renamed ${newPath}`);
 		} finally {
 			queueMicrotask(() => {
@@ -532,23 +718,50 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 	}
 
-	private async createMergeBackup(file: TFile, text: string): Promise<void> {
-		const backupPath = nextBackupPath(file.path, new Date());
-		let candidatePath = backupPath;
-		this.suppressPathEvents.add(candidatePath);
+	private async mirrorTextSnapshot(path: string, text: string): Promise<void> {
+		const client = this.host.getFileSyncClient?.() ?? null;
+		const clientId = this.host.getPresenceSessionId?.() ?? "";
+		const convexSecret = this.host.settings.convexSecret.trim();
+		if (!client || convexSecret.length === 0 || clientId.length === 0 || this.disposed) {
+			return;
+		}
+		const encoded = new TextEncoder().encode(text);
 		try {
-			await ensureVaultFolderExists(this.host.app, folderPathForFile(backupPath));
-			let attempt = 1;
-			while (this.host.app.vault.getAbstractFileByPath(candidatePath)) {
-				this.suppressPathEvents.delete(candidatePath);
-				candidatePath = appendBackupSuffix(backupPath, attempt);
-				this.suppressPathEvents.add(candidatePath);
-				attempt += 1;
-			}
-			await this.host.app.vault.create(candidatePath, text);
-		} finally {
-			queueMicrotask(() => {
-				this.suppressPathEvents.delete(candidatePath);
+			await uploadLocalFile(
+				client,
+				convexSecret,
+				clientId,
+				normalizePath(path),
+				encoded.buffer.slice(
+					encoded.byteOffset,
+					encoded.byteOffset + encoded.byteLength,
+				) as ArrayBuffer,
+				Date.now(),
+				{ force: true },
+			);
+		} catch (error) {
+			console.warn("[live-sync] vaultFiles mirror skipped", {
+				path,
+				message: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	private async removeSnapshotPath(path: string): Promise<void> {
+		const client = this.host.getFileSyncClient?.() ?? null;
+		const convexSecret = this.host.settings.convexSecret.trim();
+		if (!client || convexSecret.length === 0 || this.disposed) {
+			return;
+		}
+		try {
+			await client.mutation(api.fileSync.removeFilesByPath, {
+				convexSecret,
+				removedPaths: [normalizePath(path)],
+			});
+		} catch (error) {
+			console.warn("[live-sync] vaultFiles delete skipped", {
+				path,
+				message: error instanceof Error ? error.message : String(error),
 			});
 		}
 	}
@@ -558,7 +771,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (timer === undefined) {
 			return;
 		}
-		window.clearTimeout(timer);
+		clearLiveSyncTimeout(timer);
 		this.pendingModifyTimers.delete(path);
 	}
 
@@ -568,31 +781,37 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 		return docId === undefined || this.current.session.docId === docId;
 	}
-}
 
-function nextBackupPath(path: string, now: Date): string {
-	const timestamp = [
-		now.getFullYear(),
-		pad(now.getMonth() + 1),
-		pad(now.getDate()),
-	].join("") + `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-	const extensionIndex = path.lastIndexOf(".");
-	if (extensionIndex <= 0) {
-		return `${path}.convex-merge-backup-${timestamp}.md`;
+	private shouldIgnoreVaultEventPath(path: string): boolean {
+		return (
+			this.disposed ||
+			path.trim() === "" ||
+			shouldIgnoreVaultPath(path) ||
+			this.suppressPathEvents.has(path)
+		);
 	}
-	const stem = path.slice(0, extensionIndex);
-	const extension = path.slice(extensionIndex);
-	return `${stem}.convex-merge-backup-${timestamp}${extension}`;
 }
 
-function appendBackupSuffix(path: string, attempt: number): string {
-	const extensionIndex = path.lastIndexOf(".");
-	if (extensionIndex <= 0) {
-		return `${path}-${attempt}`;
+function isEmptySyncedFolder(folder: TFolder): boolean {
+	return folder.children.every((child) =>
+		shouldIgnoreVaultPath(normalizePath(child.path)),
+	);
+}
+
+function folderAncestry(path: string): string[] {
+	const normalized = normalizePath(path);
+	const parts = normalized.split("/").filter(Boolean);
+	const paths: string[] = [];
+	for (let index = 0; index < parts.length; index += 1) {
+		paths.push(parts.slice(0, index + 1).join("/"));
 	}
-	return `${path.slice(0, extensionIndex)}-${attempt}${path.slice(extensionIndex)}`;
+	return paths;
 }
 
-function pad(value: number): string {
-	return value.toString().padStart(2, "0");
+function setLiveSyncTimeout(callback: () => void, delayMs: number): number {
+	return globalThis.setTimeout(callback, delayMs) as unknown as number;
+}
+
+function clearLiveSyncTimeout(timer: number): void {
+	globalThis.clearTimeout(timer);
 }

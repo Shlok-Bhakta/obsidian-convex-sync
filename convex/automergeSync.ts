@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import type { MutationCtx } from "./_generated/server";
 import { requirePluginSecret } from "./security";
 import { hash as sha256 } from "fast-sha256";
 
@@ -70,6 +71,13 @@ export const submitChanges = mutation({
 				serverCursor = Math.max(serverCursor, row._creationTime);
 			}
 			inserted += 1;
+		}
+		if (inserted > 0) {
+			await touchDocPathsForContentChange(ctx, {
+				docId: args.docId,
+				clientId: args.clientId,
+				updatedAtMs: Date.now(),
+			});
 		}
 
 		return {
@@ -268,6 +276,7 @@ export const listDocPathChanges = query({
 				path: row.path,
 				docId: row.docId,
 				updatedAtMs: row.updatedAtMs,
+				updatedByClientId: row.createdByClientId,
 				deletedAtMs: row.deletedAtMs ?? null,
 			})),
 		};
@@ -292,6 +301,25 @@ function maxCreationTime(
 function hashBytes(binary: Uint8Array): string {
 	const hash = sha256(binary);
 	return Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function touchDocPathsForContentChange(
+	ctx: MutationCtx,
+	args: { docId: string; clientId: string; updatedAtMs: number },
+): Promise<void> {
+	const paths = await ctx.db
+		.query("automergeDocPaths")
+		.withIndex("by_docId", (q) => q.eq("docId", args.docId))
+		.collect();
+	for (const path of paths) {
+		if (path.deletedAtMs !== undefined) {
+			continue;
+		}
+		await ctx.db.patch(path._id, {
+			updatedAtMs: Math.max(path.updatedAtMs + 1, args.updatedAtMs),
+			createdByClientId: args.clientId,
+		});
+	}
 }
 
 function normalizePath(input: string): string {

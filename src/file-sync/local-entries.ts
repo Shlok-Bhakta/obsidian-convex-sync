@@ -13,24 +13,33 @@ import type {
 	LocalFileEntry,
 } from "./types";
 
-function listEmptyFolders(app: App): string[] {
+export function listVaultFolders(app: App): {
+	folders: string[];
+	emptyFolders: string[];
+} {
 	const all = app.vault.getAllLoadedFiles();
-	const empty: string[] = [];
+	const folders: string[] = [];
+	const emptyFolders: string[] = [];
 	for (const entry of all) {
 		if (!(entry instanceof TFolder)) {
 			continue;
 		}
-		if (entry.path.trim() === "") {
+		const path = normalizePath(entry.path);
+		if (path.trim() === "") {
 			continue;
 		}
-		if (shouldIgnoreVaultPath(normalizePath(entry.path))) {
+		if (shouldIgnoreVaultPath(path)) {
 			continue;
 		}
-		if (entry.children.length === 0) {
-			empty.push(normalizePath(entry.path));
+		folders.push(path);
+		const syncedChildren = entry.children.filter(
+			(child) => !shouldIgnoreVaultPath(normalizePath(child.path)),
+		);
+		if (syncedChildren.length === 0) {
+			emptyFolders.push(path);
 		}
 	}
-	return empty;
+	return { folders, emptyFolders };
 }
 
 async function listDotObsidianEntries(
@@ -38,9 +47,10 @@ async function listDotObsidianEntries(
 ): Promise<LocalEntriesState> {
 	const rootExists = await host.app.vault.adapter.exists(OBSIDIAN_ROOT);
 	if (!rootExists) {
-		return { files: [], emptyFolders: [] };
+		return { files: [], folders: [], emptyFolders: [] };
 	}
 	const files: LocalFileEntry[] = [];
+	const folders: string[] = [];
 	const emptyFolders: string[] = [];
 	const queue: string[] = [OBSIDIAN_ROOT];
 	while (queue.length > 0) {
@@ -48,6 +58,7 @@ async function listDotObsidianEntries(
 		if (!current || shouldIgnoreVaultPath(current)) {
 			continue;
 		}
+		folders.push(normalizePath(current));
 		const listed = await host.app.vault.adapter.list(current);
 		const syncedFiles = listed.files.filter((filePath) => !shouldIgnoreVaultPath(filePath));
 		const syncedFolders = listed.folders.filter(
@@ -80,7 +91,7 @@ async function listDotObsidianEntries(
 			queue.push(normalizePath(folderPath));
 		}
 	}
-	return { files, emptyFolders };
+	return { files, folders, emptyFolders };
 }
 
 export async function listLocalEntries(
@@ -106,9 +117,11 @@ export async function listLocalEntries(
 	for (const entry of dotObsidian.files) {
 		byPath.set(entry.path, entry);
 	}
+	const vaultFolders = listVaultFolders(host.app);
 
 	return {
 		files: [...byPath.values()],
-		emptyFolders: [...listEmptyFolders(host.app), ...dotObsidian.emptyFolders],
+		folders: [...vaultFolders.folders, ...dotObsidian.folders],
+		emptyFolders: [...vaultFolders.emptyFolders, ...dotObsidian.emptyFolders],
 	};
 }

@@ -12,6 +12,7 @@ import {
 	startObsidianLiveSync,
 	type LiveSyncController,
 } from "./obsidian/live-sync";
+import { ResetLocalSyncStateModal } from "./obsidian/reset-local-sync-modal";
 import {
 	ensureVaultSecretRegisteredWithDeployment,
 	mintVaultApiSecretFromConvexSite,
@@ -22,6 +23,7 @@ import {
 	ConvexSyncSettingTab,
 	type MyPluginSettings,
 } from "./settings";
+import { resetLocalSyncState } from "./storage/reset-local-sync-state";
 
 export default class ObsidianConvexSyncPlugin extends Plugin {
 	settings: MyPluginSettings = { ...DEFAULT_SETTINGS };
@@ -113,6 +115,17 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 				void this.reloadLiveSync();
 			},
 		});
+		this.addCommand({
+			id: "reset-local-sync-state",
+			name: "Reset local Convex sync state",
+			callback: () => {
+				const modal = new ResetLocalSyncStateModal(this.app);
+				modal.onConfirm = () => {
+					void this.resetLocalSyncState();
+				};
+				modal.open();
+			},
+		});
 
 		this.addSettingTab(new ConvexSyncSettingTab(this.app, this));
 
@@ -157,8 +170,32 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			app: this.app,
 			settings: this.settings,
 			getRealtimeClient: () => this.getConvexRealtimeClient(),
+			getFileSyncClient: () => this.getConvexHttpClient(),
+			getPresenceSessionId: () => this.getPresenceSessionId(),
 			setStatus: (text) => this.syncStatusBarItemEl?.setText(text),
 		});
+	}
+
+	private async resetLocalSyncState(): Promise<void> {
+		this.syncStatusBarItemEl?.setText("Convex sync: resetting local state...");
+		try {
+			await this.liveSync?.dispose();
+			this.liveSync = null;
+			const result = await resetLocalSyncState(this.app.vault.getName());
+			console.info("[plugin] local sync state reset", {
+				databaseNames: result.databaseNames,
+			});
+			new Notice("Convex sync: local sync state reset. Restarting live sync.", 8000);
+			await this.reloadLiveSync();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.syncStatusBarItemEl?.setText("Convex sync: reset failed");
+			new Notice(`Convex sync reset failed: ${message}`, 10000);
+			console.error(error);
+			await this.reloadLiveSync().catch((reloadError: unknown) => {
+				console.error(reloadError);
+			});
+		}
 	}
 
 	async ensureConvexSecretRegisteredWithDeployment(): Promise<void> {

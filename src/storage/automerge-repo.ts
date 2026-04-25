@@ -17,6 +17,10 @@ type AutomergeRepoStoreOptions = {
 	storageAdapter?: StorageAdapterInterface;
 };
 
+export function automergeRepoDatabaseName(vaultId: string): string {
+	return `automerge-repo-${vaultId}`;
+}
+
 export class AutomergeRepoStore {
 	readonly repo: Repo;
 	readonly storageAdapter: StorageAdapterInterface;
@@ -37,7 +41,7 @@ export class AutomergeRepoStore {
 	}
 
 	static async open(options: AutomergeRepoStoreOptions): Promise<AutomergeRepoStore> {
-		const databaseName = `automerge-repo-${options.vaultId}`;
+		const databaseName = automergeRepoDatabaseName(options.vaultId);
 		const storageAdapter =
 			options.storageAdapter ?? new IndexedDBStorageAdapter(databaseName);
 		await storageAdapter.load(["repo", "init"]);

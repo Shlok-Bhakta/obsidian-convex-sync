@@ -39,5 +39,6 @@ export type LocalFileEntry = {
 
 export type LocalEntriesState = {
 	files: LocalFileEntry[];
+	folders: string[];
 	emptyFolders: string[];
 };

@@ -1,6 +1,9 @@
 import { ConvexError } from "convex/values";
 import { describe, expect, test } from "vitest";
-import { normalizeVaultPath } from "../../convex/_lib/path";
+import {
+	normalizeOptionalVaultPath,
+	normalizeVaultPath,
+} from "../../convex/_lib/path";
 
 describe("normalizeVaultPath", () => {
 	test("normalizes_slashes_and_outer_whitespace", () => {
@@ -18,5 +21,17 @@ describe("normalizeVaultPath", () => {
 
 	test("rejects_empty_paths", () => {
 		expect(() => normalizeVaultPath(" / ")).toThrow(ConvexError);
+	});
+});
+
+describe("normalizeOptionalVaultPath", () => {
+	test("returns_null_for_empty_paths", () => {
+		expect(normalizeOptionalVaultPath(" / ")).toBeNull();
+	});
+
+	test("still_rejects_path_traversal_segments", () => {
+		expect(() => normalizeOptionalVaultPath("../secret.md")).toThrow(
+			ConvexError,
+		);
 	});
 });

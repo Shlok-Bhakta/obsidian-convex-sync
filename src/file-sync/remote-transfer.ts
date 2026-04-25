@@ -25,7 +25,11 @@ export async function readRemoteFileBytes(
 	if (!signed) {
 		return null;
 	}
-	const response = await fetch(signed.url, { method: "GET", cache: "no-store" });
+	const response = await fetchWithPathContext(
+		signed.url,
+		{ method: "GET", cache: "no-store" },
+		`Failed downloading ${path}`,
+	);
 	if (!response.ok) {
 		throw new Error(`Failed downloading ${path}: HTTP ${response.status}`);
 	}
@@ -40,6 +44,7 @@ export async function uploadLocalFile(
 	path: string,
 	bytes: ArrayBuffer,
 	updatedAtMs: number,
+	options: { force?: boolean } = {},
 ): Promise<"ok" | "stale_write"> {
 	const blob = new Blob([bytes], { type: "application/octet-stream" });
 	const contentHash = await sha256Bytes(bytes);
@@ -51,13 +56,17 @@ export async function uploadLocalFile(
 		sizeBytes: blob.size,
 		clientId,
 	});
-	const uploadResponse = await fetch(issued.uploadUrl, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/octet-stream",
+	const uploadResponse = await fetchWithPathContext(
+		issued.uploadUrl,
+		{
+			method: "POST",
+			headers: {
+				"Content-Type": "application/octet-stream",
+			},
+			body: blob,
 		},
-		body: blob,
-	});
+		`Upload failed for ${path}`,
+	);
 	if (!uploadResponse.ok) {
 		throw new Error(`Upload failed for ${path}: HTTP ${uploadResponse.status}`);
 	}
@@ -65,7 +74,7 @@ export async function uploadLocalFile(
 	if (!payload.storageId) {
 		throw new Error(`Upload did not return storageId for ${path}`);
 	}
-	const finalized = await client.mutation(api.fileSync.finalizeUpload, {
+	const finalized = await finalizeUploadedFile(client, {
 		convexSecret: secret,
 		path,
 		storageId: payload.storageId as never,
@@ -73,9 +82,62 @@ export async function uploadLocalFile(
 		updatedAtMs,
 		sizeBytes: blob.size,
 		clientId,
+		force: options.force,
 	});
 	if (!finalized.ok && finalized.reason === "stale_write") {
 		return "stale_write";
 	}
 	return "ok";
+}
+
+type FinalizeUploadArgs = {
+	convexSecret: string;
+	path: string;
+	storageId: never;
+	contentHash: string;
+	updatedAtMs: number;
+	sizeBytes: number;
+	clientId: string;
+	force?: boolean;
+};
+
+type FinalizeUploadResult = { ok: true } | { ok: false; reason: "stale_write" };
+
+async function finalizeUploadedFile(
+	client: ConvexHttpClient,
+	args: FinalizeUploadArgs,
+): Promise<FinalizeUploadResult> {
+	try {
+		return (await client.mutation(
+			api.fileSync.finalizeUpload,
+			args,
+		)) as FinalizeUploadResult;
+	} catch (error) {
+		if (!args.force || !isUnknownForceArgError(error)) {
+			throw error;
+		}
+		const { force: _force, ...retryArgs } = args;
+		return (await client.mutation(
+			api.fileSync.finalizeUpload,
+			retryArgs,
+		)) as FinalizeUploadResult;
+	}
+}
+
+function isUnknownForceArgError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes("force") && message.includes("Unexpected");
+}
+
+async function fetchWithPathContext(
+	input: RequestInfo | URL,
+	init: RequestInit,
+	context: string,
+): Promise<Response> {
+	try {
+		return await fetch(input, init);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`${context}: ${message}`);
+	}
 }

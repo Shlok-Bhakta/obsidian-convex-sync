@@ -260,6 +260,10 @@ export class SyncEngine {
 		}
 	}
 
+	getClientId(): string {
+		return this.clientId;
+	}
+
 	watchPathChanges(onChanges: (changes: DocPathChange[]) => void): () => void {
 		return this.requireTransport().watchDocPathChanges(onChanges);
 	}

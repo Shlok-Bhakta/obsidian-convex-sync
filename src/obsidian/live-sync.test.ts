@@ -4,6 +4,7 @@ const openDocMock = vi.fn();
 const reconcilePathMock = vi.fn();
 const engineDisposeMock = vi.fn();
 const watchPathChangesMock = vi.fn(() => () => undefined);
+const uploadLocalFileMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../core/sync-engine", () => ({
 	SyncEngine: {
@@ -16,15 +17,28 @@ vi.mock("../core/sync-engine", () => ({
 	},
 }));
 
+vi.mock("../file-sync/remote-transfer", () => ({
+	uploadLocalFile: uploadLocalFileMock,
+}));
+
 vi.mock("obsidian", () => {
 	class TAbstractFile {}
 	class TFile extends TAbstractFile {
 		basename: string;
 		extension: string;
+		stat = { mtime: 1 };
 		constructor(public path: string) {
 			super();
 			this.basename = path.replace(/.*\//, "").replace(/\.[^.]+$/, "");
 			this.extension = path.split(".").pop() ?? "";
+		}
+	}
+	class TFolder extends TAbstractFile {
+		constructor(
+			public path: string,
+			public children: TAbstractFile[] = [],
+		) {
+			super();
 		}
 	}
 	class MarkdownView {
@@ -42,16 +56,20 @@ vi.mock("obsidian", () => {
 	return {
 		TAbstractFile,
 		TFile,
+		TFolder,
 		MarkdownView,
 		Notice,
 		normalizePath: (path: string) => path,
 	};
 });
 
-import { MarkdownView, TFile } from "obsidian";
+import { MarkdownView, TFile, TFolder } from "obsidian";
 import { startObsidianLiveSync } from "./live-sync";
 
 const TFileCtor = TFile as unknown as { new (path: string): TFile };
+const TFolderCtor = TFolder as unknown as {
+	new (path: string, children?: Array<TFile | TFolder>): TFolder;
+};
 const MarkdownViewCtor = MarkdownView as unknown as {
 	new (
 		file: TFile,
@@ -65,6 +83,7 @@ describe("startObsidianLiveSync", () => {
 		reconcilePathMock.mockReset();
 		engineDisposeMock.mockReset();
 		watchPathChangesMock.mockReset();
+		uploadLocalFileMock.mockReset();
 		watchPathChangesMock.mockReturnValue(() => undefined);
 	});
 
@@ -200,6 +219,139 @@ describe("startObsidianLiveSync", () => {
 		expect(editor.getValue()).toBe("local newer");
 		await controller.dispose();
 	});
+
+	test("active editor reconcile mirrors text into vaultFiles snapshot", async () => {
+		const editor = createEditor("local");
+		const file = new TFileCtor("note.md");
+		const app = createApp(new MarkdownViewCtor(file, editor), [[file.path, file]]);
+		openDocMock.mockResolvedValue(createSession());
+		reconcilePathMock.mockResolvedValue({
+			docId: "doc-1",
+			path: file.path,
+			text: "snapshot text",
+			changed: true,
+			usedFallbackBackup: false,
+		});
+		uploadLocalFileMock.mockResolvedValue("ok");
+
+		const controller = startObsidianLiveSync({
+			app: app as never,
+			settings: { convexSecret: "secret" } as never,
+			getRealtimeClient: () => ({}) as never,
+			getFileSyncClient: () => ({}) as never,
+			getPresenceSessionId: () => "client-1",
+			setStatus: () => undefined,
+		});
+
+		await vi.waitFor(() => expect(uploadLocalFileMock).toHaveBeenCalledTimes(1));
+		const call = uploadLocalFileMock.mock.calls[0];
+		expect(call).toBeDefined();
+		const [, secret, clientId, path, bytes, , options] = call!;
+		expect(secret).toBe("secret");
+		expect(clientId).toBe("client-1");
+		expect(path).toBe("note.md");
+		expect(new TextDecoder().decode(new Uint8Array(bytes))).toBe("snapshot text");
+		expect(options).toEqual({ force: true });
+		await controller.dispose();
+	});
+
+	test("folder create publishes folder snapshot", async () => {
+		vi.useFakeTimers();
+		try {
+			const editor = createEditor("local");
+			const file = new TFileCtor("note.md");
+			const folder = new TFolderCtor("new-folder");
+			const app = createApp(new MarkdownViewCtor(file, editor), [
+				[file.path, file],
+				[folder.path, folder],
+			]);
+			const mutation = vi.fn(async (_fn: unknown, _args: unknown) => undefined);
+			const fileSyncClient = { mutation };
+			openDocMock.mockResolvedValue(createSession());
+			reconcilePathMock.mockResolvedValue({
+				docId: "doc-1",
+				path: file.path,
+				text: "local",
+				changed: false,
+				usedFallbackBackup: false,
+			});
+
+			const controller = startObsidianLiveSync({
+				app: app as never,
+				settings: { convexSecret: "secret" } as never,
+				getRealtimeClient: () => ({}) as never,
+				getFileSyncClient: () => fileSyncClient as never,
+				getPresenceSessionId: () => "client-1",
+				setStatus: () => undefined,
+			});
+
+			app.vault.emit("create", folder);
+			await vi.advanceTimersByTimeAsync(300);
+
+			expect(mutation).toHaveBeenCalledTimes(1);
+			const args = mutation.mock.calls[0]?.[1] as {
+				folderPaths: string[];
+				emptyFolderPaths: string[];
+			};
+			expect(args.folderPaths).toContain("new-folder");
+			expect(args.emptyFolderPaths).toContain("new-folder");
+			await controller.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("remote folder snapshots create and delete empty folders", async () => {
+		const editor = createEditor("local");
+		const file = new TFileCtor("note.md");
+		const app = createApp(new MarkdownViewCtor(file, editor), [[file.path, file]]);
+		let onFolderSnapshot: ((rows: unknown[]) => void) | null = null;
+		const realtimeClient = {
+			onUpdate: vi.fn((_query, _args, callback: (rows: unknown[]) => void) => {
+				onFolderSnapshot = callback;
+				return () => undefined;
+			}),
+		};
+		openDocMock.mockResolvedValue(createSession());
+		reconcilePathMock.mockResolvedValue({
+			docId: "doc-1",
+			path: file.path,
+			text: "local",
+			changed: false,
+			usedFallbackBackup: false,
+		});
+
+		const controller = startObsidianLiveSync({
+			app: app as never,
+			settings: { convexSecret: "secret" } as never,
+			getRealtimeClient: () => realtimeClient as never,
+			setStatus: () => undefined,
+		});
+
+		expect(onFolderSnapshot).not.toBeNull();
+		const emitFolderSnapshot = onFolderSnapshot as unknown as (
+			rows: unknown[],
+		) => void;
+		emitFolderSnapshot([
+			{
+				path: "remote-empty",
+				updatedAtMs: 1,
+				isExplicitlyEmpty: true,
+				updatedByClientId: "peer",
+			},
+		]);
+		await vi.waitFor(() =>
+			expect(app.vault.getAbstractFileByPath("remote-empty")).toBeInstanceOf(
+				TFolder,
+			),
+		);
+
+		emitFolderSnapshot([]);
+		await vi.waitFor(() =>
+			expect(app.vault.getAbstractFileByPath("remote-empty")).toBeNull(),
+		);
+		await controller.dispose();
+	});
 });
 
 function createEditor(initialValue: string) {
@@ -222,7 +374,10 @@ function createSession() {
 	};
 }
 
-function createApp(view: InstanceType<typeof MarkdownView>, files: Array<[string, TFile]>) {
+function createApp(
+	view: InstanceType<typeof MarkdownView>,
+	files: Array<[string, TFile | TFolder]>,
+) {
 	const fileMap = new Map(files);
 	const workspace = createEventTarget();
 	const vault = createEventTarget();
@@ -234,13 +389,25 @@ function createApp(view: InstanceType<typeof MarkdownView>, files: Array<[string
 		},
 		vault: {
 			...vault,
+			getAllLoadedFiles: () => [...fileMap.values()],
 			cachedRead: vi.fn(async (_file: TFile) => view.editor.getValue()),
 			read: vi.fn(async (_file: TFile) => view.editor.getValue()),
 			modify: vi.fn(async () => undefined),
 			create: vi.fn(async (path: string, _text: string) => {
 				fileMap.set(path, new TFileCtor(path));
 			}),
-			delete: vi.fn(async (file: TFile) => {
+			createFolder: vi.fn(async (path: string) => {
+				const folder = new TFolderCtor(path);
+				fileMap.set(path, folder);
+				const parentPath = path.includes("/")
+					? path.slice(0, path.lastIndexOf("/"))
+					: "";
+				const parent = fileMap.get(parentPath);
+				if (parent instanceof TFolder && !parent.children.includes(folder)) {
+					parent.children.push(folder);
+				}
+			}),
+			delete: vi.fn(async (file: TFile | TFolder) => {
 				fileMap.delete(file.path);
 			}),
 			rename: vi.fn(async (file: TFile, newPath: string) => {
@@ -250,6 +417,13 @@ function createApp(view: InstanceType<typeof MarkdownView>, files: Array<[string
 			}),
 			getAbstractFileByPath: (path: string) => fileMap.get(path) ?? null,
 			getName: () => "vault",
+			adapter: {
+				exists: vi.fn(async () => false),
+				list: vi.fn(async () => ({ files: [], folders: [] })),
+				stat: vi.fn(async () => null),
+				readBinary: vi.fn(async () => new ArrayBuffer(0)),
+				writeBinary: vi.fn(async () => undefined),
+			},
 		},
 	};
 }
