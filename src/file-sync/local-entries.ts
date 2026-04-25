@@ -42,7 +42,7 @@ export function listVaultFolders(app: App): {
 	return { folders, emptyFolders };
 }
 
-async function listDotObsidianEntries(
+export async function listDotObsidianEntries(
 	host: FileSyncHost,
 ): Promise<LocalEntriesState> {
 	const rootExists = await host.app.vault.adapter.exists(OBSIDIAN_ROOT);

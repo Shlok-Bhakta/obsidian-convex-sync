@@ -27,7 +27,12 @@ import { isMergeBackupPath } from "../lib/merge-backups";
 import { folderPathForFile } from "../lib/path";
 import { uploadLocalFile } from "../file-sync/remote-transfer";
 import { listLocalEntries } from "../file-sync/local-entries";
-import { shouldIgnoreVaultPath } from "../file-sync/path-rules";
+import { isDotObsidianPath, shouldIgnoreVaultPath } from "../file-sync/path-rules";
+import {
+	applyDotObsidianSnapshot,
+	showConfigRestartNotice,
+} from "../file-sync/config-sync";
+import type { Snapshot } from "../file-sync/types";
 
 export type LiveSyncHost = {
 	app: App;
@@ -76,8 +81,12 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	private readonly vaultRefs: EventRef[] = [];
 	private pathChangesUnsubscribe: (() => void) | null = null;
 	private folderSnapshotUnsubscribe: (() => void) | null = null;
+	private configSnapshotUnsubscribe: (() => void) | null = null;
 	private folderSyncTimer: number | null = null;
+	private configSnapshotTimer: number | null = null;
 	private remoteFolders: Map<string, FolderSnapshotRow> | null = null;
+	private latestConfigSnapshot: Snapshot | null = null;
+	private lastConfigSnapshotSignature: string | null = null;
 	private disposing: Promise<void> | null = null;
 	private disposed = false;
 	private started = false;
@@ -120,6 +129,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			}),
 		);
 		this.startFolderSnapshotWatch();
+		this.startConfigSnapshotWatch();
 		void this.openActiveFile();
 	}
 
@@ -281,6 +291,8 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		this.pathChangesUnsubscribe = null;
 		this.folderSnapshotUnsubscribe?.();
 		this.folderSnapshotUnsubscribe = null;
+		this.configSnapshotUnsubscribe?.();
+		this.configSnapshotUnsubscribe = null;
 		for (const ref of this.workspaceRefs.splice(0)) {
 			this.host.app.workspace.offref(ref);
 		}
@@ -294,6 +306,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (this.folderSyncTimer !== null) {
 			clearLiveSyncTimeout(this.folderSyncTimer);
 			this.folderSyncTimer = null;
+		}
+		if (this.configSnapshotTimer !== null) {
+			clearLiveSyncTimeout(this.configSnapshotTimer);
+			this.configSnapshotTimer = null;
 		}
 		this.current?.session.close();
 		this.current = null;
@@ -421,6 +437,87 @@ class ObsidianLiveSyncController implements LiveSyncController {
 				void this.applyRemoteFolderSnapshot(rows as FolderSnapshotRow[]);
 			},
 		);
+	}
+
+	private startConfigSnapshotWatch(): void {
+		const client = this.host.getRealtimeClient();
+		const fileSyncClient = this.host.getFileSyncClient?.() ?? null;
+		const convexSecret = this.host.settings.convexSecret.trim();
+		if (
+			!client ||
+			!fileSyncClient ||
+			convexSecret.length === 0 ||
+			this.configSnapshotUnsubscribe
+		) {
+			return;
+		}
+		if (typeof client.onUpdate !== "function") {
+			return;
+		}
+		this.configSnapshotUnsubscribe = client.onUpdate(
+			api.fileSync.listSnapshot,
+			{ convexSecret },
+			(snapshot) => {
+				this.handleConfigSnapshot(snapshot as Snapshot);
+			},
+		);
+	}
+
+	private handleConfigSnapshot(snapshot: Snapshot): void {
+		if (this.disposed) {
+			return;
+		}
+		const signature = configSnapshotSignature(snapshot);
+		if (this.lastConfigSnapshotSignature === null) {
+			this.lastConfigSnapshotSignature = signature;
+			return;
+		}
+		if (signature === this.lastConfigSnapshotSignature) {
+			return;
+		}
+		this.lastConfigSnapshotSignature = signature;
+		this.latestConfigSnapshot = snapshot;
+		if (this.configSnapshotTimer !== null) {
+			clearLiveSyncTimeout(this.configSnapshotTimer);
+		}
+		this.configSnapshotTimer = setLiveSyncTimeout(() => {
+			this.configSnapshotTimer = null;
+			const latest = this.latestConfigSnapshot;
+			this.latestConfigSnapshot = null;
+			if (latest) {
+				void this.applyRemoteConfigSnapshot(latest);
+			}
+		}, 750);
+	}
+
+	private async applyRemoteConfigSnapshot(snapshot: Snapshot): Promise<void> {
+		const client = this.host.getFileSyncClient?.() ?? null;
+		const convexSecret = this.host.settings.convexSecret.trim();
+		if (!client || convexSecret.length === 0 || this.disposed) {
+			return;
+		}
+		try {
+			const result = await applyDotObsidianSnapshot(
+				{
+					app: this.host.app,
+					settings: this.host.settings,
+					getConvexHttpClient: () => client,
+				},
+				snapshot,
+			);
+			const changed =
+				result.filesDownloaded > 0 ||
+				result.localFilesDeleted > 0 ||
+				result.foldersSynced > 0;
+			if (changed) {
+				this.host.setStatus("Convex sync: .obsidian updated");
+				showConfigRestartNotice();
+			}
+		} catch (error) {
+			console.warn("[live-sync] .obsidian config pull skipped", {
+				message: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	private scheduleFolderStateSync(): void {
@@ -827,4 +924,25 @@ function setLiveSyncTimeout(callback: () => void, delayMs: number): number {
 
 function clearLiveSyncTimeout(timer: number): void {
 	globalThis.clearTimeout(timer);
+}
+
+function configSnapshotSignature(snapshot: Snapshot): string {
+	const files = snapshot.files
+		.filter((file) => isSyncedDotObsidianPath(file.path))
+		.map(
+			(file) =>
+				`f:${normalizePath(file.path)}:${file.contentHash}:${file.updatedAtMs}:${file.updatedByClientId}`,
+		);
+	const folders = snapshot.folders
+		.filter((folder) => isSyncedDotObsidianPath(folder.path))
+		.map(
+			(folder) =>
+				`d:${normalizePath(folder.path)}:${folder.updatedAtMs}:${folder.isExplicitlyEmpty}:${folder.updatedByClientId}`,
+		);
+	return [...files, ...folders].sort().join("\n");
+}
+
+function isSyncedDotObsidianPath(path: string): boolean {
+	const normalized = normalizePath(path);
+	return isDotObsidianPath(normalized) && !shouldIgnoreVaultPath(normalized);
 }

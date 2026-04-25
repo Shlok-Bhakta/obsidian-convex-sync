@@ -100,6 +100,38 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 				text.setValue(this.plugin.settings.convexSecret).setDisabled(true);
 			});
 
+		const canSyncConfig =
+			this.plugin.settings.convexUrl.trim() !== "" &&
+			this.plugin.settings.convexSecret.trim() !== "";
+
+		new Setting(containerEl)
+			.setName(".obsidian config sync")
+			.setDesc(
+				"Push local Obsidian config to Convex or pull the cloud config onto this device. Restart Obsidian after pulling config changes.",
+			)
+			.addButton((button) =>
+				button
+					.setButtonText("Push config")
+					.setTooltip("Overwrite the cloud .obsidian config with this device")
+					.setDisabled(!canSyncConfig)
+					.onClick(async () => {
+						button.setDisabled(true);
+						await this.plugin.pushObsidianConfig();
+						this.display();
+					}),
+			)
+			.addButton((button) =>
+				button
+					.setButtonText("Pull config")
+					.setTooltip("Overwrite local .obsidian config with Convex")
+					.setDisabled(!canSyncConfig)
+					.onClick(async () => {
+						button.setDisabled(true);
+						await this.plugin.pullObsidianConfig();
+						this.display();
+					}),
+			);
+
 		this.renderBootstrapSection(containerEl);
 		if (!this.hasHydratedBootstrapState) {
 			this.hasHydratedBootstrapState = true;

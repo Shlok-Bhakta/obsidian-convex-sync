@@ -1,7 +1,22 @@
 import { v } from "convex/values";
-import { mutation, query } from "./_generated/server";
+import { action, internalQuery, mutation, query } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { normalizeOptionalVaultPath, normalizeVaultPath } from "./_lib/path";
 import { requirePluginSecret } from "./security";
+
+type StorageDescriptor = {
+	storageId: string;
+	contentHash: string;
+	sizeBytes: number;
+	updatedAtMs: number;
+};
+
+type FileBytesResult = {
+	bytes: ArrayBuffer;
+	contentHash: string;
+	sizeBytes: number;
+	updatedAtMs: number;
+} | null;
 
 export const issueUploadUrl = mutation({
 	args: {
@@ -159,6 +174,64 @@ export const getDownloadUrl = query({
 	},
 });
 
+export const getStorageDescriptorByPath = internalQuery({
+	args: { path: v.string() },
+	handler: async (ctx, args) => {
+		const path = normalizeVaultPath(args.path);
+		const row = await ctx.db
+			.query("vaultFiles")
+			.withIndex("by_path", (q) => q.eq("path", path))
+			.unique();
+		if (!row) {
+			return null;
+		}
+		return {
+			storageId: row.storageId,
+			contentHash: row.contentHash,
+			sizeBytes: row.sizeBytes,
+			updatedAtMs: row.updatedAtMs,
+		};
+	},
+});
+
+export const getFileBytes = action({
+	args: { convexSecret: v.string(), path: v.string() },
+	returns: v.union(
+		v.null(),
+		v.object({
+			bytes: v.bytes(),
+			contentHash: v.string(),
+			sizeBytes: v.number(),
+			updatedAtMs: v.number(),
+		}),
+	),
+	handler: async (ctx, args): Promise<FileBytesResult> => {
+		const auth = await ctx.runQuery(internal.security.validatePluginSecret, {
+			secret: args.convexSecret,
+		});
+		if (!auth.ok) {
+			throw new Error("The vault API key is invalid for this Convex deployment.");
+		}
+		const descriptor = (await ctx.runQuery(
+			(internal as any).fileSync.getStorageDescriptorByPath,
+			{ path: args.path },
+		)) as StorageDescriptor | null;
+		if (!descriptor) {
+			return null;
+		}
+		const blob = await ctx.storage.get(descriptor.storageId as never);
+		if (!blob) {
+			return null;
+		}
+		return {
+			bytes: await blob.arrayBuffer(),
+			contentHash: descriptor.contentHash,
+			sizeBytes: descriptor.sizeBytes,
+			updatedAtMs: descriptor.updatedAtMs,
+		};
+	},
+});
+
 export const syncFolderState = mutation({
 	args: {
 		convexSecret: v.string(),
@@ -206,6 +279,66 @@ export const syncFolderState = mutation({
 			normalizedFolders.add(path);
 		}
 		for (const folder of existing) {
+			const stillExists = normalizedFolders.has(folder.path);
+			if (!stillExists) {
+				await ctx.db.delete(folder._id);
+				continue;
+			}
+			const shouldBeEmpty = normalizedEmpty.has(folder.path);
+			if (folder.isExplicitlyEmpty !== shouldBeEmpty) {
+				await ctx.db.patch(folder._id, {
+					updatedAtMs: args.scannedAtMs,
+					isExplicitlyEmpty: shouldBeEmpty,
+					updatedByClientId: args.clientId,
+				});
+			}
+			normalizedFolders.delete(folder.path);
+			normalizedEmpty.delete(folder.path);
+		}
+		for (const path of normalizedFolders) {
+			await ctx.db.insert("vaultFolders", {
+				path,
+				updatedAtMs: args.scannedAtMs,
+				isExplicitlyEmpty: normalizedEmpty.has(path),
+				updatedByClientId: args.clientId,
+			});
+		}
+	},
+});
+
+export const syncFolderStateForRoot = mutation({
+	args: {
+		convexSecret: v.string(),
+		scannedAtMs: v.number(),
+		clientId: v.string(),
+		rootPath: v.string(),
+		folderPaths: v.array(v.string()),
+		emptyFolderPaths: v.array(v.string()),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const rootPath = normalizeVaultPath(args.rootPath);
+		const isWithinRoot = (path: string) =>
+			path === rootPath || path.startsWith(`${rootPath}/`);
+		const normalizedEmpty = new Set(
+			args.emptyFolderPaths
+				.map((path) => normalizeOptionalVaultPath(path))
+				.filter((path): path is string => path !== null && isWithinRoot(path)),
+		);
+		const normalizedFolders = new Set(
+			args.folderPaths
+				.map((path) => normalizeOptionalVaultPath(path))
+				.filter((path): path is string => path !== null && isWithinRoot(path)),
+		);
+		for (const path of normalizedEmpty) {
+			normalizedFolders.add(path);
+		}
+
+		const existing = await ctx.db.query("vaultFolders").collect();
+		for (const folder of existing) {
+			if (!isWithinRoot(folder.path)) {
+				continue;
+			}
 			const stillExists = normalizedFolders.has(folder.path);
 			if (!stillExists) {
 				await ctx.db.delete(folder._id);

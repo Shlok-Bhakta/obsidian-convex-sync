@@ -9,6 +9,10 @@ import {
 import { ConvexClientManager } from "./convex/client-manager";
 import { runVaultFileSync } from "./file-sync";
 import {
+	pullDotObsidianConfig,
+	pushDotObsidianConfig,
+} from "./file-sync/config-sync";
+import {
 	startObsidianLiveSync,
 	type LiveSyncController,
 } from "./obsidian/live-sync";
@@ -96,6 +100,20 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 						this.syncStatusBarItemEl?.setText("Convex sync: failed");
 						console.error(err);
 					});
+			},
+		});
+		this.addCommand({
+			id: "push-obsidian-config",
+			name: "Push .obsidian config to Convex",
+			callback: () => {
+				void this.pushObsidianConfig();
+			},
+		});
+		this.addCommand({
+			id: "pull-obsidian-config",
+			name: "Pull .obsidian config from Convex",
+			callback: () => {
+				void this.pullObsidianConfig();
 			},
 		});
 		this.addCommand({
@@ -195,6 +213,46 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			await this.reloadLiveSync().catch((reloadError: unknown) => {
 				console.error(reloadError);
 			});
+		}
+	}
+
+	async pushObsidianConfig(): Promise<void> {
+		this.syncStatusBarItemEl?.setText("Convex sync: pushing .obsidian...");
+		try {
+			const result = await pushDotObsidianConfig({
+				app: this.app,
+				settings: this.settings,
+				getConvexHttpClient: this.getConvexHttpClient,
+				getPresenceSessionId: this.getPresenceSessionId.bind(this),
+			});
+			this.syncStatusBarItemEl?.setText(
+				`Convex sync: pushed .obsidian (${result.filesUploaded} files)`,
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.syncStatusBarItemEl?.setText("Convex sync: .obsidian push failed");
+			new Notice(`Convex .obsidian push failed: ${message}`, 10000);
+			console.error(error);
+		}
+	}
+
+	async pullObsidianConfig(): Promise<void> {
+		this.syncStatusBarItemEl?.setText("Convex sync: pulling .obsidian...");
+		try {
+			const result = await pullDotObsidianConfig({
+				app: this.app,
+				settings: this.settings,
+				getConvexHttpClient: this.getConvexHttpClient,
+				getPresenceSessionId: this.getPresenceSessionId.bind(this),
+			});
+			this.syncStatusBarItemEl?.setText(
+				`Convex sync: pulled .obsidian (${result.filesDownloaded} files)`,
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.syncStatusBarItemEl?.setText("Convex sync: .obsidian pull failed");
+			new Notice(`Convex .obsidian pull failed: ${message}`, 10000);
+			console.error(error);
 		}
 	}
 
