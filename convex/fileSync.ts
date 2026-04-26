@@ -1,6 +1,5 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { OBSIDIAN_BUNDLE_SCOPE } from "./_lib/constants";
 import { requirePluginSecret } from "./security";
 
 function normalizePath(input: string): string {
@@ -72,13 +71,14 @@ export const finalizeUpload = mutation({
 
 		let previousStorageId: typeof args.storageId | null = null;
 		if (existing) {
-			previousStorageId = existing.storageId;
+			previousStorageId = existing.storageId ?? null;
 			await ctx.db.patch(existing._id, {
 				storageId: args.storageId,
 				contentHash: args.contentHash,
 				sizeBytes: args.sizeBytes,
 				updatedAtMs: args.updatedAtMs,
 				updatedByClientId: args.clientId,
+				isText: false,
 			});
 		} else {
 			await ctx.db.insert("vaultFiles", {
@@ -88,6 +88,7 @@ export const finalizeUpload = mutation({
 				sizeBytes: args.sizeBytes,
 				updatedAtMs: args.updatedAtMs,
 				updatedByClientId: args.clientId,
+				isText: false,
 			});
 		}
 
@@ -99,16 +100,133 @@ export const finalizeUpload = mutation({
 	},
 });
 
+export const registerTextFile = mutation({
+	args: {
+		convexSecret: v.string(),
+		path: v.string(),
+		contentHash: v.string(),
+		sizeBytes: v.number(),
+		updatedAtMs: v.number(),
+		clientId: v.string(),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const path = normalizePath(args.path);
+		const existing = await ctx.db
+			.query("vaultFiles")
+			.withIndex("by_path", (q) => q.eq("path", path))
+			.unique();
+		if (existing) {
+			if (existing.storageId) {
+				await ctx.storage.delete(existing.storageId);
+			}
+			await ctx.db.patch(existing._id, {
+				contentHash: args.contentHash,
+				sizeBytes: args.sizeBytes,
+				updatedAtMs: args.updatedAtMs,
+				updatedByClientId: args.clientId,
+				isText: true,
+				storageId: undefined,
+			});
+		} else {
+			await ctx.db.insert("vaultFiles", {
+				path,
+				contentHash: args.contentHash,
+				sizeBytes: args.sizeBytes,
+				updatedAtMs: args.updatedAtMs,
+				updatedByClientId: args.clientId,
+				isText: true,
+			});
+		}
+	},
+});
+
+function mapBinaryVaultFileRow(f: {
+	path: string;
+	contentHash: string;
+	updatedAtMs: number;
+}) {
+	return {
+		path: f.path,
+		contentHash: f.contentHash,
+		updatedAtMs: f.updatedAtMs,
+	};
+}
+
+export const listFilesChangedSince = query({
+	args: {
+		convexSecret: v.string(),
+		sinceMs: v.number(),
+		sincePath: v.optional(v.string()),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const sincePath = args.sincePath ?? "";
+
+		let files: Array<{
+			path: string;
+			contentHash: string;
+			updatedAtMs: number;
+		}>;
+
+		if (args.sinceMs === 0 && sincePath === "") {
+			files = await ctx.db
+				.query("vaultFiles")
+				.withIndex("by_isText_updatedAtMs", (q) => q.eq("isText", false))
+				.collect();
+		} else {
+			const strictAfter = await ctx.db
+				.query("vaultFiles")
+				.withIndex("by_isText_updatedAtMs", (q) =>
+					q.eq("isText", false).gt("updatedAtMs", args.sinceMs),
+				)
+				.collect();
+			const sameMsAfterPath = await ctx.db
+				.query("vaultFiles")
+				.withIndex("by_isText_updatedAtMs", (q) =>
+					q.eq("isText", false).eq("updatedAtMs", args.sinceMs),
+				)
+				.filter((q) => q.gt(q.field("path"), sincePath))
+				.collect();
+			const byId = new Map<
+				string,
+				{ path: string; contentHash: string; updatedAtMs: number }
+			>();
+			for (const f of strictAfter) {
+				byId.set(f._id, f);
+			}
+			for (const f of sameMsAfterPath) {
+				byId.set(f._id, f);
+			}
+			files = [...byId.values()];
+		}
+
+		return files.map(mapBinaryVaultFileRow);
+	},
+});
+
+export const listFileHashes = query({
+	args: { convexSecret: v.string() },
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const files = await ctx.db
+			.query("vaultFiles")
+			.withIndex("by_isText_updatedAtMs", (q) => q.eq("isText", false))
+			.collect();
+		return files.map((f) => ({
+			path: f.path,
+			contentHash: f.contentHash,
+			updatedAtMs: f.updatedAtMs,
+		}));
+	},
+});
+
 export const listSnapshot = query({
 	args: { convexSecret: v.string() },
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const files = await ctx.db.query("vaultFiles").collect();
 		const folders = await ctx.db.query("vaultFolders").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
 		return {
 			files: files.map((file) => ({
 				path: file.path,
@@ -116,6 +234,8 @@ export const listSnapshot = query({
 				sizeBytes: file.sizeBytes,
 				updatedAtMs: file.updatedAtMs,
 				updatedByClientId: file.updatedByClientId,
+				isText: file.isText,
+				storageId: file.storageId,
 			})),
 			folders: folders.map((folder) => ({
 				path: folder.path,
@@ -123,15 +243,6 @@ export const listSnapshot = query({
 				isExplicitlyEmpty: folder.isExplicitlyEmpty,
 				updatedByClientId: folder.updatedByClientId ?? "",
 			})),
-			obsidianBundle:
-				bundle === null
-					? null
-					: {
-							contentHash: bundle.contentHash,
-							sizeBytes: bundle.sizeBytes,
-							updatedAtMs: bundle.updatedAtMs,
-							updatedByClientId: bundle.updatedByClientId,
-						},
 		};
 	},
 });
@@ -145,7 +256,7 @@ export const getDownloadUrl = query({
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
 			.unique();
-		if (!row) {
+		if (!row || !row.storageId) {
 			return null;
 		}
 		const url = await ctx.storage.getUrl(row.storageId);
@@ -212,99 +323,11 @@ export const removeFilesByPath = mutation({
 			if (!row) {
 				continue;
 			}
-			await ctx.storage.delete(row.storageId);
+			if (row.storageId) {
+				await ctx.storage.delete(row.storageId);
+			}
 			await ctx.db.delete(row._id);
 		}
 	},
 });
 
-export const issueBundleUploadUrl = mutation({
-	args: {
-		convexSecret: v.string(),
-		contentHash: v.string(),
-		updatedAtMs: v.number(),
-		sizeBytes: v.number(),
-		clientId: v.string(),
-	},
-	handler: async (ctx, args) => {
-		await requirePluginSecret(ctx, args.convexSecret);
-		void args;
-		const uploadUrl = await ctx.storage.generateUploadUrl();
-		return { uploadUrl };
-	},
-});
-
-export const finalizeBundleUpload = mutation({
-	args: {
-		convexSecret: v.string(),
-		storageId: v.id("_storage"),
-		contentHash: v.string(),
-		updatedAtMs: v.number(),
-		sizeBytes: v.number(),
-		clientId: v.string(),
-	},
-	handler: async (ctx, args) => {
-		await requirePluginSecret(ctx, args.convexSecret);
-		const existing = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		if (existing && existing.updatedAtMs > args.updatedAtMs) {
-			await ctx.storage.delete(args.storageId);
-			return {
-				ok: false as const,
-				reason: "stale_write" as const,
-				remoteUpdatedAtMs: existing.updatedAtMs,
-			};
-		}
-		let previousStorageId: typeof args.storageId | null = null;
-		if (existing) {
-			previousStorageId = existing.storageId;
-			await ctx.db.patch(existing._id, {
-				storageId: args.storageId,
-				contentHash: args.contentHash,
-				sizeBytes: args.sizeBytes,
-				updatedAtMs: args.updatedAtMs,
-				updatedByClientId: args.clientId,
-			});
-		} else {
-			await ctx.db.insert("vaultBundles", {
-				scope: OBSIDIAN_BUNDLE_SCOPE,
-				storageId: args.storageId,
-				contentHash: args.contentHash,
-				sizeBytes: args.sizeBytes,
-				updatedAtMs: args.updatedAtMs,
-				updatedByClientId: args.clientId,
-			});
-		}
-		if (previousStorageId !== null && previousStorageId !== args.storageId) {
-			await ctx.storage.delete(previousStorageId);
-		}
-		return { ok: true as const };
-	},
-});
-
-export const getBundleDownloadUrl = query({
-	args: { convexSecret: v.string() },
-	handler: async (ctx, args) => {
-		await requirePluginSecret(ctx, args.convexSecret);
-		const row = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		if (!row) {
-			return null;
-		}
-		const url = await ctx.storage.getUrl(row.storageId);
-		if (!url) {
-			return null;
-		}
-		return {
-			url,
-			contentHash: row.contentHash,
-			sizeBytes: row.sizeBytes,
-			updatedAtMs: row.updatedAtMs,
-			updatedByClientId: row.updatedByClientId,
-		};
-	},
-});

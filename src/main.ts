@@ -8,6 +8,7 @@ import {
 } from "./clients-presence";
 import { ConvexClientManager } from "./convex/client-manager";
 import { runVaultFileSync } from "./file-sync";
+import { api } from "../convex/_generated/api";
 import {
 	ensureVaultSecretRegisteredWithDeployment,
 	mintVaultApiSecretFromConvexSite,
@@ -18,12 +19,16 @@ import {
 	ConvexSyncSettingTab,
 	type MyPluginSettings,
 } from "./settings";
+import { BinarySyncManager } from "./sync/binary-sync-manager";
+import { DocManager } from "./sync/doc-manager";
 
 export default class ObsidianConvexSyncPlugin extends Plugin {
 	settings: MyPluginSettings = { ...DEFAULT_SETTINGS };
 	private presenceSessionId = "";
 	private convex = new ConvexClientManager(() => this.settings);
 	private syncStatusBarItemEl: HTMLElement | null = null;
+	private binarySync: BinarySyncManager | null = null;
+	private docManager: DocManager | null = null;
 
 	getPresenceSessionId(): string {
 		return this.presenceSessionId;
@@ -32,6 +37,10 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 	getConvexHttpClient = () => this.convex.getHttp();
 	getConvexRealtimeClient = () => this.convex.getRealtime();
 	getKeepaliveHttpClient = () => this.convex.getKeepaliveHttp();
+
+	getDocAwareness() {
+		return this.docManager?.getCurrentAwareness() ?? null;
+	}
 
 	async onload() {
 		await this.loadSettings();
@@ -103,10 +112,51 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 		this.syncStatusBarItemEl.setText("Convex sync: idle");
 		this.addSettingTab(new ConvexSyncSettingTab(this.app, this));
 
+		const realtimeClient = this.convex.getRealtime();
+		if (realtimeClient) {
+			this.docManager = new DocManager(
+				this.app,
+				realtimeClient,
+				api,
+				this.presenceSessionId,
+				this.settings.convexSecret.trim(),
+			);
+			this.registerEditorExtension(this.docManager.extensions);
+			this.registerEvent(
+				this.app.workspace.on("file-open", (file) => {
+					if (file?.extension === "md") {
+						void this.docManager?.onFileOpen(file.path);
+					} else {
+						void this.docManager?.closeCurrentDoc();
+					}
+				}),
+			);
+			this.register(() => {
+				void this.docManager?.dispose();
+				this.docManager = null;
+			});
+
+			this.binarySync = new BinarySyncManager(
+				this.app,
+				this.getConvexHttpClient(),
+				realtimeClient,
+				this.settings.convexSecret.trim(),
+			);
+			void this.binarySync.start().catch((err: unknown) => {
+				console.error("Convex binary sync catch-up failed", err);
+			});
+			this.register(() => {
+				this.binarySync?.dispose();
+				this.binarySync = null;
+			});
+		}
+
 	}
 
 	onunload() {
 		void leaveClientsPresence(this);
+		this.binarySync?.dispose();
+		this.binarySync = null;
 		this.convex.dispose();
 	}
 

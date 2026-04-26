@@ -226,19 +226,31 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 			"Important: while a bootstrap link is active, do not edit files on this device until the new device finishes extracting the zip and opens the vault.",
 		);
 
+		const canBootstrap =
+			this.plugin.settings.convexUrl.trim() !== "" &&
+			this.plugin.settings.convexSecret.trim() !== "";
+
 		new Setting(containerEl)
 			.setName("Generate bootstrap link (10 min)")
 			.setDesc(
-				"Creates a full vault snapshot from Convex, including .obsidian and plugin key data, and returns a temporary download link.",
+				"Builds a full vault snapshot on Convex (Markdown from collaborative Yjs state, binaries from storage) and a temporary HTTPS download link. Set Convex site URL for a complete link.",
 			)
 			.addButton((button) =>
-				button.setButtonText("Generate link").onClick(() => {
-					const modal = new BootstrapConfirmModal(this.app);
-					modal.onConfirm = () => {
-						void this.startBootstrapFlow();
-					};
-					modal.open();
-				}),
+				button
+					.setButtonText("Generate link")
+					.setTooltip(
+						canBootstrap
+							? "Sync vault, then build archive and show a 10-minute link"
+							: "Set Convex URL and secret first",
+					)
+					.setDisabled(!canBootstrap)
+					.onClick(() => {
+						const modal = new BootstrapConfirmModal(this.app);
+						modal.onConfirm = () => {
+							void this.startBootstrapFlow();
+						};
+						modal.open();
+					}),
 			);
 
 		if (this.bootstrapState.kind === "syncing" || this.bootstrapState.kind === "building") {

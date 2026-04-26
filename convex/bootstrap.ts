@@ -1,6 +1,7 @@
 import { ConvexError, v } from "convex/values";
-import { unzipSync, zipSync } from "fflate";
-import { internal } from "./_generated/api";
+import { zipSync } from "fflate";
+import * as Y from "yjs";
+import { api, internal } from "./_generated/api";
 import {
 	internalAction,
 	internalMutation,
@@ -8,7 +9,6 @@ import {
 	mutation,
 	query,
 } from "./_generated/server";
-import { OBSIDIAN_BUNDLE_SCOPE } from "./_lib/constants";
 import { requirePluginSecret } from "./security";
 
 const TEN_MINUTES_MS = 10 * 60_000;
@@ -44,6 +44,14 @@ async function cleanupBootstrapStorage(ctx: any, row: BootstrapRow | null): Prom
 	}
 }
 
+function sanitizeVaultName(vaultName: string): string {
+	return vaultName
+		.trim()
+		.replace(/[^\w.-]+/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-|-$/g, "");
+}
+
 export const startBuild = mutation({
 	args: {
 		convexSecret: v.string(),
@@ -63,23 +71,15 @@ export const startBuild = mutation({
 		}
 
 		const allFiles = await ctx.db.query("vaultFiles").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q: any) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
-		const bytesTotal = allFiles.reduce((sum, file) => sum + file.sizeBytes, 0) + (bundle?.sizeBytes ?? 0);
+		const bytesTotal = allFiles.reduce((sum, file) => sum + file.sizeBytes, 0);
 
-		const cleanVaultName = args.vaultName
-			.trim()
-			.replace(/[^\w.-]+/g, "-")
-			.replace(/-+/g, "-")
-			.replace(/^-|-$/g, "");
+		const cleanVaultName = sanitizeVaultName(args.vaultName);
 		const archiveName = `${cleanVaultName || "obsidian-vault"}.zip`;
 		const rowId = await ctx.db.insert("vaultBootstraps", {
 			status: "building",
 			phase: "Queued",
 			filesProcessed: 0,
-			filesTotal: allFiles.length + (bundle ? 1 : 0),
+			filesTotal: allFiles.length,
 			bytesProcessed: 0,
 			bytesTotal,
 			archiveName,
@@ -90,6 +90,7 @@ export const startBuild = mutation({
 		await ctx.scheduler.runAfter(0, internal.bootstrap.buildArchive, {
 			bootstrapId: rowId,
 			convexSecret: args.convexSecret,
+			vaultName: args.vaultName,
 		});
 		return { ok: true as const };
 	},
@@ -269,6 +270,7 @@ export const buildArchive = internalAction({
 	args: {
 		bootstrapId: v.id("vaultBootstraps"),
 		convexSecret: v.string(),
+		vaultName: v.string(),
 	},
 	handler: async (ctx, args) => {
 		try {
@@ -279,38 +281,54 @@ export const buildArchive = internalAction({
 			let filesProcessed = 0;
 			let bytesProcessed = 0;
 			const chunkInterval = 8;
+			const docIdPrefix = `${args.vaultName}::`;
 
 			for (const row of snapshot.files) {
-				const blob = await ctx.storage.get(row.storageId);
-				if (!blob) {
-					continue;
+				try {
+					if (row.isText) {
+						const doc = new Y.Doc();
+						try {
+							const initial = await ctx.runAction(api.yjs.init, {
+								docId: `${docIdPrefix}${row.path}`,
+								stateVector: toArrayBuffer(Y.encodeStateVector(doc)),
+							});
+							if (
+								initial &&
+								typeof initial === "object" &&
+								"update" in initial &&
+								(initial as { update?: ArrayBuffer | Uint8Array }).update
+							) {
+								const raw = (initial as { update: ArrayBuffer | Uint8Array }).update;
+								Y.applyUpdate(
+									doc,
+									raw instanceof Uint8Array ? raw : new Uint8Array(raw),
+								);
+							}
+							const text = doc.getText("content").toString();
+							archiveEntries[row.path] = new TextEncoder().encode(text);
+						} finally {
+							doc.destroy();
+						}
+					} else {
+						if (!row.storageId) {
+							continue;
+						}
+						const blob = await ctx.storage.get(row.storageId);
+						if (!blob) {
+							continue;
+						}
+						const bytes = new Uint8Array(await blob.arrayBuffer());
+						archiveEntries[row.path] = bytes;
+					}
+				} catch (err) {
+					console.warn(`[bootstrap] skipping ${row.path}:`, err);
 				}
-				const bytes = new Uint8Array(await blob.arrayBuffer());
-				archiveEntries[row.path] = bytes;
 				filesProcessed += 1;
 				bytesProcessed += row.sizeBytes;
 				if (filesProcessed % chunkInterval === 0) {
 					await ctx.runMutation(internal.bootstrap.updateProgress, {
 						bootstrapId: args.bootstrapId,
 						phase: `Collecting vault files (${filesProcessed}/${snapshot.files.length})`,
-						filesProcessed,
-						bytesProcessed,
-					});
-				}
-			}
-
-			if (snapshot.bundle) {
-				const bundleBlob = await ctx.storage.get(snapshot.bundle.storageId);
-				if (bundleBlob) {
-					const archive = unzipSync(new Uint8Array(await bundleBlob.arrayBuffer()));
-					for (const [relativePath, content] of Object.entries(archive)) {
-						archiveEntries[`.obsidian/${relativePath}`] = content;
-					}
-					filesProcessed += 1;
-					bytesProcessed += snapshot.bundle.sizeBytes;
-					await ctx.runMutation(internal.bootstrap.updateProgress, {
-						bootstrapId: args.bootstrapId,
-						phase: "Merged .obsidian bundle",
 						filesProcessed,
 						bytesProcessed,
 					});
@@ -351,22 +369,20 @@ export const _readSnapshot = internalQuery({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const files = await ctx.db.query("vaultFiles").collect();
-		const bundle = await ctx.db
-			.query("vaultBundles")
-			.withIndex("by_scope", (q) => q.eq("scope", OBSIDIAN_BUNDLE_SCOPE))
-			.unique();
 		return {
 			files: files.map((row) => ({
 				path: row.path,
+				isText: row.isText,
 				storageId: row.storageId,
 				sizeBytes: row.sizeBytes,
 			})),
-			bundle: bundle
-				? {
-						storageId: bundle.storageId,
-						sizeBytes: bundle.sizeBytes,
-				  }
-				: null,
 		};
 	},
 });
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+	return bytes.buffer.slice(
+		bytes.byteOffset,
+		bytes.byteOffset + bytes.byteLength,
+	) as ArrayBuffer;
+}

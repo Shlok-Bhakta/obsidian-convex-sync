@@ -1,19 +1,10 @@
-import type { Extension } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
 import { ConvexHttpClient, type ConvexClient } from "convex/browser";
-import {
-	App,
-	Editor,
-	EventRef,
-	MarkdownView,
-	Platform,
-	editorInfoField,
-} from "obsidian";
+import { App, EventRef, MarkdownView, Platform } from "obsidian";
+import type { Awareness } from "y-protocols/awareness.js";
 import { api } from "../../convex/_generated/api";
 import type { MyPluginSettings } from "../settings";
 
 const HEARTBEAT_MS = 10_000;
-const CURSOR_DEBOUNCE_MS = 200;
 const EMPTY_CURSOR = {
 	anchor: { line: 0, ch: 0 },
 	head: { line: 0, ch: 0 },
@@ -27,9 +18,10 @@ export type ClientsPresenceHost = {
 	getPresenceSessionId(): string;
 	getConvexRealtimeClient(): ConvexClient | null;
 	getKeepaliveHttpClient(): ConvexHttpClient;
+	/** Yjs awareness for the active shared markdown doc, or null if none. */
+	getDocAwareness(): Awareness | null;
 	registerEvent(event: EventRef): void;
 	registerInterval(id: number): void;
-	registerEditorExtension(extension: Extension): void;
 	registerDomEvent<K extends keyof WindowEventMap>(
 		el: Window,
 		type: K,
@@ -38,23 +30,12 @@ export type ClientsPresenceHost = {
 	): void;
 };
 
-function readCursorFromEditor(editor: Editor) {
-	return {
-		anchor: editor.getCursor("anchor"),
-		head: editor.getCursor("head"),
-		from: editor.getCursor("from"),
-		to: editor.getCursor("to"),
-	};
-}
-
-function getOpenMarkdownContext(
-	app: App,
-): { editor: Editor; path: string } | null {
+function getActiveMarkdownPath(app: App): string | null {
 	const view = app.workspace.getActiveViewOfType(MarkdownView);
 	if (!view || !view.editor || !view.file) {
 		return null;
 	}
-	return { editor: view.editor, path: view.file.path };
+	return view.file.path;
 }
 
 export function leaveClientsPresence(host: ClientsPresenceHost): void {
@@ -91,13 +72,14 @@ export function startClientsPresence(host: ClientsPresenceHost): () => void {
 		if (!client) {
 			return;
 		}
-		const ctx = getOpenMarkdownContext(host.app);
+		const path = getActiveMarkdownPath(host.app);
 		void client
 			.mutation(api.clients.updateEditorPresence, {
 				convexSecret: host.settings.convexSecret,
 				clientId: host.getPresenceSessionId(),
-				openFilePath: ctx?.path ?? "",
-				cursor: ctx ? readCursorFromEditor(ctx.editor) : EMPTY_CURSOR,
+				openFilePath: path ?? "",
+				// Cursor positions live in Yjs/yCollab only, not clientPresence.
+				cursor: EMPTY_CURSOR,
 			})
 			.catch(() => {});
 	};
@@ -124,39 +106,6 @@ export function startClientsPresence(host: ClientsPresenceHost): () => void {
 	const interval = window.setInterval(sendHeartbeat, HEARTBEAT_MS);
 	host.registerInterval(interval);
 	teardowns.push(() => window.clearInterval(interval));
-
-	let cursorTimer: number | null = null;
-	const scheduleCursorPush = (): void => {
-		if (cursorTimer !== null) {
-			window.clearTimeout(cursorTimer);
-		}
-		cursorTimer = window.setTimeout(() => {
-			cursorTimer = null;
-			pushPresence();
-		}, CURSOR_DEBOUNCE_MS);
-	};
-	teardowns.push(() => {
-		if (cursorTimer !== null) {
-			window.clearTimeout(cursorTimer);
-		}
-	});
-
-	host.registerEditorExtension(
-		EditorView.updateListener.of((update) => {
-			if (!update.selectionSet && !update.docChanged) {
-				return;
-			}
-			const info = update.state.field(editorInfoField, false);
-			if (!info?.editor) {
-				return;
-			}
-			const active = host.app.workspace.getActiveViewOfType(MarkdownView);
-			if (!active || active.editor !== info.editor) {
-				return;
-			}
-			scheduleCursorPush();
-		}),
-	);
 
 	host.registerEvent(host.app.workspace.on("active-leaf-change", pushPresence));
 	host.registerEvent(host.app.workspace.on("file-open", pushPresence));

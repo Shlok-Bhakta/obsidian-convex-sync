@@ -1,4 +1,5 @@
 import type { ConvexHttpClient } from "convex/browser";
+import { api } from "../../convex/_generated/api";
 import { runVaultFileSync } from "../file-sync";
 import type { MyPluginSettings } from "../settings";
 
@@ -10,9 +11,7 @@ type BootstrapHost = {
 };
 
 export type BootstrapUiState =
-	| {
-			kind: "idle";
-	  }
+	| { kind: "idle" }
 	| {
 			kind: "syncing";
 			phase: string;
@@ -39,10 +38,7 @@ export type BootstrapUiState =
 			phase: string;
 			message: string;
 	  }
-	| {
-			kind: "expired";
-			phase: string;
-	  };
+	| { kind: "expired"; phase: string };
 
 type BootstrapStatus = {
 	status: "idle" | "building" | "ready" | "failed" | "expired";
@@ -78,19 +74,17 @@ export async function startBootstrapBuild(
 			});
 		},
 	});
-	await (client.mutation as any)("bootstrap:startBuild", {
-		convexSecret: host.settings.convexSecret,
+	await client.mutation(api.bootstrap.startBuild, {
+		convexSecret: host.settings.convexSecret.trim(),
 		clientId: host.getPresenceSessionId(),
 		vaultName: host.app.vault.getName(),
 	});
 }
 
-export async function readBootstrapStatus(
-	host: BootstrapHost,
-): Promise<BootstrapUiState> {
+export async function readBootstrapStatus(host: BootstrapHost): Promise<BootstrapUiState> {
 	const client = host.getConvexHttpClient();
-	const status = (await (client.query as any)("bootstrap:getStatus", {
-		convexSecret: host.settings.convexSecret,
+	const status = (await client.query(api.bootstrap.getStatus, {
+		convexSecret: host.settings.convexSecret.trim(),
 	})) as BootstrapStatus;
 	switch (status.status) {
 		case "idle":
@@ -105,12 +99,20 @@ export async function readBootstrapStatus(
 				bytesTotal: status.bytesTotal ?? 0,
 			};
 		case "ready":
-			if (status.downloadUrl && status.expiresAtMs && status.expiresAtMs > Date.now()) {
+			if (
+				status.downloadUrl &&
+				status.expiresAtMs &&
+				status.expiresAtMs > Date.now()
+			) {
 				const base = host.settings.convexSiteUrl.replace(/\/+$/, "");
+				const path = status.downloadUrl.startsWith("/")
+					? status.downloadUrl
+					: `/${status.downloadUrl}`;
+				const url = base.length > 0 ? `${base}${path}` : path;
 				return {
 					kind: "ready",
 					phase: status.phase ?? "Ready",
-					url: `${base}${status.downloadUrl}`,
+					url,
 					expiresAtMs: status.expiresAtMs,
 					sizeBytes: status.sizeBytes ?? 0,
 				};
@@ -129,7 +131,7 @@ export async function readBootstrapStatus(
 }
 
 export async function cancelBootstrap(host: BootstrapHost): Promise<void> {
-	await (host.getConvexHttpClient().mutation as any)("bootstrap:cancelBootstrap", {
-		convexSecret: host.settings.convexSecret,
+	await host.getConvexHttpClient().mutation(api.bootstrap.cancelBootstrap, {
+		convexSecret: host.settings.convexSecret.trim(),
 	});
 }

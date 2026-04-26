@@ -3,20 +3,18 @@ import { v } from "convex/values";
 import { editorCursor } from "./_lib/validators";
 
 export default defineSchema({
-	tasks: defineTable({
-		text: v.string(),
-		isCompleted: v.boolean(),
-	}),
 	vaultFiles: defineTable({
 		path: v.string(),
-		storageId: v.id("_storage"),
+		storageId: v.optional(v.id("_storage")),
 		contentHash: v.string(),
 		sizeBytes: v.number(),
 		updatedAtMs: v.number(),
 		updatedByClientId: v.string(),
+		isText: v.boolean(),
 	})
 		.index("by_path", ["path"])
-		.index("by_updatedAtMs", ["updatedAtMs"]),
+		.index("by_updatedAtMs", ["updatedAtMs"])
+		.index("by_isText_updatedAtMs", ["isText", "updatedAtMs"]),
 	vaultFolders: defineTable({
 		path: v.string(),
 		updatedAtMs: v.number(),
@@ -25,14 +23,6 @@ export default defineSchema({
 	})
 		.index("by_path", ["path"])
 		.index("by_updatedAtMs", ["updatedAtMs"]),
-	vaultBundles: defineTable({
-		scope: v.string(),
-		storageId: v.id("_storage"),
-		contentHash: v.string(),
-		sizeBytes: v.number(),
-		updatedAtMs: v.number(),
-		updatedByClientId: v.string(),
-	}).index("by_scope", ["scope"]),
 	vaultBootstraps: defineTable({
 		status: v.union(
 			v.literal("building"),
@@ -70,4 +60,9 @@ export default defineSchema({
 		cursor: editorCursor,
 		lastHeartbeatAt: v.number(),
 	}).index("by_clientId", ["clientId"]),
+	/** y-protocols awareness payloads for Yjs collab cursors (per docId). */
+	yjsAwarenessUpdates: defineTable({
+		docId: v.string(),
+		update: v.bytes(),
+	}).index("by_docId", ["docId"]),
 });

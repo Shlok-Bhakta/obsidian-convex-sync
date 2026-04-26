@@ -19,6 +19,8 @@ import type * as fileSync from "../fileSync.js";
 import type * as http from "../http.js";
 import type * as pluginSecretMint from "../pluginSecretMint.js";
 import type * as security from "../security.js";
+import type * as yjs from "../yjs.js";
+import type * as yjsAwareness from "../yjsAwareness.js";
 
 import type {
   ApiFromModules,
@@ -38,6 +40,8 @@ declare const fullApi: ApiFromModules<{
   http: typeof http;
   pluginSecretMint: typeof pluginSecretMint;
   security: typeof security;
+  yjs: typeof yjs;
+  yjsAwareness: typeof yjsAwareness;
 }>;
 
 /**
@@ -66,4 +70,6 @@ export declare const internal: FilterApi<
   FunctionReference<any, "internal">
 >;
 
-export declare const components: {};
+export declare const components: {
+  yconvex: import("y-convex/_generated/component.js").ComponentApi<"yconvex">;
+};
