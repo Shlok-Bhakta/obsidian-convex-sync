@@ -182,8 +182,20 @@ describe("DocSession", () => {
 			doc.text = "two";
 		});
 
-		await session.applyRemoteChanges(Automerge.getChanges(base, first));
-		await session.applyRemoteChanges(Automerge.getChanges(first, second));
+		await session.applyRemoteChanges(
+			Automerge.getChanges(base, first).map((data) => ({
+				type: "incremental" as const,
+				data,
+				serverCursor: 1,
+			})),
+		);
+		await session.applyRemoteChanges(
+			Automerge.getChanges(first, second).map((data) => ({
+				type: "incremental" as const,
+				data,
+				serverCursor: 2,
+			})),
+		);
 
 		expect(session.getTextSnapshot()).toBe("two");
 		expect(onRemotePatch).toHaveBeenLastCalledWith("two");

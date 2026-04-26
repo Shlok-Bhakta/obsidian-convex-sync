@@ -17,6 +17,12 @@ export type DocSessionTransport = {
 	pushSnapshot?(docId: string, snapshot: Uint8Array): Promise<number>;
 };
 
+export type RemoteAutomergeChange = {
+	type: "incremental" | "snapshot";
+	data: Uint8Array;
+	serverCursor: number;
+};
+
 export type DocSessionOptions = {
 	docId: string;
 	repo: AutomergeRepoStore;
@@ -61,7 +67,7 @@ export class DocSession {
 		await this.trackWork(this.doApplyLocalText(text));
 	}
 
-	async applyRemoteChanges(changes: Uint8Array[]): Promise<void> {
+	async applyRemoteChanges(changes: RemoteAutomergeChange[]): Promise<void> {
 		if (this.closed) {
 			return;
 		}
@@ -186,7 +192,9 @@ export class DocSession {
 		await this.trackWork(pushWork);
 	}
 
-	private async doApplyRemoteChanges(changes: Uint8Array[]): Promise<void> {
+	private async doApplyRemoteChanges(
+		changes: RemoteAutomergeChange[],
+	): Promise<void> {
 		if (changes.length === 0) {
 			return;
 		}
@@ -195,17 +203,26 @@ export class DocSession {
 			return;
 		}
 		const handle = this.handle;
-		handle.update((doc) => {
-			for (const change of changes) {
-				doc = Automerge.loadIncremental(doc, change);
-			}
-			return doc;
-		});
+		const appliedChanges = selectApplicableRemoteChanges(
+			changes,
+			handle.doc().text,
+		);
+		if (appliedChanges.length === 0) {
+			return;
+		}
+		let nextDoc = handle.doc();
+		for (const change of appliedChanges) {
+			nextDoc =
+				change.type === "snapshot"
+					? Automerge.load<AutomergeTextDoc>(change.data)
+					: Automerge.loadIncremental(nextDoc, change.data);
+		}
+		handle.update(() => nextDoc);
 		await this.options.repo.ensureFlushed(this.options.docId);
 		const text = this.getTextSnapshot();
 		console.info("[session] remote change applied", {
 			docId: this.options.docId,
-			changeHash: await sha256Hex(mergeArrays(changes)),
+			changeHash: await sha256Hex(mergeArrays(appliedChanges.map((change) => change.data))),
 			newTextLength: text.length,
 		});
 		this.options.onRemotePatch?.(text);
@@ -278,6 +295,25 @@ export class DocSession {
 			this.inFlightWork.delete(work);
 		}
 	}
+}
+
+function selectApplicableRemoteChanges(
+	changes: RemoteAutomergeChange[],
+	currentText: string,
+): RemoteAutomergeChange[] {
+	let latestSnapshotIndex = -1;
+	for (let index = 0; index < changes.length; index += 1) {
+		if (changes[index]?.type === "snapshot") {
+			latestSnapshotIndex = index;
+		}
+	}
+	if (latestSnapshotIndex === -1) {
+		return changes;
+	}
+	if (currentText.length === 0) {
+		return changes.slice(latestSnapshotIndex);
+	}
+	return changes.filter((change) => change.type === "incremental");
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {

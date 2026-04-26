@@ -1,5 +1,9 @@
 import { ConvexClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
+import {
+	MAX_AUTOMERGE_MUTATION_BYTES,
+	MAX_AUTOMERGE_PAYLOAD_BYTES,
+} from "../core/limits";
 import { retry } from "./retry";
 
 export type ConnectionStatus = "connected" | "reconnecting" | "offline";
@@ -106,6 +110,22 @@ export class ConvexAutomergeTransport {
 		if (changes.length === 0) {
 			return 0;
 		}
+		assertAutomergePayloadsFit(changes);
+		let latestServerCursor = 0;
+		for (const batch of batchAutomergeChanges(changes)) {
+			latestServerCursor = Math.max(
+				latestServerCursor,
+				await this.pushChangeBatch(docId, batch, "incremental"),
+			);
+		}
+		return latestServerCursor;
+	}
+
+	private async pushChangeBatch(
+		docId: string,
+		changes: Uint8Array[],
+		type: "incremental" | "snapshot",
+	): Promise<number> {
 		const idempotencyKey = await derivePushIdempotencyKey(
 			this.options.clientId,
 			docId,
@@ -116,6 +136,7 @@ export class ConvexAutomergeTransport {
 			docId,
 			changeCount: changes.length,
 			idempotencyKeyPrefix: idempotencyKey.slice(0, 8),
+			type,
 		});
 
 		const result = await retry(
@@ -126,7 +147,7 @@ export class ConvexAutomergeTransport {
 					clientId: this.options.clientId,
 					idempotencyKey,
 					changes: changes.map((change) => ({
-						type: "incremental" as const,
+						type,
 						data: toArrayBuffer(change),
 					})),
 				}),
@@ -144,44 +165,8 @@ export class ConvexAutomergeTransport {
 	}
 
 	async pushSnapshot(docId: string, snapshot: Uint8Array): Promise<number> {
-		const idempotencyKey = await derivePushIdempotencyKey(
-			this.options.clientId,
-			docId,
-			[snapshot],
-		);
-
-		console.info("[transport] push sent", {
-			docId,
-			changeCount: 1,
-			idempotencyKeyPrefix: idempotencyKey.slice(0, 8),
-			type: "snapshot",
-		});
-
-		const result = await retry(
-			() =>
-				this.options.client.mutation(api.automergeSync.submitChanges, {
-					convexSecret: this.options.convexSecret,
-					docId,
-					clientId: this.options.clientId,
-					idempotencyKey,
-					changes: [
-						{
-							type: "snapshot" as const,
-							data: toArrayBuffer(snapshot),
-						},
-					],
-				}),
-			{
-				maxAttempts: 4,
-				shouldRetry: isRetryableTransportError,
-			},
-		);
-
-		console.info("[transport] push ack", {
-			docId,
-			serverCursor: result.serverCursor,
-		});
-		return result.serverCursor;
+		assertAutomergePayloadsFit([snapshot]);
+		return this.pushChangeBatch(docId, [snapshot], "snapshot");
 	}
 
 	async pullMissingChanges(
@@ -195,7 +180,7 @@ export class ConvexAutomergeTransport {
 				convexSecret: this.options.convexSecret,
 				docId,
 				sinceCursor,
-				numItems: 100,
+				numItems: 1,
 				cursor,
 			});
 			for (const change of page.page) {
@@ -350,7 +335,39 @@ function mapConnectionState(state: {
 
 function isRetryableTransportError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
+	if (message.includes("Automerge") && message.includes("too large")) {
+		return false;
+	}
 	return !/\b(400|401|403|404)\b/.test(message);
+}
+
+function assertAutomergePayloadsFit(changes: Uint8Array[]): void {
+	for (const change of changes) {
+		if (change.byteLength > MAX_AUTOMERGE_PAYLOAD_BYTES) {
+			throw new Error(
+				`Automerge payload is too large (${change.byteLength} bytes > ${MAX_AUTOMERGE_PAYLOAD_BYTES} bytes). Use storage sync for this file instead.`,
+			);
+		}
+	}
+}
+
+function batchAutomergeChanges(changes: Uint8Array[]): Uint8Array[][] {
+	const batches: Uint8Array[][] = [];
+	let current: Uint8Array[] = [];
+	let currentBytes = 0;
+	for (const change of changes) {
+		if (current.length > 0 && currentBytes + change.byteLength > MAX_AUTOMERGE_MUTATION_BYTES) {
+			batches.push(current);
+			current = [];
+			currentBytes = 0;
+		}
+		current.push(change);
+		currentBytes += change.byteLength;
+	}
+	if (current.length > 0) {
+		batches.push(current);
+	}
+	return batches;
 }
 
 async function sha256Hex(input: string | Uint8Array): Promise<string> {

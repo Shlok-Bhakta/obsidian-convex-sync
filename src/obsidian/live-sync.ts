@@ -22,7 +22,9 @@ import type { DocPathChange } from "../transport/convex-client";
 import {
 	ensureVaultFolderExists,
 	isTextSyncFile,
+	isTextSyncVaultPath,
 } from "../lib/obsidian-vault";
+import { MAX_LIVE_TEXT_BYTES } from "../core/limits";
 import { isMergeBackupPath } from "../lib/merge-backups";
 import { folderPathForFile } from "../lib/path";
 import {
@@ -48,6 +50,7 @@ export type LiveSyncHost = {
 
 export type LiveSyncController = {
 	openActiveFile(): Promise<void>;
+	setBulkSyncActive(active: boolean): void;
 	dispose(): Promise<void>;
 };
 
@@ -64,6 +67,8 @@ type FolderSnapshotRow = {
 	isExplicitlyEmpty: boolean;
 	updatedByClientId: string;
 };
+
+type FileSnapshotRow = Snapshot["files"][number];
 
 const FOLDER_SYNC_DEBOUNCE_MS = 250;
 const EDITOR_CHANGE_DEBOUNCE_MS = 75;
@@ -92,8 +97,13 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	private remoteFolders: Map<string, FolderSnapshotRow> | null = null;
 	private latestConfigSnapshot: Snapshot | null = null;
 	private lastConfigSnapshotSignature: string | null = null;
+	private remoteStorageFiles: Map<string, FileSnapshotRow> | null = null;
+	private lastStorageSnapshotSignature: string | null = null;
+	private storageSnapshotQueue: Promise<void> = Promise.resolve();
+	private binaryUploadQueue: Promise<void> = Promise.resolve();
 	private disposing: Promise<void> | null = null;
 	private disposed = false;
+	private bulkSyncActive = false;
 	private started = false;
 
 	constructor(private readonly host: LiveSyncHost) {}
@@ -149,6 +159,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		await this.openEditor(view.file, view.editor);
 	}
 
+	setBulkSyncActive(active: boolean): void {
+		this.bulkSyncActive = active;
+	}
+
 	async handleEditorChange(
 		editor: Editor,
 		info: MarkdownView | MarkdownFileInfo,
@@ -180,10 +194,14 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			this.host.setStatus(`Convex sync: folder created ${path}`);
 			return;
 		}
-		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
+		if (!(file instanceof TFile) || this.disposed) {
 			return;
 		}
 		if (this.suppressPathEvents.has(path)) {
+			return;
+		}
+		if (!isTextSyncFile(file)) {
+			this.enqueueBinaryUpload(file, "created");
 			return;
 		}
 		const text = await this.host.app.vault.cachedRead(file);
@@ -192,10 +210,25 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	}
 
 	async handleVaultModify(file: TAbstractFile): Promise<void> {
-		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
+		if (!(file instanceof TFile) || this.disposed || this.bulkSyncActive) {
 			return;
 		}
 		const path = normalizePath(file.path);
+		if (!isTextSyncFile(file)) {
+			if (this.suppressPathEvents.has(path) || !isBinaryStorageSyncPath(path)) {
+				return;
+			}
+			const existingTimer = this.pendingModifyTimers.get(path);
+			if (existingTimer !== undefined) {
+				clearLiveSyncTimeout(existingTimer);
+			}
+			const timer = setLiveSyncTimeout(() => {
+				this.pendingModifyTimers.delete(path);
+				this.enqueueBinaryUpload(file, "modified");
+			}, 750);
+			this.pendingModifyTimers.set(path, timer);
+			return;
+		}
 		if (this.suppressPathEvents.has(path)) {
 			return;
 		}
@@ -224,10 +257,17 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			this.host.setStatus(`Convex sync: folder deleted ${path}`);
 			return;
 		}
-		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
+		if (!(file instanceof TFile) || this.disposed) {
 			return;
 		}
 		if (this.suppressPathEvents.has(path)) {
+			return;
+		}
+		if (!isTextSyncFile(file)) {
+			if (isBinaryStorageSyncPath(path)) {
+				await this.removeSnapshotPath(path);
+				this.host.setStatus(`Convex sync: deleted ${file.basename}`);
+			}
 			return;
 		}
 		const engine = await this.getEngine();
@@ -257,13 +297,23 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			this.host.setStatus(`Convex sync: folder renamed ${newPath}`);
 			return;
 		}
-		if (!(file instanceof TFile) || !isTextSyncFile(file) || this.disposed) {
+		if (!(file instanceof TFile) || this.disposed) {
 			return;
 		}
 		if (
 			this.suppressPathEvents.has(normalizedOldPath) ||
 			this.suppressPathEvents.has(newPath)
 		) {
+			return;
+		}
+		if (!isTextSyncFile(file)) {
+			if (isBinaryStorageSyncPath(newPath)) {
+				await this.uploadBinaryFileByPath(newPath, "renamed");
+			}
+			if (isBinaryStorageSyncPath(normalizedOldPath)) {
+				await this.removeSnapshotPath(normalizedOldPath);
+			}
+			this.host.setStatus(`Convex sync: renamed ${file.basename}`);
 			return;
 		}
 		const engine = await this.getEngine();
@@ -477,14 +527,21 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			return;
 		}
 		const signature = configSnapshotSignature(snapshot);
+		const storageSignature = storageSnapshotSignature(snapshot);
 		if (this.lastConfigSnapshotSignature === null) {
 			this.lastConfigSnapshotSignature = signature;
+			this.lastStorageSnapshotSignature = storageSignature;
+			this.remoteStorageFiles = storageSnapshotMap(snapshot);
 			return;
 		}
-		if (signature === this.lastConfigSnapshotSignature) {
+		if (
+			signature === this.lastConfigSnapshotSignature &&
+			storageSignature === this.lastStorageSnapshotSignature
+		) {
 			return;
 		}
 		this.lastConfigSnapshotSignature = signature;
+		this.lastStorageSnapshotSignature = storageSignature;
 		this.latestConfigSnapshot = snapshot;
 		if (this.configSnapshotTimer !== null) {
 			clearLiveSyncTimeout(this.configSnapshotTimer);
@@ -495,8 +552,38 @@ class ObsidianLiveSyncController implements LiveSyncController {
 			this.latestConfigSnapshot = null;
 			if (latest) {
 				void this.applyRemoteConfigSnapshot(latest);
+				this.storageSnapshotQueue = this.storageSnapshotQueue
+					.catch(() => undefined)
+					.then(() => this.applyRemoteStorageSnapshot(latest));
 			}
 		}, 750);
+	}
+
+	private async applyRemoteStorageSnapshot(snapshot: Snapshot): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		const previous = this.remoteStorageFiles;
+		const next = storageSnapshotMap(snapshot);
+		this.remoteStorageFiles = next;
+		if (!previous) {
+			return;
+		}
+		for (const [path, row] of next) {
+			const old = previous.get(path);
+			if (old?.contentHash === row.contentHash) {
+				continue;
+			}
+			if (row.updatedByClientId === (this.host.getPresenceSessionId?.() ?? "")) {
+				continue;
+			}
+			await this.applyRemoteBinaryFile(row);
+		}
+		for (const [path, old] of previous) {
+			if (!next.has(path)) {
+				await this.applyRemoteBinaryDelete(path, old);
+			}
+		}
 	}
 
 	private async applyRemoteConfigSnapshot(snapshot: Snapshot): Promise<void> {
@@ -655,6 +742,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 		const editorTextAtStart = binding.editor.getValue();
 		const localText = localTextOverride ?? editorTextAtStart;
+		if (!canUseLiveTextSync(localText)) {
+			await this.mirrorTextSnapshot(binding.file.path, localText);
+			return;
+		}
 		const result = await engine.reconcilePath(binding.file.path, localText);
 		if (this.current !== binding || binding.editor.getValue() !== editorTextAtStart) {
 			return;
@@ -697,6 +788,15 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		if (!engine || this.disposed) {
 			return;
 		}
+		if (!canUseLiveTextSync(localText)) {
+			if (file === null) {
+				await this.writePathText(path, localText);
+			}
+			if (options.mirrorSnapshot ?? true) {
+				await this.mirrorTextSnapshot(path, localText);
+			}
+			return;
+		}
 		const result = await engine.reconcilePath(path, localText, {
 			preferRemoteOnMissingBase: options.preferRemoteOnMissingBase,
 		});
@@ -711,6 +811,10 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	private async syncModifiedFile(file: TFile): Promise<void> {
 		const path = normalizePath(file.path);
 		if (this.suppressPathEvents.has(path) || this.isCurrentOpenPath(path)) {
+			return;
+		}
+		if (!isTextSyncFile(file)) {
+			this.enqueueBinaryUpload(file, "modified");
 			return;
 		}
 		const text = await this.host.app.vault.read(file);
@@ -934,6 +1038,113 @@ class ObsidianLiveSyncController implements LiveSyncController {
 		}
 	}
 
+	private enqueueBinaryUpload(
+		file: TFile,
+		action: "created" | "modified" | "renamed",
+	): void {
+		const path = normalizePath(file.path);
+		if (!isBinaryStorageSyncPath(path) || this.disposed || this.bulkSyncActive) {
+			return;
+		}
+		this.binaryUploadQueue = this.binaryUploadQueue
+			.catch(() => undefined)
+			.then(() => this.uploadBinaryFileByPath(path, action));
+	}
+
+	private async uploadBinaryFileByPath(
+		path: string,
+		action: "created" | "modified" | "renamed",
+	): Promise<void> {
+		const client = this.host.getFileSyncClient?.() ?? null;
+		const clientId = this.host.getPresenceSessionId?.() ?? "";
+		const convexSecret = this.host.settings.convexSecret.trim();
+		if (!client || convexSecret.length === 0 || clientId.length === 0 || this.disposed) {
+			return;
+		}
+		const existing = this.host.app.vault.getAbstractFileByPath(path);
+		if (!(existing instanceof TFile) || isTextSyncFile(existing)) {
+			return;
+		}
+		try {
+			const bytes = await this.host.app.vault.readBinary(existing);
+			await uploadLocalFile(
+				client,
+				convexSecret,
+				clientId,
+				path,
+				bytes,
+				existing.stat.mtime,
+			);
+			this.host.setStatus(`Convex sync: ${action} ${existing.basename}`);
+		} catch (error) {
+			console.warn("[live-sync] binary upload skipped", {
+				path,
+				message: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	private async applyRemoteBinaryFile(row: FileSnapshotRow): Promise<void> {
+		const client = this.host.getFileSyncClient?.() ?? null;
+		const convexSecret = this.host.settings.convexSecret.trim();
+		const path = normalizePath(row.path);
+		if (!client || convexSecret.length === 0 || this.disposed || !isStorageSnapshotSyncRow(row)) {
+			return;
+		}
+		const existing = this.host.app.vault.getAbstractFileByPath(path);
+		if (existing instanceof TFile && existing.stat.mtime > row.updatedAtMs) {
+			return;
+		}
+		if (existing instanceof TFile && isTextSyncFile(existing) && !isLargeTextStorageRow(row)) {
+			return;
+		}
+		const remote = await readRemoteFileBytes(client, convexSecret, path);
+		if (!remote) {
+			return;
+		}
+		this.suppressPathEvents.add(path);
+		try {
+			if (isLargeTextStorageRow(row)) {
+				await this.writePathText(path, new TextDecoder().decode(remote.bytes));
+			} else if (existing instanceof TFile) {
+				await this.host.app.vault.modifyBinary(existing, remote.bytes);
+			} else {
+				await ensureVaultFolderExists(this.host.app, folderPathForFile(path));
+				await this.host.app.vault.createBinary(path, remote.bytes);
+			}
+			this.host.setStatus(`Convex sync: binary updated ${path}`);
+		} finally {
+			queueMicrotask(() => {
+				this.suppressPathEvents.delete(path);
+			});
+		}
+	}
+
+	private async applyRemoteBinaryDelete(
+		path: string,
+		previousRemote: FileSnapshotRow,
+	): Promise<void> {
+		if (this.disposed || !isBinaryStorageSyncPath(path)) {
+			return;
+		}
+		const existing = this.host.app.vault.getAbstractFileByPath(path);
+		if (!(existing instanceof TFile) || isTextSyncFile(existing)) {
+			return;
+		}
+		if (existing.stat.mtime > previousRemote.updatedAtMs) {
+			return;
+		}
+		this.suppressPathEvents.add(path);
+		try {
+			await this.host.app.vault.delete(existing);
+			this.host.setStatus(`Convex sync: binary deleted ${path}`);
+		} finally {
+			queueMicrotask(() => {
+				this.suppressPathEvents.delete(path);
+			});
+		}
+	}
+
 	private async removeSnapshotPath(path: string): Promise<void> {
 		const client = this.host.getFileSyncClient?.() ?? null;
 		const convexSecret = this.host.settings.convexSecret.trim();
@@ -972,6 +1183,7 @@ class ObsidianLiveSyncController implements LiveSyncController {
 	private shouldIgnoreVaultEventPath(path: string): boolean {
 		return (
 			this.disposed ||
+			this.bulkSyncActive ||
 			path.trim() === "" ||
 			shouldIgnoreVaultPath(path) ||
 			this.suppressPathEvents.has(path)
@@ -1019,7 +1231,58 @@ function configSnapshotSignature(snapshot: Snapshot): string {
 	return [...files, ...folders].sort().join("\n");
 }
 
+function storageSnapshotMap(snapshot: Snapshot): Map<string, FileSnapshotRow> {
+	const rows = new Map<string, FileSnapshotRow>();
+	for (const file of snapshot.files) {
+		const path = normalizePath(file.path);
+		const row = { ...file, path };
+		if (isStorageSnapshotSyncRow(row)) {
+			rows.set(path, row);
+		}
+	}
+	return rows;
+}
+
+function storageSnapshotSignature(snapshot: Snapshot): string {
+	return [...storageSnapshotMap(snapshot).values()]
+		.map(
+			(file) =>
+				`f:${file.path}:${file.contentHash}:${file.updatedAtMs}:${file.updatedByClientId}`,
+		)
+		.sort()
+		.join("\n");
+}
+
 function isSyncedDotObsidianPath(path: string): boolean {
 	const normalized = normalizePath(path);
 	return isDotObsidianPath(normalized) && !shouldIgnoreVaultPath(normalized);
+}
+
+function isBinaryStorageSyncPath(path: string): boolean {
+	const normalized = normalizePath(path);
+	return (
+		normalized.trim() !== "" &&
+		!isDotObsidianPath(normalized) &&
+		!shouldIgnoreVaultPath(normalized) &&
+		!isTextSyncVaultPath(normalized)
+	);
+}
+
+function isStorageSnapshotSyncRow(row: FileSnapshotRow): boolean {
+	return isBinaryStorageSyncPath(row.path) || isLargeTextStorageRow(row);
+}
+
+function isLargeTextStorageRow(row: FileSnapshotRow): boolean {
+	const normalized = normalizePath(row.path);
+	return (
+		normalized.trim() !== "" &&
+		!isDotObsidianPath(normalized) &&
+		!shouldIgnoreVaultPath(normalized) &&
+		isTextSyncVaultPath(normalized) &&
+		row.sizeBytes > MAX_LIVE_TEXT_BYTES
+	);
+}
+
+function canUseLiveTextSync(text: string): boolean {
+	return new TextEncoder().encode(text).byteLength <= MAX_LIVE_TEXT_BYTES;
 }

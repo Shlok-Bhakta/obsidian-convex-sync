@@ -369,7 +369,7 @@ export class SyncEngine {
 					entry.lastRemoteClientId = remoteClientId;
 				}
 				void this.enqueueEntry(entry, () =>
-					entry.session.applyRemoteChanges(changes.map((change) => change.data)),
+					entry.session.applyRemoteChanges(changes),
 				).catch((error: unknown) => {
 					console.warn("[engine] remote apply skipped", {
 						docId,
@@ -383,12 +383,7 @@ export class SyncEngine {
 			if (remoteClientId) {
 				entry.lastRemoteClientId = remoteClientId;
 			}
-			await this.enqueueEntry(entry, () =>
-				entry.session.applyRemoteChanges(missing.map((change) => change.data)),
-			);
-			if (missing.length === 0 || entry.session.getTextSnapshot().length > 0) {
-				await this.enqueueEntry(entry, () => entry.session.pushSnapshot());
-			}
+			await this.enqueueEntry(entry, () => entry.session.applyRemoteChanges(missing));
 			return entry;
 		} catch (error) {
 			this.sessions.delete(docId);

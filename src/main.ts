@@ -35,6 +35,7 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 	private convex = new ConvexClientManager(() => this.settings);
 	private syncStatusBarItemEl: HTMLElement | null = null;
 	private liveSync: LiveSyncController | null = null;
+	private bulkSyncDepth = 0;
 
 	getPresenceSessionId(): string {
 		return this.presenceSessionId;
@@ -79,6 +80,7 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			name: "Sync vault files with Convex",
 			callback: () => {
 				this.syncStatusBarItemEl?.setText("Convex sync: starting...");
+				this.beginBulkSync();
 				void runVaultFileSync({
 					app: this.app,
 					settings: this.settings,
@@ -99,6 +101,9 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 						new Notice(`Convex sync failed: ${message}`, 10000);
 						this.syncStatusBarItemEl?.setText("Convex sync: failed");
 						console.error(err);
+					})
+					.finally(() => {
+						this.endBulkSync();
 					});
 			},
 		});
@@ -192,6 +197,17 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			getPresenceSessionId: () => this.getPresenceSessionId(),
 			setStatus: (text) => this.syncStatusBarItemEl?.setText(text),
 		});
+		this.liveSync.setBulkSyncActive(this.bulkSyncDepth > 0);
+	}
+
+	private beginBulkSync(): void {
+		this.bulkSyncDepth += 1;
+		this.liveSync?.setBulkSyncActive(true);
+	}
+
+	private endBulkSync(): void {
+		this.bulkSyncDepth = Math.max(0, this.bulkSyncDepth - 1);
+		this.liveSync?.setBulkSyncActive(this.bulkSyncDepth > 0);
 	}
 
 	private async resetLocalSyncState(): Promise<void> {

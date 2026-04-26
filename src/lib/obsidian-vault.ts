@@ -76,9 +76,20 @@ export async function ensureAdapterFolderExists(
 }
 
 export function isTextSyncFile(file: TFile): boolean {
-	const extension = file.extension.toLowerCase();
+	return isTextSyncPath(file.path, file.extension);
+}
+
+export function isTextSyncPath(path: string, extension: string): boolean {
+	const normalizedExtension = extension.toLowerCase();
 	return (
-		(extension === "md" || extension === "markdown" || extension === "txt") &&
-		!isMergeBackupPath(file.path)
+		(normalizedExtension === "md" ||
+			normalizedExtension === "markdown" ||
+			normalizedExtension === "txt") &&
+		!isMergeBackupPath(path)
 	);
+}
+
+export function isTextSyncVaultPath(path: string): boolean {
+	const extension = path.split(".").pop() ?? "";
+	return isTextSyncPath(path, extension);
 }

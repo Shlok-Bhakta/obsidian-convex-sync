@@ -6,6 +6,8 @@ import { hash as sha256 } from "fast-sha256";
 
 const DEFAULT_PAGE_SIZE = 100;
 const MAX_PAGE_SIZE = 1000;
+const MAX_AUTOMERGE_PAYLOAD_BYTES = 900_000;
+const MAX_AUTOMERGE_MUTATION_BYTES = 900_000;
 
 const changeType = v.union(v.literal("incremental"), v.literal("snapshot"));
 
@@ -24,6 +26,21 @@ export const submitChanges = mutation({
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
+		let totalBytes = 0;
+		for (const change of args.changes) {
+			const byteLength = change.data.byteLength;
+			if (byteLength > MAX_AUTOMERGE_PAYLOAD_BYTES) {
+				throw new Error(
+					`Automerge change is too large (${byteLength} bytes > ${MAX_AUTOMERGE_PAYLOAD_BYTES} bytes)`,
+				);
+			}
+			totalBytes += byteLength;
+		}
+		if (totalBytes > MAX_AUTOMERGE_MUTATION_BYTES) {
+			throw new Error(
+				`Automerge change batch is too large (${totalBytes} bytes > ${MAX_AUTOMERGE_MUTATION_BYTES} bytes)`,
+			);
+		}
 
 		const existingByKey = await ctx.db
 			.query("automergeChanges")

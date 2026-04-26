@@ -1,6 +1,8 @@
 import type { ConvexHttpClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 
+const MAX_CONVEX_BYTES_ARG_BYTES = 900_000;
+
 function toHex(buffer: ArrayBuffer): string {
 	const bytes = new Uint8Array(buffer);
 	return Array.from(bytes)
@@ -18,24 +20,6 @@ export async function readRemoteFileBytes(
 	secret: string,
 	path: string,
 ): Promise<{ bytes: ArrayBuffer; updatedAtMs: number } | null> {
-	try {
-		const payload = await client.action(api.fileSync.getFileBytes, {
-			convexSecret: secret,
-			path,
-		});
-		if (payload) {
-			return {
-				bytes: payload.bytes,
-				updatedAtMs: payload.updatedAtMs,
-			};
-		}
-	} catch (error) {
-		console.warn("[file-sync] Convex action download failed, falling back to signed URL", {
-			path,
-			message: error instanceof Error ? error.message : String(error),
-		});
-	}
-
 	const signed = await client.query(api.fileSync.getDownloadUrl, {
 		convexSecret: secret,
 		path,
@@ -105,6 +89,9 @@ export async function uploadLocalFile(
 			force: options.force,
 		});
 	} catch (error) {
+		if (blob.size > MAX_CONVEX_BYTES_ARG_BYTES) {
+			throw error;
+		}
 		console.warn("[file-sync] signed upload failed, falling back to Convex action", {
 			path,
 			message: error instanceof Error ? error.message : String(error),
