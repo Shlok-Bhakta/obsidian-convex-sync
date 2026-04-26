@@ -17,4 +17,9 @@ export const YjsLocalCache = {
 	async remove(docId: string): Promise<void> {
 		await del(docId, obsidianConvexIdbStore);
 	},
+	/** True if IndexedDB has a non-empty persisted Yjs update for this doc. */
+	async hasCachedState(docId: string): Promise<boolean> {
+		const state = await get<Uint8Array>(docId, obsidianConvexIdbStore);
+		return state != null && state.byteLength > 0;
+	},
 };

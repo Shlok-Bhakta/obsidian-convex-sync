@@ -1,4 +1,4 @@
-import { Notice, Plugin, WorkspaceLeaf } from "obsidian";
+import { Notice, Plugin, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
 import {
 	ClientsPresenceView,
 	CLIENTS_PRESENCE_VIEW_TYPE,
@@ -7,7 +7,7 @@ import {
 	startClientsPresence,
 } from "./clients-presence";
 import { ConvexClientManager } from "./convex/client-manager";
-import { runVaultFileSync } from "./file-sync";
+import { isTextSyncFile, runVaultFileSync } from "./file-sync";
 import { api } from "../convex/_generated/api";
 import {
 	ensureVaultSecretRegisteredWithDeployment,
@@ -40,6 +40,11 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 
 	getDocAwareness() {
 		return this.docManager?.getCurrentAwareness() ?? null;
+	}
+
+	/** Flush open Markdown Yjs state before bootstrap so the archive matches the editor. */
+	async flushEditorDocForBootstrap(): Promise<void> {
+		await this.docManager?.closeCurrentDoc();
 	}
 
 	async onload() {
@@ -131,6 +136,57 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 					}
 				}),
 			);
+
+			this.registerEvent(
+				this.app.vault.on("create", (abstractFile) => {
+					if (abstractFile instanceof TFile) {
+						if (abstractFile.extension === "md") {
+							void this.docManager?.onFileCreated(abstractFile.path);
+						} else {
+							void this.binarySync?.onLocalFileCreated(abstractFile);
+						}
+					} else if (abstractFile instanceof TFolder) {
+						void this.binarySync?.onLocalFolderCreated(abstractFile.path);
+					}
+				}),
+			);
+			this.registerEvent(
+				this.app.vault.on("modify", (abstractFile) => {
+					if (abstractFile instanceof TFile) {
+						const path = normalizePath(abstractFile.path);
+						if (!isTextSyncFile(path)) {
+							void this.binarySync?.onLocalFileModified(abstractFile);
+						}
+					}
+				}),
+			);
+			this.registerEvent(
+				this.app.vault.on("rename", (abstractFile, oldPath) => {
+					if (abstractFile instanceof TFile) {
+						if (abstractFile.extension === "md") {
+							void this.docManager?.onFileRenamed(oldPath, abstractFile.path);
+						} else {
+							void this.binarySync?.onLocalFileRenamed(oldPath, abstractFile);
+						}
+					} else if (abstractFile instanceof TFolder) {
+						void this.binarySync?.onLocalFolderRenamed(oldPath, abstractFile.path);
+					}
+				}),
+			);
+			this.registerEvent(
+				this.app.vault.on("delete", (abstractFile) => {
+					if (abstractFile instanceof TFile) {
+						if (abstractFile.extension === "md") {
+							void this.docManager?.onFileDeleted(abstractFile.path);
+						} else {
+							void this.binarySync?.onLocalFileDeleted(abstractFile.path);
+						}
+					} else if (abstractFile instanceof TFolder) {
+						void this.binarySync?.onLocalFolderDeleted(abstractFile.path);
+					}
+				}),
+			);
+
 			this.register(() => {
 				void this.docManager?.dispose();
 				this.docManager = null;
@@ -141,10 +197,26 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 				this.getConvexHttpClient(),
 				realtimeClient,
 				this.settings.convexSecret.trim(),
+				this.presenceSessionId,
 			);
-			void this.binarySync.start().catch((err: unknown) => {
-				console.error("Convex binary sync catch-up failed", err);
-			});
+			void (async () => {
+				try {
+					await this.binarySync?.start();
+				} catch (err: unknown) {
+					console.error("Convex binary sync catch-up failed", err);
+				}
+				const secret = this.settings.convexSecret.trim();
+				if (!secret || !this.docManager) return;
+				try {
+					const snapshot = await this.getConvexHttpClient().query(api.fileSync.listSnapshot, {
+						convexSecret: secret,
+					});
+					const textPaths = snapshot.files.filter((f) => f.isText).map((f) => f.path);
+					await this.docManager.warmUpAllDocs(textPaths);
+				} catch (e: unknown) {
+					console.warn("DocManager warmUp error", e);
+				}
+			})();
 			this.register(() => {
 				this.binarySync?.dispose();
 				this.binarySync = null;

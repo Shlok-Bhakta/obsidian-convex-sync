@@ -37,7 +37,9 @@ export class ConvexYjsProvider {
 			this.convexApi.init as FunctionReference<"action">,
 			{
 				docId: this.docId,
-				stateVector: toArrayBuffer(Y.encodeStateVector(this.doc)),
+				// Fresh doc state vector = "no local state" so init returns the full server update.
+				// Do not use a zero-length Uint8Array: lib0 cannot decode it as a state vector.
+				stateVector: toArrayBuffer(Y.encodeStateVector(new Y.Doc())),
 			},
 		);
 		if (this.destroyed) return;
@@ -56,6 +58,17 @@ export class ConvexYjsProvider {
 				console.error("Convex Yjs pull subscription failed", error);
 			},
 		);
+	}
+
+	/** Push the entire CRDT state (e.g. after rename when docId changes server-side). */
+	async pushFullState(): Promise<void> {
+		if (this.destroyed) return;
+		const update = Y.encodeStateAsUpdate(this.doc);
+		if (update.byteLength === 0) return;
+		await this.client.mutation(this.convexApi.push as FunctionReference<"mutation">, {
+			docId: this.docId,
+			update: toArrayBuffer(update),
+		});
 	}
 
 	destroy(): void {

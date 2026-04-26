@@ -14,6 +14,7 @@ type DocEntry = {
 	doc: Y.Doc;
 	awareness: Awareness;
 	provider: ConvexYjsProvider;
+	/** Attached after yCollab + updateOptions so remote cursors never target an empty CM doc. */
 	awarenessSync: ConvexAwarenessSync | null;
 };
 
@@ -22,6 +23,7 @@ export class DocManager {
 	readonly extensions: Extension[] = [];
 	private current: DocEntry | null = null;
 	private currentPath: string | null = null;
+	private destroyed = false;
 
 	/** Current Yjs awareness for the open collaborative doc (sidebar presence merge). */
 	getCurrentAwareness(): Awareness | null {
@@ -79,24 +81,34 @@ export class DocManager {
 			persistDocAndManifest();
 		});
 
-		const awarenessSync =
-			this.convexSecret.trim() !== ""
-				? new ConvexAwarenessSync(
-						this.client,
-						docId,
-						awareness,
-						this.convexApi.yjsAwareness,
-						this.convexSecret,
-					)
-				: null;
-
-		this.current = { doc, awareness, provider, awarenessSync };
+		const ytext = doc.getText("content");
+		const entry: DocEntry = { doc, awareness, provider, awarenessSync: null };
+		this.current = entry;
 		this.currentPath = path;
 
-		const ytext = doc.getText("content");
 		this.extensions.length = 0;
 		this.extensions.push(yCollab(ytext, awareness));
 		this.app.workspace.updateOptions();
+
+		// Remote awareness carries cursor positions. Convex may deliver rows in the same
+		// turn as subscription setup; defer until after CM has applied yCollab so length
+		// matches Y.Text (avoids RangeError: Invalid position N in document of length 0).
+		let awarenessAttached = false;
+		const attachAwareness = (): void => {
+			if (this.destroyed || this.current !== entry || awarenessAttached) return;
+			awarenessAttached = true;
+			entry.awarenessSync =
+				this.convexSecret.trim() !== ""
+					? new ConvexAwarenessSync(
+							this.client,
+							docId,
+							awareness,
+							this.convexApi.yjsAwareness,
+							this.convexSecret,
+						)
+					: null;
+		};
+		requestAnimationFrame(attachAwareness);
 	}
 
 	async closeCurrentDoc(): Promise<void> {
@@ -121,7 +133,122 @@ export class DocManager {
 	}
 
 	async dispose(): Promise<void> {
+		this.destroyed = true;
 		await this.closeCurrentDoc();
+	}
+
+	/** Register a new Markdown file on the server manifest (empty content) before first open. */
+	async onFileCreated(path: string): Promise<void> {
+		const docId = this.pathToDocId(path);
+		const doc = new Y.Doc();
+		const content = doc.getText("content").toString();
+		const hash = await sha256Utf8(content);
+		await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
+			convexSecret: this.convexSecret,
+			path: normalizePath(path),
+			contentHash: hash,
+			sizeBytes: 0,
+			updatedAtMs: Date.now(),
+			clientId: this.clientId,
+		});
+		doc.destroy();
+	}
+
+	async onFileRenamed(oldPath: string, newPath: string): Promise<void> {
+		const oldDocId = this.pathToDocId(oldPath);
+		const newDocId = this.pathToDocId(newPath);
+
+		if (this.currentPath === oldPath) {
+			await this.closeCurrentDoc();
+		}
+
+		const hadCached = await YjsLocalCache.hasCachedState(oldDocId);
+		if (hadCached) {
+			const tempDoc = new Y.Doc();
+			await YjsLocalCache.load(oldDocId, tempDoc);
+			await YjsLocalCache.save(newDocId, tempDoc);
+			tempDoc.destroy();
+		}
+		await YjsLocalCache.remove(oldDocId);
+
+		await this.client.mutation(this.convexApi.fileSync.removeFilesByPath, {
+			convexSecret: this.convexSecret,
+			removedPaths: [normalizePath(oldPath)],
+		});
+		await this.onFileCreated(newPath);
+
+		if (hadCached) {
+			const doc = new Y.Doc();
+			await YjsLocalCache.load(newDocId, doc);
+			const provider = new ConvexYjsProvider(
+				this.client,
+				newDocId,
+				doc,
+				this.convexApi.yjs,
+			);
+			try {
+				await provider.init();
+				await provider.pushFullState();
+				const content = doc.getText("content").toString();
+				const hash = await sha256Utf8(content);
+				await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
+					convexSecret: this.convexSecret,
+					path: normalizePath(newPath),
+					contentHash: hash,
+					sizeBytes: new TextEncoder().encode(content).length,
+					updatedAtMs: Date.now(),
+					clientId: this.clientId,
+				});
+				await YjsLocalCache.save(newDocId, doc);
+			} finally {
+				provider.destroy();
+				doc.destroy();
+			}
+		}
+	}
+
+	async onFileDeleted(path: string): Promise<void> {
+		const docId = this.pathToDocId(path);
+		if (this.currentPath === path) {
+			await this.closeCurrentDoc();
+		}
+		await YjsLocalCache.remove(docId);
+		await this.client.mutation(this.convexApi.fileSync.removeFilesByPath, {
+			convexSecret: this.convexSecret,
+			removedPaths: [normalizePath(path)],
+		});
+	}
+
+	/**
+	 * For each remote Markdown path without local idb cache, pull full Yjs state once and persist.
+	 * Ensures Convex has been exercised for known files and improves cold-start cache coverage.
+	 */
+	async warmUpAllDocs(remotePaths: string[]): Promise<void> {
+		for (const path of remotePaths) {
+			if (this.destroyed) return;
+			const docId = this.pathToDocId(path);
+			if (await YjsLocalCache.hasCachedState(docId)) continue;
+
+			const doc = new Y.Doc();
+			const provider = new ConvexYjsProvider(
+				this.client,
+				docId,
+				doc,
+				this.convexApi.yjs,
+			);
+			try {
+				await provider.init();
+				if (doc.getText("content").toString().length > 0) {
+					await YjsLocalCache.save(docId, doc);
+				}
+			} catch (e) {
+				console.warn(`[DocManager] warmUp failed for ${path}`, e);
+			} finally {
+				provider.destroy();
+				doc.destroy();
+			}
+			await new Promise((r) => setTimeout(r, 50));
+		}
 	}
 
 	private pathToDocId(path: string): string {

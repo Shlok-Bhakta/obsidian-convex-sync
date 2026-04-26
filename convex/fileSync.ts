@@ -331,3 +331,55 @@ export const removeFilesByPath = mutation({
 	},
 });
 
+export const removeFoldersByPath = mutation({
+	args: {
+		convexSecret: v.string(),
+		removedPaths: v.array(v.string()),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		for (const raw of args.removedPaths) {
+			const path = normalizePath(raw);
+			const existing = await ctx.db
+				.query("vaultFolders")
+				.withIndex("by_path", (q) => q.eq("path", path))
+				.unique();
+			if (existing) {
+				await ctx.db.delete(existing._id);
+			}
+		}
+	},
+});
+
+/** Realtime-safe: upsert one explicitly-empty folder without rewriting all folder rows. */
+export const registerExplicitEmptyFolder = mutation({
+	args: {
+		convexSecret: v.string(),
+		path: v.string(),
+		scannedAtMs: v.number(),
+		clientId: v.string(),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const path = normalizePath(args.path);
+		const existing = await ctx.db
+			.query("vaultFolders")
+			.withIndex("by_path", (q) => q.eq("path", path))
+			.unique();
+		if (existing) {
+			await ctx.db.patch(existing._id, {
+				updatedAtMs: args.scannedAtMs,
+				isExplicitlyEmpty: true,
+				updatedByClientId: args.clientId,
+			});
+		} else {
+			await ctx.db.insert("vaultFolders", {
+				path,
+				updatedAtMs: args.scannedAtMs,
+				isExplicitlyEmpty: true,
+				updatedByClientId: args.clientId,
+			});
+		}
+	},
+});
+

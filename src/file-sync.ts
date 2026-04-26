@@ -3,7 +3,8 @@ import { Notice, TFile, TFolder, normalizePath } from "obsidian";
 import { api } from "../convex/_generated/api";
 import type { MyPluginSettings } from "./settings";
 
-// Text files sync via Yjs (doc-manager). Never upload/download them here.
+// INTENTIONAL: Only .md files use Yjs. Other text-like files (.json, .canvas, .svg, etc.)
+// sync as binary blobs — no CRDT merge semantics required unless we extend this later.
 export function isTextSyncFile(path: string): boolean {
 	return path.endsWith(".md");
 }
@@ -106,7 +107,8 @@ export async function readRemoteFileBytes(
 	return { bytes, updatedAtMs: signed.updatedAtMs };
 }
 
-async function uploadLocalFile(
+/** Upload or replace a binary vault file (used by manual sync and realtime binary sync). */
+export async function uploadLocalFile(
 	client: ConvexHttpClient,
 	secret: string,
 	clientId: string,

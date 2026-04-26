@@ -3,7 +3,7 @@ import type { ConvexClient, ConvexHttpClient } from "convex/browser";
 import { del, get, keys, set } from "idb-keyval";
 import { normalizePath, TFile, type App } from "obsidian";
 import { api } from "../../convex/_generated/api";
-import { isTextSyncFile, readRemoteFileBytes } from "../file-sync";
+import { isTextSyncFile, readRemoteFileBytes, uploadLocalFile } from "../file-sync";
 import { obsidianConvexIdbStore } from "./yjs-local-cache";
 
 const BINARY_SYNC_CURSOR_KEY = "binarySync:cursor";
@@ -96,12 +96,14 @@ async function writeLocalFile(app: App, path: string, bytes: ArrayBuffer): Promi
 
 export class BinarySyncManager {
 	private realtimeUnsub: (() => void) | null = null;
+	private readonly modifyDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 	constructor(
 		private readonly app: App,
 		private readonly httpClient: ConvexHttpClient,
 		private readonly realtimeClient: ConvexClient,
 		private readonly convexSecret: string,
+		private readonly clientId: string,
 	) {}
 
 	async start(): Promise<void> {
@@ -116,6 +118,8 @@ export class BinarySyncManager {
 			await this.syncFile(file);
 		}
 
+		await this.syncRemoteFolders();
+
 		this.realtimeUnsub = this.realtimeClient.onUpdate(
 			api.fileSync.listFileHashes as FunctionReference<"query">,
 			{ convexSecret: this.convexSecret },
@@ -126,6 +130,19 @@ export class BinarySyncManager {
 				console.error("Convex binary file hash subscription failed", err);
 			},
 		);
+	}
+
+	private async syncRemoteFolders(): Promise<void> {
+		const snapshot = await this.httpClient.query(api.fileSync.listSnapshot, {
+			convexSecret: this.convexSecret,
+		});
+		for (const folder of snapshot.folders) {
+			if (!folder.isExplicitlyEmpty) continue;
+			const exists = await this.app.vault.adapter.exists(folder.path);
+			if (!exists) {
+				await this.app.vault.createFolder(folder.path).catch(() => {});
+			}
+		}
 	}
 
 	private async onRemoteFileList(remoteFiles: RemoteFileMeta[]): Promise<void> {
@@ -179,7 +196,74 @@ export class BinarySyncManager {
 		);
 	}
 
+	async onLocalFileCreated(file: TFile): Promise<void> {
+		const path = normalizePath(file.path);
+		if (isTextSyncFile(path)) return;
+		const bytes = await this.app.vault.readBinary(file);
+		await uploadLocalFile(
+			this.httpClient,
+			this.convexSecret,
+			this.clientId,
+			path,
+			bytes,
+			file.stat.mtime,
+		);
+	}
+
+	async onLocalFileModified(file: TFile): Promise<void> {
+		const path = normalizePath(file.path);
+		if (isTextSyncFile(path)) return;
+		const existing = this.modifyDebounceTimers.get(path);
+		if (existing) clearTimeout(existing);
+		this.modifyDebounceTimers.set(
+			path,
+			setTimeout(() => {
+				this.modifyDebounceTimers.delete(path);
+				void this.onLocalFileCreated(file);
+			}, 800),
+		);
+	}
+
+	async onLocalFileDeleted(path: string): Promise<void> {
+		const norm = normalizePath(path);
+		await del(hashKeyForPath(norm), obsidianConvexIdbStore);
+		await this.httpClient.mutation(api.fileSync.removeFilesByPath, {
+			convexSecret: this.convexSecret,
+			removedPaths: [norm],
+		});
+	}
+
+	async onLocalFileRenamed(oldPath: string, newFile: TFile): Promise<void> {
+		await this.onLocalFileDeleted(oldPath);
+		await this.onLocalFileCreated(newFile);
+	}
+
+	async onLocalFolderCreated(folderPath: string): Promise<void> {
+		const norm = normalizePath(folderPath);
+		await this.httpClient.mutation(api.fileSync.registerExplicitEmptyFolder, {
+			convexSecret: this.convexSecret,
+			path: norm,
+			scannedAtMs: Date.now(),
+			clientId: this.clientId,
+		});
+	}
+
+	async onLocalFolderDeleted(folderPath: string): Promise<void> {
+		await this.httpClient.mutation(api.fileSync.removeFoldersByPath, {
+			convexSecret: this.convexSecret,
+			removedPaths: [normalizePath(folderPath)],
+		});
+	}
+
+	async onLocalFolderRenamed(oldPath: string, newPath: string): Promise<void> {
+		await this.onLocalFolderDeleted(oldPath);
+	}
+
 	dispose(): void {
+		for (const t of this.modifyDebounceTimers.values()) {
+			clearTimeout(t);
+		}
+		this.modifyDebounceTimers.clear();
 		this.realtimeUnsub?.();
 		this.realtimeUnsub = null;
 	}

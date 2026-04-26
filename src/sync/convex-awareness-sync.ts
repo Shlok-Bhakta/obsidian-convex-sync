@@ -49,7 +49,11 @@ export class ConvexAwarenessSync {
 					if (this.appliedRowIds.has(row._id)) continue;
 					this.appliedRowIds.add(row._id);
 					const u8 = new Uint8Array(row.update);
-					applyAwarenessUpdate(this.awareness, u8, REMOTE_ORIGIN);
+					try {
+						applyAwarenessUpdate(this.awareness, u8, REMOTE_ORIGIN);
+					} catch (e) {
+						console.warn("[ConvexAwarenessSync] skipped invalid awareness update", e);
+					}
 				}
 			},
 			(err: Error) => {

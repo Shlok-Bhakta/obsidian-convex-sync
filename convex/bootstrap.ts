@@ -290,6 +290,7 @@ export const buildArchive = internalAction({
 						try {
 							const initial = await ctx.runAction(api.yjs.init, {
 								docId: `${docIdPrefix}${row.path}`,
+								// Valid minimal state vector (same as empty Y.Doc), not raw empty bytes.
 								stateVector: toArrayBuffer(Y.encodeStateVector(doc)),
 							});
 							if (

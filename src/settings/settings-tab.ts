@@ -329,6 +329,8 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 		};
 		this.display();
 		try {
+			await this.plugin.flushEditorDocForBootstrap();
+			await new Promise<void>((resolve) => setTimeout(resolve, 1000));
 			await startBootstrapBuild(
 				{
 					app: this.app,
