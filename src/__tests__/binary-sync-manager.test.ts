@@ -153,7 +153,13 @@ describe("BinarySyncManager", () => {
 		}
 		const queryMock = vi.fn().mockResolvedValue({
 			files: [
-				{ path: ".obsidian/workspace.json", contentHash: "hash-a", updatedAtMs: 1, isText: false },
+				{
+					path: ".obsidian/workspace.json",
+					contentHash: "hash-a",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: false,
+				},
 			],
 			folders: [],
 		});
@@ -191,13 +197,56 @@ describe("BinarySyncManager", () => {
 					path: string;
 					contentHash: string;
 					updatedAtMs: number;
+					updatedByClientId: string;
 					isText: boolean;
 				}>;
-				folders: Array<{ path: string; updatedAtMs: number; isExplicitlyEmpty: boolean }>;
+				folders: Array<{
+					path: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isExplicitlyEmpty: boolean;
+				}>;
 			}) => Promise<void>;
 		}).onRemoteMetadata({
 			files: [
-				{ path: ".obsidian/workspace.json", contentHash: "hash-a", updatedAtMs: 20, isText: false },
+				{
+					path: ".obsidian/workspace.json",
+					contentHash: "hash-a",
+					updatedAtMs: 20,
+					updatedByClientId: "remote",
+					isText: false,
+				},
+			],
+			folders: [],
+		});
+		expect(noticeMock).not.toHaveBeenCalled();
+
+		// Baseline snapshot: same remote hash again should remain quiet.
+		await (manager as unknown as {
+			onRemoteMetadata: (remote: {
+				files: Array<{
+					path: string;
+					contentHash: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isText: boolean;
+				}>;
+				folders: Array<{
+					path: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isExplicitlyEmpty: boolean;
+				}>;
+			}) => Promise<void>;
+		}).onRemoteMetadata({
+			files: [
+				{
+					path: ".obsidian/workspace.json",
+					contentHash: "hash-a",
+					updatedAtMs: 21,
+					updatedByClientId: "remote",
+					isText: false,
+				},
 			],
 			folders: [],
 		});
@@ -210,13 +259,25 @@ describe("BinarySyncManager", () => {
 					path: string;
 					contentHash: string;
 					updatedAtMs: number;
+					updatedByClientId: string;
 					isText: boolean;
 				}>;
-				folders: Array<{ path: string; updatedAtMs: number; isExplicitlyEmpty: boolean }>;
+				folders: Array<{
+					path: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isExplicitlyEmpty: boolean;
+				}>;
 			}) => Promise<void>;
 		}).onRemoteMetadata({
 			files: [
-				{ path: ".obsidian/workspace.json", contentHash: "hash-b", updatedAtMs: 30, isText: false },
+				{
+					path: ".obsidian/workspace.json",
+					contentHash: "hash-b",
+					updatedAtMs: 30,
+					updatedByClientId: "remote",
+					isText: false,
+				},
 			],
 			folders: [],
 		});
@@ -227,7 +288,13 @@ describe("BinarySyncManager", () => {
 		const pulled: string[] = [];
 		const queryMock = vi.fn().mockResolvedValue({
 			files: [
-				{ path: "gone.md", contentHash: "h1", updatedAtMs: 1, isText: true },
+				{
+					path: "gone.md",
+					contentHash: "h1",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: true,
+				},
 			],
 			folders: [],
 		});
@@ -260,21 +327,43 @@ describe("BinarySyncManager", () => {
 					path: string;
 					contentHash: string;
 					updatedAtMs: number;
+					updatedByClientId: string;
 					isText: boolean;
 				}>;
-				folders: Array<{ path: string; updatedAtMs: number; isExplicitlyEmpty: boolean }>;
+				folders: Array<{
+					path: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isExplicitlyEmpty: boolean;
+				}>;
 			}) => Promise<void>;
 		}).onRemoteMetadata;
 
 		await onRemoteMetadata.call(manager, {
-			files: [{ path: "gone.md", contentHash: "h1", updatedAtMs: 1, isText: true }],
+			files: [
+				{
+					path: "gone.md",
+					contentHash: "h1",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: true,
+				},
+			],
 			folders: [],
 		});
 		expect(pulled).toEqual(["gone.md"]);
 
 		manager.noteLocalDeletePending("gone.md");
 		await onRemoteMetadata.call(manager, {
-			files: [{ path: "gone.md", contentHash: "h1", updatedAtMs: 1, isText: true }],
+			files: [
+				{
+					path: "gone.md",
+					contentHash: "h1",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: true,
+				},
+			],
 			folders: [],
 		});
 		expect(pulled).toEqual(["gone.md"]);

@@ -99,6 +99,7 @@ export const buildArchive = internalAction({
 						const doc = new Y.Doc();
 						try {
 							const initial = await ctx.runAction(api.yjsSync.init, {
+								convexSecret: args.convexSecret,
 								docId: `${vaultPrefix}${row.path}`,
 								stateVector: toArrayBuffer(Y.encodeStateVector(doc)),
 							});

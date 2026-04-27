@@ -10,6 +10,7 @@ import {
 	uploadLocalFile,
 } from "../file-sync";
 import type { MyPluginSettings } from "../settings";
+import { isLocalChangeSuppressed, withSuppressedLocalChange } from "./local-change-suppressor";
 import { obsidianConvexIdbStore } from "./yjs-local-cache";
 
 const VAULT_SYNC_TIMESTAMP_KEY = "vaultSync:lastServerTimestamp";
@@ -19,12 +20,14 @@ type RemoteFileMeta = {
 	path: string;
 	contentHash: string;
 	updatedAtMs: number;
+	updatedByClientId: string;
 	isText: boolean;
 };
 
 type RemoteFolderMeta = {
 	path: string;
 	updatedAtMs: number;
+	updatedByClientId: string;
 	isExplicitlyEmpty: boolean;
 };
 
@@ -41,6 +44,18 @@ function folderPathForFile(filePath: string): string | null {
 	const slash = filePath.lastIndexOf("/");
 	if (slash < 0) return null;
 	return filePath.slice(0, slash);
+}
+
+function toHex(buffer: ArrayBuffer): string {
+	const bytes = new Uint8Array(buffer);
+	return Array.from(bytes)
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
+}
+
+async function sha256Bytes(bytes: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return toHex(digest);
 }
 
 /** Uses the vault adapter so we match on-disk state; avoids createFolder() throwing when the tree is not fully in the metadata cache yet. */
@@ -67,28 +82,30 @@ async function writeLocalFile(app: App, path: string, bytes: ArrayBuffer): Promi
 		await ensureFolderExistsOnAdapter(app, parent);
 	}
 
-	const cached = app.vault.getAbstractFileByPath(norm);
-	if (cached instanceof TFile) {
-		await app.vault.modifyBinary(cached, bytes);
-		return;
-	}
+	await withSuppressedLocalChange(norm, async () => {
+		const cached = app.vault.getAbstractFileByPath(norm);
+		if (cached instanceof TFile) {
+			await app.vault.modifyBinary(cached, bytes);
+			return;
+		}
 
-	const stat = await app.vault.adapter.stat(norm);
-	if (stat?.type === "file") {
-		await app.vault.adapter.writeBinary(norm, bytes);
-		return;
-	}
-
-	try {
-		await app.vault.createBinary(norm, bytes);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		if (message.includes("already exists")) {
+		const stat = await app.vault.adapter.stat(norm);
+		if (stat?.type === "file") {
 			await app.vault.adapter.writeBinary(norm, bytes);
 			return;
 		}
-		throw err;
-	}
+
+		try {
+			await app.vault.createBinary(norm, bytes);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (message.includes("already exists")) {
+				await app.vault.adapter.writeBinary(norm, bytes);
+				return;
+			}
+			throw err;
+		}
+	});
 }
 
 export class BinarySyncManager {
@@ -96,18 +113,10 @@ export class BinarySyncManager {
 	private readonly modifyDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly uploadsInFlight = new Set<string>();
 	private readonly pendingUploadPaths = new Set<string>();
-	private remoteFoldersDebounce: ReturnType<typeof setTimeout> | null = null;
-	/** Paths last seen as explicitly-empty on Convex; used to prune local folders when remote removes the row. */
-	private lastExplicitEmptyRemotePaths = new Set<string>();
-	/** Set once we show the per-session .obsidian sync notice (prevents duplicate notices). */
-	private obsidianSyncNoticeShown = false;
-	/** Tracks remote text file paths so we can detect deletions (paths that disappear from metadata). */
-	private lastRemoteTextPaths = new Set<string>();
-	/**
-	 * Paths we removed locally and told Convex to delete; metadata may still list them briefly.
-	 * Do not treat "remote row exists + missing local file" as a pull until the row is gone.
-	 */
+	private readonly lastRemoteFiles = new Map<string, RemoteFileMeta>();
 	private readonly pendingLocalDeletedPaths = new Set<string>();
+	private lastExplicitEmptyRemotePaths = new Set<string>();
+	private obsidianSyncNoticeShown = false;
 
 	constructor(
 		private readonly app: App,
@@ -115,28 +124,24 @@ export class BinarySyncManager {
 		private readonly realtimeClient: ConvexClient,
 		private readonly convexSecret: string,
 		private readonly clientId: string,
-		/** Called when remote text files are discovered (new/modified from another device). */
 		private readonly onRemoteTextFilesDiscovered: (paths: string[]) => Promise<void>,
-		/** Same object as plugin settings (mutated on save); read per call for live toggles. */
 		private readonly pluginSettings: MyPluginSettings,
 	) {}
 
-	/** Call synchronously when the vault file is already gone locally but `removeFilesByPath` may still be in flight. */
 	noteLocalDeletePending(path: string): void {
 		this.pendingLocalDeletedPaths.add(normalizePath(path));
 	}
 
 	private releasePendingDeletesAckedByRemote(files: readonly { path: string }[]): void {
-		const remotePaths = new Set(files.map((f) => normalizePath(f.path)));
-		for (const p of [...this.pendingLocalDeletedPaths]) {
-			if (!remotePaths.has(p)) {
-				this.pendingLocalDeletedPaths.delete(p);
+		const remotePaths = new Set(files.map((file) => normalizePath(file.path)));
+		for (const path of [...this.pendingLocalDeletedPaths]) {
+			if (!remotePaths.has(path)) {
+				this.pendingLocalDeletedPaths.delete(path);
 			}
 		}
 	}
 
 	async start(): Promise<void> {
-		// ----- offline catch-up -----
 		const lastServerTimestamp = await this.loadServerTimestamp();
 		if (lastServerTimestamp > 0) {
 			try {
@@ -148,30 +153,19 @@ export class BinarySyncManager {
 			} catch (err: unknown) {
 				console.error("Convex vault catch-up failed", err);
 			}
-		} else {
-			// First-ever sync: seed the hash cache with all remote binary files so we
-			// don't re-download files that already match on-disk content.
-			try {
-				const full = await this.httpClient.query(api.fileSync.listAllMetadata, {
-					convexSecret: this.convexSecret,
-				});
-				for (const f of full.files) {
-					if (!f.isText && f.contentHash) {
-						await set(hashKeyForPath(f.path), f.contentHash, obsidianConvexIdbStore);
-					}
-				}
-			} catch (err: unknown) {
-				console.error("Convex vault initial seed failed", err);
-			}
 		}
 
-		// Store a fresh server timestamp as the new watermark.
+		try {
+			const full = await this.httpClient.query(api.fileSync.listAllMetadata, {
+				convexSecret: this.convexSecret,
+			});
+			await this.seedBaselineSnapshot(full, lastServerTimestamp === 0);
+		} catch (err: unknown) {
+			console.error("Convex vault baseline sync failed", err);
+		}
+
 		await this.saveServerTimestamp();
 
-		// Sync folder state (handles remote empty-folder create/delete after catch-up).
-		await this.syncRemoteFolders();
-
-		// ----- realtime subscription (covers all vault files + folders) -----
 		this.realtimeUnsub = this.realtimeClient.onUpdate(
 			api.fileSync.listAllMetadata as FunctionReference<"query">,
 			{ convexSecret: this.convexSecret },
@@ -204,99 +198,125 @@ export class BinarySyncManager {
 		}
 	}
 
+	private async seedBaselineSnapshot(
+		remote: RemoteMetadata,
+		seedHashesOnly: boolean,
+	): Promise<void> {
+		this.lastRemoteFiles.clear();
+		for (const file of remote.files) {
+			this.lastRemoteFiles.set(normalizePath(file.path), {
+				...file,
+				path: normalizePath(file.path),
+			});
+			if (seedHashesOnly && !file.isText && file.contentHash) {
+				await set(hashKeyForPath(file.path), file.contentHash, obsidianConvexIdbStore);
+			}
+		}
+		await this.applyRemoteBinaryDeletes(remote.files);
+		await this.applyRemoteFolderSnapshot(remote.folders);
+	}
+
 	private async applyCatchUpChanges(changes: RemoteMetadata): Promise<void> {
 		this.releasePendingDeletesAckedByRemote(changes.files);
-		const textPaths: string[] = [];
+		const textPaths = new Set<string>();
 		const changedObsidianPaths = new Set<string>();
 
 		for (const file of changes.files) {
+			const norm = normalizePath(file.path);
 			if (file.isText) {
-				if (!this.pendingLocalDeletedPaths.has(normalizePath(file.path))) {
-					textPaths.push(file.path);
+				if (
+					!this.pendingLocalDeletedPaths.has(norm) &&
+					file.updatedByClientId !== this.clientId
+				) {
+					textPaths.add(norm);
 				}
-			} else {
-				if (this.pendingLocalDeletedPaths.has(normalizePath(file.path))) {
-					continue;
-				}
-				const changed = await this.syncBinaryFile(file);
-				if (changed && this.isObsidianPath(file.path)) {
-					changedObsidianPaths.add(file.path);
-				}
+				continue;
+			}
+			if (file.updatedByClientId === this.clientId) {
+				await set(hashKeyForPath(norm), file.contentHash, obsidianConvexIdbStore);
+				continue;
+			}
+			if (this.pendingLocalDeletedPaths.has(norm)) {
+				continue;
+			}
+			const changed = await this.syncBinaryFile({ ...file, path: norm });
+			if (changed && this.isObsidianPath(norm)) {
+				changedObsidianPaths.add(norm);
 			}
 		}
 
-		for (const folder of changes.folders) {
-			if (folder.isExplicitlyEmpty) {
-				const exists = await this.app.vault.adapter.exists(folder.path);
-				if (!exists) {
-					await this.app.vault.createFolder(folder.path).catch(() => {});
-				}
-			}
-		}
+		await this.applyRemoteFolderSnapshot(changes.folders);
 
-		// Detect remote deletes (binary hash cache + text path tracking).
-		const deletedObsidianPaths = await this.detectAndApplyRemoteDeletes();
-		for (const path of deletedObsidianPaths) {
-			changedObsidianPaths.add(path);
+		if (textPaths.size > 0) {
+			await this.onRemoteTextFilesDiscovered([...textPaths]);
 		}
-
-		// Notify DocManager about remote text files discovered during catch-up.
-		if (textPaths.length > 0) {
-			await this.onRemoteTextFilesDiscovered(textPaths);
-		}
-
 		this.maybeNotifyObsidianSyncChanges(changedObsidianPaths);
 	}
 
 	private async onRemoteMetadata(remote: RemoteMetadata): Promise<void> {
 		this.releasePendingDeletesAckedByRemote(remote.files);
-		const textPaths: string[] = [];
-		const currentRemoteTextPaths = new Set<string>();
+		const nextRemoteFiles = new Map<string, RemoteFileMeta>();
+		const textPaths = new Set<string>();
 		const changedObsidianPaths = new Set<string>();
 
 		for (const file of remote.files) {
-			if (file.isText) {
-				const norm = normalizePath(file.path);
-				currentRemoteTextPaths.add(file.path);
-				const exists = this.app.vault.getAbstractFileByPath(file.path) instanceof TFile;
-				if (!exists && !this.pendingLocalDeletedPaths.has(norm)) {
-					textPaths.push(file.path);
+			const norm = normalizePath(file.path);
+			const normalizedFile = { ...file, path: norm };
+			nextRemoteFiles.set(norm, normalizedFile);
+			const previous = this.lastRemoteFiles.get(norm);
+			const changed =
+				previous === undefined ||
+				previous.contentHash !== normalizedFile.contentHash ||
+				previous.updatedAtMs !== normalizedFile.updatedAtMs;
+
+			if (normalizedFile.isText) {
+				if (
+					changed &&
+					normalizedFile.updatedByClientId !== this.clientId &&
+					!this.pendingLocalDeletedPaths.has(norm)
+				) {
+					textPaths.add(norm);
 				}
 				continue;
 			}
 
-			if (this.pendingLocalDeletedPaths.has(normalizePath(file.path))) {
+			const cachedHash = await get<string>(hashKeyForPath(norm), obsidianConvexIdbStore);
+			if (normalizedFile.updatedByClientId === this.clientId) {
+				await set(hashKeyForPath(norm), normalizedFile.contentHash, obsidianConvexIdbStore);
 				continue;
 			}
-
-			const localHash = await get<string>(hashKeyForPath(file.path), obsidianConvexIdbStore);
-			if (localHash === file.contentHash) continue;
-			const changed = await this.syncBinaryFile(file);
-			if (changed && this.isObsidianPath(file.path)) {
-				changedObsidianPaths.add(file.path);
+			if (cachedHash === normalizedFile.contentHash) {
+				continue;
+			}
+			if (!changed || this.pendingLocalDeletedPaths.has(norm)) {
+				continue;
+			}
+			const didChange = await this.syncBinaryFile(normalizedFile);
+			if (didChange && this.isObsidianPath(norm)) {
+				changedObsidianPaths.add(norm);
 			}
 		}
 
-		// Detect remote text file deletions: paths that were in the last snapshot but not now.
-		for (const path of this.lastRemoteTextPaths) {
-			if (currentRemoteTextPaths.has(path)) continue;
-			const abstract = this.app.vault.getAbstractFileByPath(path);
-			if (abstract instanceof TFile) {
-				await this.app.vault.delete(abstract, true).catch(() => {});
+		for (const [path, previous] of this.lastRemoteFiles) {
+			if (nextRemoteFiles.has(path)) {
+				continue;
+			}
+			await this.applyRemoteDelete(previous);
+			if (this.isObsidianPath(path)) {
+				changedObsidianPaths.add(path);
 			}
 		}
-		this.lastRemoteTextPaths = currentRemoteTextPaths;
 
-		const deletedObsidianPaths = await this.detectAndApplyRemoteDeletes();
-		for (const path of deletedObsidianPaths) {
-			changedObsidianPaths.add(path);
-		}
-		this.scheduleSyncRemoteFolders();
-
-		if (textPaths.length > 0) {
-			await this.onRemoteTextFilesDiscovered(textPaths);
+		this.lastRemoteFiles.clear();
+		for (const [path, file] of nextRemoteFiles) {
+			this.lastRemoteFiles.set(path, file);
 		}
 
+		await this.applyRemoteFolderSnapshot(remote.folders);
+
+		if (textPaths.size > 0) {
+			await this.onRemoteTextFilesDiscovered([...textPaths]);
+		}
 		this.maybeNotifyObsidianSyncChanges(changedObsidianPaths);
 	}
 
@@ -309,8 +329,7 @@ export class BinarySyncManager {
 			binaryTransferOpts(this.pluginSettings),
 		);
 		if (!result) {
-			await this.app.vault.adapter.remove(file.path).catch(() => {});
-			await del(hashKeyForPath(file.path), obsidianConvexIdbStore);
+			await this.applyRemoteDelete(file);
 			return true;
 		}
 		await writeLocalFile(this.app, file.path, result.bytes);
@@ -318,46 +337,40 @@ export class BinarySyncManager {
 		return true;
 	}
 
-	private async detectAndApplyRemoteDeletes(): Promise<Set<string>> {
-		let full: RemoteMetadata;
-		try {
-			full = await this.httpClient.query(api.fileSync.listAllMetadata, {
-				convexSecret: this.convexSecret,
-			});
-		} catch {
-			return new Set<string>();
-		}
-		const remotePaths = new Set(full.files.map((f) => f.path));
-		const deletedObsidianPaths = new Set<string>();
-
-		// Seed text path tracking so subsequent subscription updates can detect text deletions.
-		const currentRemoteTextPaths = new Set(
-			full.files.filter((f) => f.isText).map((f) => f.path),
-		);
-		// Only seed on first run; after that onRemoteMetadata manages the set.
-		if (this.lastRemoteTextPaths.size === 0) {
-			this.lastRemoteTextPaths = currentRemoteTextPaths;
-		}
-
-		const allKeys = await keys(obsidianConvexIdbStore);
-		for (const key of allKeys) {
-			if (typeof key !== "string" || !key.startsWith(BINARY_HASH_KEY_PREFIX)) continue;
-			const path = key.slice(BINARY_HASH_KEY_PREFIX.length);
-			if (!remotePaths.has(path)) {
-				await this.app.vault.adapter.remove(path).catch(() => {});
-				await del(key, obsidianConvexIdbStore);
-				if (this.isObsidianPath(path)) {
-					deletedObsidianPaths.add(path);
-				}
-				if (isTextSyncFile(path)) {
-					const abstract = this.app.vault.getAbstractFileByPath(path);
-					if (abstract instanceof TFile) {
-						await this.app.vault.delete(abstract, true).catch(() => {});
-					}
-				}
+	private async applyRemoteDelete(file: Pick<RemoteFileMeta, "path" | "isText">): Promise<void> {
+		const norm = normalizePath(file.path);
+		if (file.isText) {
+			const abstract = this.app.vault.getAbstractFileByPath(norm);
+			if (abstract instanceof TFile) {
+				await withSuppressedLocalChange(norm, async () => {
+					await this.app.vault.delete(abstract, true).catch(() => {});
+				});
 			}
+			return;
 		}
-		return deletedObsidianPaths;
+		await withSuppressedLocalChange(norm, async () => {
+			await this.app.vault.adapter.remove(norm).catch(() => {});
+		});
+		await del(hashKeyForPath(norm), obsidianConvexIdbStore);
+	}
+
+	private async applyRemoteBinaryDeletes(files: readonly RemoteFileMeta[]): Promise<void> {
+		const remoteBinaryPaths = new Set(
+			files.filter((file) => !file.isText).map((file) => normalizePath(file.path)),
+		);
+		for (const key of await keys(obsidianConvexIdbStore)) {
+			if (typeof key !== "string" || !key.startsWith(BINARY_HASH_KEY_PREFIX)) {
+				continue;
+			}
+			const path = key.slice(BINARY_HASH_KEY_PREFIX.length);
+			if (remoteBinaryPaths.has(path)) {
+				continue;
+			}
+			await withSuppressedLocalChange(path, async () => {
+				await this.app.vault.adapter.remove(path).catch(() => {});
+			});
+			await del(key, obsidianConvexIdbStore);
+		}
 	}
 
 	private isObsidianPath(path: string): boolean {
@@ -373,53 +386,47 @@ export class BinarySyncManager {
 		);
 	}
 
-	private async syncRemoteFolders(): Promise<void> {
-		const snapshot = await this.httpClient.query(api.fileSync.listAllMetadata, {
-			convexSecret: this.convexSecret,
-		});
-		const explicitEmptyNow = new Set<string>(
-			snapshot.folders
-				.filter((f) => f.isExplicitlyEmpty)
-				.map((f) => f.path),
+	private async applyRemoteFolderSnapshot(folders: readonly RemoteFolderMeta[]): Promise<void> {
+		const explicitEmptyNow = new Set(
+			folders.filter((folder) => folder.isExplicitlyEmpty).map((folder) => normalizePath(folder.path)),
 		);
-		const anyRemoteRowForPath = new Set<string>(snapshot.folders.map((f) => f.path));
+		const anyRemoteRowForPath = new Set(
+			folders.map((folder) => normalizePath(folder.path)),
+		);
+
 		for (const path of explicitEmptyNow) {
 			const exists = await this.app.vault.adapter.exists(path);
 			if (!exists) {
-				await this.app.vault.createFolder(path).catch(() => {});
+				await withSuppressedLocalChange(path, async () => {
+					await this.app.vault.createFolder(path).catch(() => {});
+				});
 			}
 		}
+
 		for (const path of this.lastExplicitEmptyRemotePaths) {
-			if (explicitEmptyNow.has(path)) continue;
-			if (anyRemoteRowForPath.has(path)) continue;
+			if (explicitEmptyNow.has(path) || anyRemoteRowForPath.has(path)) {
+				continue;
+			}
 			const abstract = this.app.vault.getAbstractFileByPath(path);
 			if (abstract instanceof TFolder && abstract.children.length === 0) {
-				await this.app.vault.delete(abstract, true).catch(() => {});
+				await withSuppressedLocalChange(path, async () => {
+					await this.app.vault.delete(abstract, true).catch(() => {});
+				});
 			}
 		}
-		this.lastExplicitEmptyRemotePaths = explicitEmptyNow;
-	}
 
-	/** Folder snapshot is not on the file-hash subscription; debounce to avoid extra load on every tick. */
-	private scheduleSyncRemoteFolders(): void {
-		if (this.remoteFoldersDebounce) {
-			clearTimeout(this.remoteFoldersDebounce);
-		}
-		this.remoteFoldersDebounce = setTimeout(() => {
-			this.remoteFoldersDebounce = null;
-			void this.syncRemoteFolders();
-		}, 1500);
+		this.lastExplicitEmptyRemotePaths = explicitEmptyNow;
 	}
 
 	async onLocalFileCreated(file: TFile): Promise<void> {
 		const path = normalizePath(file.path);
-		if (isTextSyncFile(path)) return;
+		if (isTextSyncFile(path) || isLocalChangeSuppressed(path)) return;
 		await this.uploadPath(path, file);
 	}
 
 	async onLocalFileModified(file: TFile): Promise<void> {
 		const path = normalizePath(file.path);
-		if (isTextSyncFile(path)) return;
+		if (isTextSyncFile(path) || isLocalChangeSuppressed(path)) return;
 		const existing = this.modifyDebounceTimers.get(path);
 		if (existing) clearTimeout(existing);
 		this.modifyDebounceTimers.set(
@@ -433,6 +440,9 @@ export class BinarySyncManager {
 
 	async onLocalFileDeleted(path: string): Promise<void> {
 		const norm = normalizePath(path);
+		if (isLocalChangeSuppressed(norm)) {
+			return;
+		}
 		this.noteLocalDeletePending(norm);
 		await del(hashKeyForPath(norm), obsidianConvexIdbStore);
 		await this.httpClient.mutation(api.fileSync.removeFilesByPath, {
@@ -448,6 +458,9 @@ export class BinarySyncManager {
 
 	async onLocalFolderCreated(folderPath: string): Promise<void> {
 		const norm = normalizePath(folderPath);
+		if (isLocalChangeSuppressed(norm)) {
+			return;
+		}
 		await this.httpClient.mutation(api.fileSync.registerExplicitEmptyFolder, {
 			convexSecret: this.convexSecret,
 			path: norm,
@@ -457,9 +470,13 @@ export class BinarySyncManager {
 	}
 
 	async onLocalFolderDeleted(folderPath: string): Promise<void> {
+		const norm = normalizePath(folderPath);
+		if (isLocalChangeSuppressed(norm)) {
+			return;
+		}
 		await this.httpClient.mutation(api.fileSync.removeFoldersByPath, {
 			convexSecret: this.convexSecret,
-			removedPaths: [normalizePath(folderPath)],
+			removedPaths: [norm],
 		});
 	}
 
@@ -488,6 +505,7 @@ export class BinarySyncManager {
 				liveFile.stat.mtime,
 				binaryTransferOpts(this.pluginSettings),
 			);
+			await set(hashKeyForPath(path), await sha256Bytes(bytes), obsidianConvexIdbStore);
 		} finally {
 			this.uploadsInFlight.delete(path);
 			if (this.pendingUploadPaths.delete(path)) {
@@ -497,12 +515,8 @@ export class BinarySyncManager {
 	}
 
 	dispose(): void {
-		if (this.remoteFoldersDebounce) {
-			clearTimeout(this.remoteFoldersDebounce);
-			this.remoteFoldersDebounce = null;
-		}
-		for (const t of this.modifyDebounceTimers.values()) {
-			clearTimeout(t);
+		for (const timer of this.modifyDebounceTimers.values()) {
+			clearTimeout(timer);
 		}
 		this.modifyDebounceTimers.clear();
 		this.uploadsInFlight.clear();

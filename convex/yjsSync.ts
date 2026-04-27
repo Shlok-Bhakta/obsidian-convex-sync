@@ -11,6 +11,8 @@ import {
 	mutation,
 } from "./_generated/server";
 import { paginationOptsValidator } from "convex/server";
+import { normalizeVaultPath, upsertTextVaultFile } from "./_lib/vaultFiles";
+import { requirePluginSecret } from "./security";
 
 const UPDATES_TRIM_THRESHOLD = 25;
 // Keep chunks comfortably below Convex's large-document warning threshold.
@@ -23,6 +25,7 @@ const GET_DOC_PAGE_MAX_BYTES = 8 * 1024 * 1024;
 
 export const init = action({
 	args: {
+		convexSecret: v.string(),
 		docId: v.string(),
 		stateVector: v.bytes(),
 	},
@@ -31,6 +34,7 @@ export const init = action({
 		serverStateVector: v.bytes(),
 	}),
 	handler: async (ctx, args) => {
+		await requirePluginSecretForAction(ctx, args.convexSecret);
 		const { mergedUpdate, updates } = await getDocData(ctx, args.docId);
 		if (updates.length >= UPDATES_TRIM_THRESHOLD) {
 			await ctx.scheduler.runAfter(0, internal.yjsSync._snapshotUpdates, {
@@ -49,11 +53,25 @@ export const init = action({
 
 export const push = mutation({
 	args: {
+		convexSecret: v.string(),
 		docId: v.string(),
+		path: v.string(),
 		update: v.bytes(),
+		contentHash: v.string(),
+		sizeBytes: v.number(),
+		updatedAtMs: v.number(),
+		clientId: v.string(),
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		await upsertTextVaultFile(ctx, {
+			path: normalizeVaultPath(args.path),
+			contentHash: args.contentHash,
+			sizeBytes: args.sizeBytes,
+			updatedAtMs: args.updatedAtMs,
+			clientId: args.clientId,
+		});
 		const decoded = Y.decodeUpdate(new Uint8Array(args.update));
 		const hasInserts = decoded.structs.length > 0;
 		const hasDeletes = decoded.ds.clients.size > 0;
@@ -98,10 +116,12 @@ export const push = mutation({
 
 export const pull = action({
 	args: {
+		convexSecret: v.string(),
 		docId: v.string(),
 	},
 	returns: v.bytes(),
 	handler: async (ctx, args) => {
+		await requirePluginSecretForAction(ctx, args.convexSecret);
 		const { mergedUpdate } = await getDocData(ctx, args.docId);
 		return asArrayBuffer(mergedUpdate);
 	},
@@ -531,4 +551,16 @@ function asArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 		bytes.byteOffset,
 		bytes.byteOffset + bytes.byteLength,
 	);
+}
+
+async function requirePluginSecretForAction(
+	ctx: Pick<GenericActionCtx<DataModel>, "runQuery">,
+	secret: string,
+): Promise<void> {
+	const auth = await ctx.runQuery(internal.security.validatePluginSecret, {
+		secret,
+	});
+	if (!auth.ok) {
+		throw new Error("The vault API key is invalid for this Convex deployment.");
+	}
 }
