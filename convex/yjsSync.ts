@@ -18,7 +18,7 @@ const UPDATES_TRIM_THRESHOLD = 25;
 // Keep chunks comfortably below Convex's large-document warning threshold.
 const MAX_UPDATE_CHUNK_BYTES = 256 * 1024;
 const MAX_SNAPSHOT_CHUNK_BYTES = 256 * 1024;
-const SNAPSHOT_PRUNE_BATCH_SIZE = 16;
+const SNAPSHOT_PRUNE_BATCH_SIZE = 64;
 const DOC_REMOVAL_BATCH_SIZE = 64;
 const GET_DOC_PAGE_SIZE = 32;
 const GET_DOC_PAGE_MAX_BYTES = 8 * 1024 * 1024;
@@ -28,6 +28,8 @@ export const init = action({
 		convexSecret: v.string(),
 		docId: v.string(),
 		stateVector: v.bytes(),
+		/** When true, do not enqueue `_snapshotUpdates` (bootstrap pre-flushes dirty docs; scheduling per file would flood writes). */
+		skipCompactionSchedule: v.optional(v.boolean()),
 	},
 	returns: v.object({
 		update: v.bytes(),
@@ -35,8 +37,11 @@ export const init = action({
 	}),
 	handler: async (ctx, args) => {
 		await requirePluginSecretForAction(ctx, args.convexSecret);
-		const { mergedUpdate, updates } = await getDocData(ctx, args.docId);
-		if (updates.length >= UPDATES_TRIM_THRESHOLD) {
+		const { mergedUpdate, updateRowCount } = await getDocData(ctx, args.docId);
+		if (
+			!args.skipCompactionSchedule &&
+			updateRowCount >= UPDATES_TRIM_THRESHOLD
+		) {
 			await ctx.scheduler.runAfter(0, internal.yjsSync._snapshotUpdates, {
 				docId: args.docId,
 			});
@@ -130,22 +135,34 @@ export const pull = action({
 	},
 });
 
+/** Spreads DB writes so bootstrap / compaction stays under Convex write-rate limits. */
+function writeThrottleMs(): number {
+	return 75;
+}
+
+async function sleepMs(ms: number): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export const _snapshotUpdates = internalAction({
 	args: { docId: v.string() },
 	returns: v.null(),
 	handler: async (ctx, args) => {
-		const { mergedUpdate, updates } = await getDocData(ctx, args.docId);
-		const latestUpdate = updates[updates.length - 1];
-		if (!latestUpdate) {
+		const { mergedUpdate, updateRowCount, lastUpdateCreationTime } = await getDocData(ctx, args.docId);
+		if (updateRowCount === 0) {
 			return null;
 		}
-		const timestamp = latestUpdate._creationTime;
+		const timestamp = lastUpdateCreationTime;
+		const throttle = writeThrottleMs();
 
 		let moreSnapshots = true;
 		while (moreSnapshots) {
 			moreSnapshots = await ctx.runMutation(internal.yjsSync._pruneOldSnapshotsOnce, {
 				docId: args.docId,
 			});
+			if (moreSnapshots) {
+				await sleepMs(throttle);
+			}
 		}
 
 		const snapshotChunks = splitBytesForStorage(
@@ -171,6 +188,9 @@ export const _snapshotUpdates = internalAction({
 					chunkIndex,
 					chunkCount: snapshotChunks.length,
 				});
+				if (chunkIndex + 1 < snapshotChunks.length) {
+					await sleepMs(throttle);
+				}
 			}
 		}
 
@@ -180,6 +200,9 @@ export const _snapshotUpdates = internalAction({
 				docId: args.docId,
 				timestamp,
 			});
+			if (moreUpdates) {
+				await sleepMs(throttle);
+			}
 		}
 
 		await ctx.runMutation(internal.yjsSync._markDocClean, { docId: args.docId });
@@ -366,23 +389,128 @@ export const _getUpdatePage = internalQuery({
 	},
 });
 
-type DocData = { mergedUpdate: Uint8Array; updates: Array<{ _creationTime: number; update: ArrayBuffer }> };
+type DocData = {
+	mergedUpdate: Uint8Array;
+	updateRowCount: number;
+	/** `_creationTime` of the last yjsUpdates row seen while paginating (same basis as the old `updates.at(-1)`). */
+	lastUpdateCreationTime: number;
+};
+
+type StoredYjsSnapshot = {
+	data: ArrayBuffer;
+	chunkGroupId?: string;
+	chunkIndex?: number;
+	chunkCount?: number;
+};
+
+type StoredYjsUpdate = {
+	_creationTime: number;
+	update: ArrayBuffer;
+	chunkGroupId?: string;
+	chunkIndex?: number;
+	chunkCount?: number;
+};
+
 type PaginatedRows<T> = {
 	page: T[];
 	isDone: boolean;
 	continueCursor: string;
 };
 
+type ChunkedBytesRow = {
+	data: ArrayBuffer;
+	chunkGroupId?: string;
+	chunkIndex?: number;
+	chunkCount?: number;
+};
+
+/** Matches `reconstructLogicalBytes` ordering: all non-chunked rows in iteration order, then completed chunk groups in first-seen group order. */
+type LogicalStreamAcc = {
+	grouped: Map<string, Map<number, ArrayBuffer>>;
+	expectedChunkCounts: Map<string, number>;
+	chunkGroupOrder: string[];
+	nonChunked: ArrayBuffer[];
+	completedChunks: Map<string, ArrayBuffer>;
+};
+
+function emptyLogicalStreamAcc(): LogicalStreamAcc {
+	return {
+		grouped: new Map(),
+		expectedChunkCounts: new Map(),
+		chunkGroupOrder: [],
+		nonChunked: [],
+		completedChunks: new Map(),
+	};
+}
+
+function feedLogicalStreamRow(acc: LogicalStreamAcc, row: ChunkedBytesRow): void {
+	const { data, chunkGroupId, chunkIndex, chunkCount } = row;
+	if (
+		chunkGroupId === undefined ||
+		chunkIndex === undefined ||
+		chunkCount === undefined
+	) {
+		acc.nonChunked.push(data);
+		return;
+	}
+	let group = acc.grouped.get(chunkGroupId);
+	if (!group) {
+		group = new Map<number, ArrayBuffer>();
+		acc.grouped.set(chunkGroupId, group);
+		acc.chunkGroupOrder.push(chunkGroupId);
+	}
+	group.set(chunkIndex, data);
+	acc.expectedChunkCounts.set(chunkGroupId, chunkCount);
+	if (group.size !== chunkCount) {
+		return;
+	}
+	const orderedChunks: Uint8Array[] = [];
+	let totalBytes = 0;
+	let missingChunk = false;
+	for (let i = 0; i < chunkCount; i++) {
+		const chunk = group.get(i);
+		if (!chunk) {
+			missingChunk = true;
+			break;
+		}
+		const bytes = new Uint8Array(chunk);
+		orderedChunks.push(bytes);
+		totalBytes += bytes.byteLength;
+	}
+	if (missingChunk) {
+		return;
+	}
+	const merged = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of orderedChunks) {
+		merged.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	acc.completedChunks.set(chunkGroupId, asArrayBuffer(merged));
+	acc.grouped.delete(chunkGroupId);
+	acc.expectedChunkCounts.delete(chunkGroupId);
+}
+
+function applyLogicalStreamAccToYDoc(doc: Y.Doc, acc: LogicalStreamAcc): void {
+	for (const buf of acc.nonChunked) {
+		Y.applyUpdate(doc, new Uint8Array(buf));
+	}
+	for (const gid of acc.chunkGroupOrder) {
+		const buf = acc.completedChunks.get(gid);
+		if (buf) {
+			Y.applyUpdate(doc, new Uint8Array(buf));
+		}
+	}
+}
+
 async function getDocData(
 	ctx: Pick<GenericActionCtx<DataModel>, "runQuery">,
 	docId: string,
 ): Promise<DocData> {
-	const snapshots: StoredYjsSnapshot[] = [];
-	const updates: StoredYjsUpdate[] = [];
+	const doc = new Y.Doc();
+	const snapshotAcc = emptyLogicalStreamAcc();
 	let snapshotCursor: string | null = null;
-	let updateCursor: string | null = null;
 	let snapshotsDone = false;
-	let updatesDone = false;
 
 	while (!snapshotsDone) {
 		const page = (await ctx.runQuery(internal.yjsSync._getSnapshotPage, {
@@ -393,10 +521,25 @@ async function getDocData(
 				maximumBytesRead: GET_DOC_PAGE_MAX_BYTES,
 			},
 		})) as PaginatedRows<StoredYjsSnapshot>;
-		snapshots.push(...page.page);
+		for (const row of page.page) {
+			feedLogicalStreamRow(snapshotAcc, {
+				data: row.data,
+				chunkGroupId: row.chunkGroupId,
+				chunkIndex: row.chunkIndex,
+				chunkCount: row.chunkCount,
+			});
+		}
 		snapshotCursor = page.continueCursor;
 		snapshotsDone = page.isDone;
 	}
+	applyLogicalStreamAccToYDoc(doc, snapshotAcc);
+
+	const updateAcc = emptyLogicalStreamAcc();
+	let updateRowCount = 0;
+	let lastUpdateCreationTime = 0;
+	let updateCursor: string | null = null;
+	let updatesDone = false;
+
 	while (!updatesDone) {
 		const page = (await ctx.runQuery(internal.yjsSync._getUpdatePage, {
 			docId,
@@ -406,20 +549,25 @@ async function getDocData(
 				maximumBytesRead: GET_DOC_PAGE_MAX_BYTES,
 			},
 		})) as PaginatedRows<StoredYjsUpdate>;
-		updates.push(...page.page);
+		for (const row of page.page) {
+			updateRowCount += 1;
+			lastUpdateCreationTime = row._creationTime;
+			feedLogicalStreamRow(updateAcc, {
+				data: row.update,
+				chunkGroupId: row.chunkGroupId,
+				chunkIndex: row.chunkIndex,
+				chunkCount: row.chunkCount,
+			});
+		}
 		updateCursor = page.continueCursor;
 		updatesDone = page.isDone;
 	}
+	applyLogicalStreamAccToYDoc(doc, updateAcc);
 
-	const snapshotBuffers = reconstructLogicalSnapshots(snapshots).map(
-		(snapshot) => new Uint8Array(snapshot),
-	);
-	const logicalUpdates = reconstructLogicalUpdates(updates);
-	const mergedUpdate = Y.mergeUpdates([
-		...snapshotBuffers,
-		...logicalUpdates.map((update) => new Uint8Array(update)),
-	]);
-	return { mergedUpdate, updates };
+	const mergedUpdate = Y.encodeStateAsUpdate(doc);
+	doc.destroy();
+
+	return { mergedUpdate, updateRowCount, lastUpdateCreationTime };
 }
 
 async function removeDocRows(
@@ -435,101 +583,6 @@ async function removeDocRows(
 		moreUpdates = await ctx.runMutation(internal.yjsSync._deleteUpdateRowsOnce, { docId });
 	}
 	await ctx.runMutation(internal.yjsSync._markDocClean, { docId });
-}
-
-type StoredYjsSnapshot = {
-	data: ArrayBuffer;
-	chunkGroupId?: string;
-	chunkIndex?: number;
-	chunkCount?: number;
-};
-
-function reconstructLogicalSnapshots(snapshots: StoredYjsSnapshot[]): ArrayBuffer[] {
-	return reconstructLogicalBytes(snapshots);
-}
-
-type StoredYjsUpdate = {
-	_creationTime: number;
-	update: ArrayBuffer;
-	chunkGroupId?: string;
-	chunkIndex?: number;
-	chunkCount?: number;
-};
-
-function reconstructLogicalUpdates(updates: StoredYjsUpdate[]): ArrayBuffer[] {
-	return reconstructLogicalBytes(
-		updates.map((update) => ({
-			data: update.update,
-			chunkGroupId: update.chunkGroupId,
-			chunkIndex: update.chunkIndex,
-			chunkCount: update.chunkCount,
-		})),
-	);
-}
-
-type ChunkedBytesRow = {
-	data: ArrayBuffer;
-	chunkGroupId?: string;
-	chunkIndex?: number;
-	chunkCount?: number;
-};
-
-function reconstructLogicalBytes(rows: ChunkedBytesRow[]): ArrayBuffer[] {
-	const logicalUpdates: ArrayBuffer[] = [];
-	const grouped = new Map<string, Map<number, ArrayBuffer>>();
-	const expectedChunkCounts = new Map<string, number>();
-
-	for (const row of rows) {
-		const { chunkGroupId, chunkIndex, chunkCount } = row;
-		if (
-			chunkGroupId === undefined ||
-			chunkIndex === undefined ||
-			chunkCount === undefined
-		) {
-			logicalUpdates.push(row.data);
-			continue;
-		}
-		let group = grouped.get(chunkGroupId);
-		if (!group) {
-			group = new Map<number, ArrayBuffer>();
-			grouped.set(chunkGroupId, group);
-		}
-		group.set(chunkIndex, row.data);
-		expectedChunkCounts.set(chunkGroupId, chunkCount);
-	}
-
-	for (const [chunkGroupId, chunkMap] of grouped) {
-		const expectedCount = expectedChunkCounts.get(chunkGroupId);
-		if (expectedCount === undefined || chunkMap.size !== expectedCount) {
-			// Skip incomplete groups and let a future pull recover once all chunks arrive.
-			continue;
-		}
-		const orderedChunks: Uint8Array[] = [];
-		let totalBytes = 0;
-		let missingChunk = false;
-		for (let i = 0; i < expectedCount; i++) {
-			const chunk = chunkMap.get(i);
-			if (!chunk) {
-				missingChunk = true;
-				break;
-			}
-			const bytes = new Uint8Array(chunk);
-			orderedChunks.push(bytes);
-			totalBytes += bytes.byteLength;
-		}
-		if (missingChunk) {
-			continue;
-		}
-		const merged = new Uint8Array(totalBytes);
-		let offset = 0;
-		for (const chunk of orderedChunks) {
-			merged.set(chunk, offset);
-			offset += chunk.byteLength;
-		}
-		logicalUpdates.push(asArrayBuffer(merged));
-	}
-
-	return logicalUpdates;
 }
 
 function splitUpdateForStorage(update: ArrayBuffer): ArrayBuffer[] {

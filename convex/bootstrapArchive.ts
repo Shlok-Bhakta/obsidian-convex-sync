@@ -61,7 +61,13 @@ export const buildArchive = internalAction({
 				internal.yjsSync._listDocIdsWithPendingUpdates,
 				{},
 			);
-			for (const docId of docsWithPendingUpdates) {
+			// Dirty-doc snapshotting issues many mutations; pace it to avoid Convex TooManyWrites.
+			const betweenDirtyDocMs = 200;
+			for (let i = 0; i < docsWithPendingUpdates.length; i++) {
+				const docId = docsWithPendingUpdates[i];
+				if (i > 0) {
+					await new Promise((r) => setTimeout(r, betweenDirtyDocMs));
+				}
 				await ctx.runAction(internal.yjsSync._snapshotUpdates, { docId });
 			}
 
@@ -102,6 +108,7 @@ export const buildArchive = internalAction({
 								convexSecret: args.convexSecret,
 								docId: `${vaultPrefix}${row.path}`,
 								stateVector: toArrayBuffer(Y.encodeStateVector(doc)),
+								skipCompactionSchedule: true,
 							});
 							if (
 								initial &&
