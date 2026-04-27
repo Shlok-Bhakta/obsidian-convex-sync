@@ -1,4 +1,4 @@
-import { createStore, del, get, set } from "idb-keyval";
+import { clear, createStore, del, get, set } from "idb-keyval";
 import * as Y from "yjs";
 
 /** Same DB/store as binary sync cursor/hash keys (`binary-sync-manager.ts`). */
@@ -21,5 +21,8 @@ export const YjsLocalCache = {
 	async hasCachedState(docId: string): Promise<boolean> {
 		const state = await get<Uint8Array>(docId, obsidianConvexIdbStore);
 		return state != null && state.byteLength > 0;
+	},
+	async clearAll(): Promise<void> {
+		await clear(obsidianConvexIdbStore);
 	},
 };

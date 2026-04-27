@@ -1,7 +1,7 @@
 import type { FunctionReference } from "convex/server";
 import type { ConvexClient, ConvexHttpClient } from "convex/browser";
 import { del, get, keys, set } from "idb-keyval";
-import { normalizePath, TFile, type App } from "obsidian";
+import { normalizePath, TFile, TFolder, type App } from "obsidian";
 import { api } from "../../convex/_generated/api";
 import { isTextSyncFile, readRemoteFileBytes, uploadLocalFile } from "../file-sync";
 import { obsidianConvexIdbStore } from "./yjs-local-cache";
@@ -97,6 +97,9 @@ async function writeLocalFile(app: App, path: string, bytes: ArrayBuffer): Promi
 export class BinarySyncManager {
 	private realtimeUnsub: (() => void) | null = null;
 	private readonly modifyDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private remoteFoldersDebounce: ReturnType<typeof setTimeout> | null = null;
+	/** Paths last seen as explicitly-empty on Convex; used to prune local folders when remote removes the row. */
+	private lastExplicitEmptyRemotePaths = new Set<string>();
 
 	constructor(
 		private readonly app: App,
@@ -136,13 +139,30 @@ export class BinarySyncManager {
 		const snapshot = await this.httpClient.query(api.fileSync.listSnapshot, {
 			convexSecret: this.convexSecret,
 		});
-		for (const folder of snapshot.folders) {
-			if (!folder.isExplicitlyEmpty) continue;
-			const exists = await this.app.vault.adapter.exists(folder.path);
+		const explicitEmptyNow = new Set<string>(
+			snapshot.folders
+				.filter((f: { isExplicitlyEmpty: boolean }) => f.isExplicitlyEmpty)
+				.map((f: { path: string }) => f.path),
+		);
+		const anyRemoteRowForPath = new Set<string>(
+			snapshot.folders.map((f: { path: string }) => f.path),
+		);
+		for (const path of explicitEmptyNow) {
+			const exists = await this.app.vault.adapter.exists(path);
 			if (!exists) {
-				await this.app.vault.createFolder(folder.path).catch(() => {});
+				await this.app.vault.createFolder(path).catch(() => {});
 			}
 		}
+		for (const path of this.lastExplicitEmptyRemotePaths) {
+			if (explicitEmptyNow.has(path)) continue;
+			// Row may still exist with isExplicitlyEmpty false after a full vault scan — do not delete.
+			if (anyRemoteRowForPath.has(path)) continue;
+			const abstract = this.app.vault.getAbstractFileByPath(path);
+			if (abstract instanceof TFolder && abstract.children.length === 0) {
+				await this.app.vault.delete(abstract, true).catch(() => {});
+			}
+		}
+		this.lastExplicitEmptyRemotePaths = explicitEmptyNow;
 	}
 
 	private async onRemoteFileList(remoteFiles: RemoteFileMeta[]): Promise<void> {
@@ -155,6 +175,18 @@ export class BinarySyncManager {
 			await this.syncFile(file);
 		}
 		await this.applyRemoteDeletes(binaryOnly);
+		this.scheduleSyncRemoteFolders();
+	}
+
+	/** Folder snapshot is not on the file-hash subscription; debounce to avoid extra load on every tick. */
+	private scheduleSyncRemoteFolders(): void {
+		if (this.remoteFoldersDebounce) {
+			clearTimeout(this.remoteFoldersDebounce);
+		}
+		this.remoteFoldersDebounce = setTimeout(() => {
+			this.remoteFoldersDebounce = null;
+			void this.syncRemoteFolders();
+		}, 1500);
 	}
 
 	private async applyRemoteDeletes(remoteFiles: RemoteFileMeta[]): Promise<void> {
@@ -260,6 +292,10 @@ export class BinarySyncManager {
 	}
 
 	dispose(): void {
+		if (this.remoteFoldersDebounce) {
+			clearTimeout(this.remoteFoldersDebounce);
+			this.remoteFoldersDebounce = null;
+		}
 		for (const t of this.modifyDebounceTimers.values()) {
 			clearTimeout(t);
 		}

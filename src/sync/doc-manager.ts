@@ -16,6 +16,8 @@ type DocEntry = {
 	provider: ConvexYjsProvider;
 	/** Attached after yCollab + updateOptions so remote cursors never target an empty CM doc. */
 	awarenessSync: ConvexAwarenessSync | null;
+	/** Guards against stale remote awareness cursor offsets crashing CodeMirror. */
+	awarenessSanitizer: ((event: { added: number[]; updated: number[]; removed: number[] }) => void) | null;
 };
 
 export class DocManager {
@@ -82,7 +84,49 @@ export class DocManager {
 		});
 
 		const ytext = doc.getText("content");
-		const entry: DocEntry = { doc, awareness, provider, awarenessSync: null };
+		const awarenessSanitizer = (event: {
+			added: number[];
+			updated: number[];
+			removed: number[];
+		}): void => {
+			const currentDocLen = ytext.length;
+			for (const clientId of [...event.added, ...event.updated]) {
+				const state = awareness.getStates().get(clientId);
+				if (!state || typeof state !== "object") continue;
+				const stateObj = state as Record<string, unknown>;
+				const cursor = stateObj.cursor;
+				if (!cursor || typeof cursor !== "object") continue;
+				const cursorObj = cursor as Record<string, unknown>;
+				let changed = false;
+				for (const key of ["anchor", "head", "from", "to"] as const) {
+					const raw = cursorObj[key];
+					if (typeof raw !== "number" || !Number.isFinite(raw)) {
+						continue;
+					}
+					const clamped = clamp(raw, 0, currentDocLen);
+					if (clamped !== raw) {
+						cursorObj[key] = clamped;
+						changed = true;
+					}
+				}
+				// If cursor is malformed, clear it to prevent downstream range errors.
+				if (!isValidCursorShape(cursorObj)) {
+					delete stateObj.cursor;
+					changed = true;
+				}
+				if (changed) {
+					awareness.getStates().set(clientId, stateObj);
+				}
+			}
+		};
+		awareness.on("update", awarenessSanitizer);
+		const entry: DocEntry = {
+			doc,
+			awareness,
+			provider,
+			awarenessSync: null,
+			awarenessSanitizer,
+		};
 		this.current = entry;
 		this.currentPath = path;
 
@@ -113,7 +157,7 @@ export class DocManager {
 
 	async closeCurrentDoc(): Promise<void> {
 		if (!this.current) return;
-		const { doc, awareness, provider, awarenessSync } = this.current;
+		const { doc, awareness, provider, awarenessSync, awarenessSanitizer } = this.current;
 		if (this.currentPath) {
 			await YjsLocalCache.save(this.pathToDocId(this.currentPath), doc);
 		}
@@ -122,6 +166,9 @@ export class DocManager {
 			awareness.setLocalState(null);
 			awarenessSync.flush();
 			awarenessSync.destroy();
+		}
+		if (awarenessSanitizer) {
+			awareness.off("update", awarenessSanitizer);
 		}
 		provider.destroy();
 		awareness.destroy();
@@ -283,4 +330,19 @@ async function sha256Utf8(text: string): Promise<string> {
 	const bytes = new TextEncoder().encode(text);
 	const digest = await crypto.subtle.digest("SHA-256", bytes);
 	return toHex(digest);
+}
+
+function clamp(value: number, min: number, max: number): number {
+	return Math.max(min, Math.min(max, value));
+}
+
+function isValidCursorShape(cursor: Record<string, unknown>): boolean {
+	const expected = ["anchor", "head"];
+	for (const key of expected) {
+		const value = cursor[key];
+		if (typeof value !== "number" || !Number.isFinite(value)) {
+			return false;
+		}
+	}
+	return true;
 }

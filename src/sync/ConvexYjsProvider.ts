@@ -37,8 +37,10 @@ export class ConvexYjsProvider {
 			this.convexApi.init as FunctionReference<"action">,
 			{
 				docId: this.docId,
-				// Fresh doc state vector = "no local state" so init returns the full server update.
-				// Do not use a zero-length Uint8Array: lib0 cannot decode it as a state vector.
+				// Always request the full server update relative to an *empty* Y.Doc state vector
+				// (not encodeStateVector(this.doc) after idb load). Otherwise diffUpdate omits
+				// server-side deletes the cache never saw. Never use Uint8Array(0): Y.diffUpdate
+				// throws "Unexpected end of array" for zero-length state vectors.
 				stateVector: toArrayBuffer(Y.encodeStateVector(new Y.Doc())),
 			},
 		);

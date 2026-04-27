@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
+import { App, Modal, Notice, Plugin, Setting, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
 import {
 	ClientsPresenceView,
 	CLIENTS_PRESENCE_VIEW_TYPE,
@@ -21,6 +21,54 @@ import {
 } from "./settings";
 import { BinarySyncManager } from "./sync/binary-sync-manager";
 import { DocManager } from "./sync/doc-manager";
+import { YjsLocalCache } from "./sync/yjs-local-cache";
+
+const DANGEROUS_RESET_PHRASE = "DELETE EVERYTHING";
+
+class VaultResetConfirmModal extends Modal {
+	onConfirm: (() => void) | null = null;
+	private readonly confirmPhrase = DANGEROUS_RESET_PHRASE;
+	private typedPhrase = "";
+
+	constructor(app: App) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.contentEl.empty();
+		this.titleEl.setText("Danger zone: wipe local vault and cache");
+		this.contentEl.createEl("p", {
+			text: "This command permanently deletes every file and folder in this vault, then clears local plugin IndexedDB/cache state.",
+		});
+		this.contentEl.createEl("p", {
+			text: `Type "${this.confirmPhrase}" to enable the wipe button.`,
+		});
+		let wipeButton: HTMLButtonElement | null = null;
+		new Setting(this.contentEl).setName("Confirmation").addText((text) => {
+			text.setPlaceholder(this.confirmPhrase).onChange((value) => {
+				this.typedPhrase = value.trim();
+				wipeButton?.toggleAttribute("disabled", this.typedPhrase !== this.confirmPhrase);
+			});
+		});
+		const row = this.contentEl.createDiv();
+		row.style.display = "flex";
+		row.style.gap = "8px";
+		wipeButton = row.createEl("button", {
+			text: "Wipe vault and local state",
+		});
+		wipeButton.style.backgroundColor = "var(--color-red)";
+		wipeButton.style.color = "var(--text-on-accent)";
+		wipeButton.setAttribute("disabled", "true");
+		wipeButton.addEventListener("click", () => {
+			if (this.typedPhrase !== this.confirmPhrase) return;
+			this.close();
+			this.onConfirm?.();
+		});
+		row.createEl("button", { text: "Cancel" }).addEventListener("click", () => {
+			this.close();
+		});
+	}
+}
 
 export default class ObsidianConvexSyncPlugin extends Plugin {
 	settings: MyPluginSettings = { ...DEFAULT_SETTINGS };
@@ -110,6 +158,17 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 					"Open plugin settings and use Bootstrap new device to generate the link.",
 					6000,
 				);
+			},
+		});
+		this.addCommand({
+			id: "danger-reset-local-state",
+			name: "Danger: reset local vault + IndexedDB state",
+			callback: () => {
+				const modal = new VaultResetConfirmModal(this.app);
+				modal.onConfirm = () => {
+					void this.resetLocalStateAndVault();
+				};
+				modal.open();
 			},
 		});
 
@@ -211,10 +270,14 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 					const snapshot = await this.getConvexHttpClient().query(api.fileSync.listSnapshot, {
 						convexSecret: secret,
 					});
-					const textPaths = snapshot.files.filter((f) => f.isText).map((f) => f.path);
-					await this.docManager.warmUpAllDocs(textPaths);
+					const textPaths = snapshot.files
+						.filter((f: { isText: boolean }) => f.isText)
+						.map((f: { path: string }) => f.path);
+					void this.docManager?.warmUpAllDocs(textPaths).catch((e: unknown) => {
+						console.warn("DocManager warmUp error", e);
+					});
 				} catch (e: unknown) {
-					console.warn("DocManager warmUp error", e);
+					console.warn("DocManager warmUp snapshot error", e);
 				}
 			})();
 			this.register(() => {
@@ -262,4 +325,47 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			},
 		});
 	}
+
+	private async resetLocalStateAndVault(): Promise<void> {
+		this.syncStatusBarItemEl?.setText("Convex sync: local reset in progress...");
+		try {
+			await this.docManager?.closeCurrentDoc();
+			this.binarySync?.dispose();
+			this.binarySync = null;
+
+			const all = this.app.vault.getAllLoadedFiles();
+			const files = all.filter((entry): entry is TFile => entry instanceof TFile);
+			const folders = all
+				.filter((entry): entry is TFolder => entry instanceof TFolder && entry.path !== "")
+				.sort((a, b) => b.path.length - a.path.length);
+
+			for (const file of files) {
+				await this.app.vault.delete(file, true).catch(() => {});
+			}
+			for (const folder of folders) {
+				await this.app.vault.delete(folder, true).catch(() => {});
+			}
+
+			await YjsLocalCache.clearAll();
+			await deleteIndexedDbDatabase("obsidian-yjs-v1");
+			this.settings = { ...DEFAULT_SETTINGS };
+			await this.saveSettings();
+			new Notice("Local vault files and IndexedDB cache were wiped.", 8000);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			new Notice(`Local reset failed: ${message}`, 12000);
+			console.error("Local reset failed", error);
+		} finally {
+			this.syncStatusBarItemEl?.setText("Convex sync: idle");
+		}
+	}
+}
+
+async function deleteIndexedDbDatabase(name: string): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		const request = indexedDB.deleteDatabase(name);
+		request.onsuccess = () => resolve();
+		request.onerror = () => reject(request.error ?? new Error(`Failed to delete IndexedDB ${name}`));
+		request.onblocked = () => reject(new Error(`IndexedDB ${name} deletion blocked by an open connection`));
+	});
 }

@@ -65,4 +65,12 @@ export default defineSchema({
 		docId: v.string(),
 		update: v.bytes(),
 	}).index("by_docId", ["docId"]),
+	yjsUpdates: defineTable({
+		docId: v.string(),
+		update: v.bytes(),
+	}).index("by_doc_id", ["docId"]),
+	yjsSnapshots: defineTable({
+		docId: v.string(),
+		fileId: v.id("_storage"),
+	}).index("by_doc_id", ["docId"]),
 });

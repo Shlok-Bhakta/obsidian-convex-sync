@@ -17,6 +17,7 @@ import type * as clients from "../clients.js";
 import type * as crons from "../crons.js";
 import type * as fileSync from "../fileSync.js";
 import type * as http from "../http.js";
+import type * as nuke from "../nuke.js";
 import type * as pluginSecretMint from "../pluginSecretMint.js";
 import type * as security from "../security.js";
 import type * as yjs from "../yjs.js";
@@ -38,6 +39,7 @@ declare const fullApi: ApiFromModules<{
   crons: typeof crons;
   fileSync: typeof fileSync;
   http: typeof http;
+  nuke: typeof nuke;
   pluginSecretMint: typeof pluginSecretMint;
   security: typeof security;
   yjs: typeof yjs;
@@ -70,6 +72,4 @@ export declare const internal: FilterApi<
   FunctionReference<any, "internal">
 >;
 
-export declare const components: {
-  yconvex: import("y-convex/_generated/component.js").ComponentApi<"yconvex">;
-};
+export declare const components: {};
