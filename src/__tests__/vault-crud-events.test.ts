@@ -42,6 +42,7 @@ describe("vault CRUD event registration", () => {
 		registerVaultCrudEventHandlers({
 			registerEvent,
 			vault: vault as never,
+			getActiveFile: () => null,
 			getDocManager: () => null,
 			getBinarySync: () => null,
 		});
@@ -63,6 +64,7 @@ describe("vault CRUD event registration", () => {
 					return `${event}-ref`;
 				}),
 			} as never,
+			getActiveFile: () => null,
 			getDocManager: () => null,
 			getBinarySync: () => binarySync as never,
 		});

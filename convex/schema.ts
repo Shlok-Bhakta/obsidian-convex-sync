@@ -68,6 +68,9 @@ export default defineSchema({
 	yjsUpdates: defineTable({
 		docId: v.string(),
 		update: v.bytes(),
+		chunkGroupId: v.optional(v.string()),
+		chunkIndex: v.optional(v.number()),
+		chunkCount: v.optional(v.number()),
 	}).index("by_doc_id", ["docId"]),
 	yjsSnapshots: defineTable({
 		docId: v.string(),

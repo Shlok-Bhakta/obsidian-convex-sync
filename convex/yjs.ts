@@ -11,6 +11,7 @@ import {
 } from "./_generated/server";
 
 const UPDATES_TRIM_THRESHOLD = 25;
+const MAX_UPDATE_CHUNK_BYTES = 900 * 1024;
 
 export const init = action({
 	args: {
@@ -49,7 +50,21 @@ export const push = mutation({
 		const hasInserts = decoded.structs.length > 0;
 		const hasDeletes = decoded.ds.clients.size > 0;
 		if (hasInserts || hasDeletes) {
-			await ctx.db.insert("yjsUpdates", args);
+			const chunks = splitUpdateForStorage(args.update);
+			if (chunks.length === 1) {
+				await ctx.db.insert("yjsUpdates", args);
+			} else {
+				const chunkGroupId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+				for (const [chunkIndex, chunk] of chunks.entries()) {
+					await ctx.db.insert("yjsUpdates", {
+						docId: args.docId,
+						update: chunk,
+						chunkGroupId,
+						chunkIndex,
+						chunkCount: chunks.length,
+					});
+				}
+			}
 			// Keep update backlog bounded under heavy typing bursts so pull stays fast.
 			const recentBatch = await ctx.db
 				.query("yjsUpdates")
@@ -78,7 +93,9 @@ export const pull = query({
 			.query("yjsUpdates")
 			.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
 			.collect();
-		const merged = Y.mergeUpdates(updates.map((u) => new Uint8Array(u.update)));
+		const merged = Y.mergeUpdates(
+			reconstructLogicalUpdates(updates).map((update) => new Uint8Array(update)),
+		);
 		return asArrayBuffer(merged);
 	},
 });
@@ -88,14 +105,15 @@ export const _snapshotUpdates = internalAction({
 	returns: v.null(),
 	handler: async (ctx, args) => {
 		const { mergedUpdate, updates } = await getDocData(ctx, args.docId);
-		if (updates.length === 0) {
+		const latestUpdate = updates[updates.length - 1];
+		if (!latestUpdate) {
 			return null;
 		}
 		const fileId = await ctx.storage.store(new Blob([asArrayBuffer(mergedUpdate)]));
 		try {
 			await ctx.runMutation(internal.yjs._createSnapshot, {
 				docId: args.docId,
-				timestamp: updates[updates.length - 1]!._creationTime,
+				timestamp: latestUpdate._creationTime,
 				fileId,
 			});
 		} catch (e) {
@@ -261,11 +279,91 @@ async function getDocData(
 			return new Uint8Array(await file.arrayBuffer());
 		}),
 	);
+	const logicalUpdates = reconstructLogicalUpdates(updates);
 	const mergedUpdate = Y.mergeUpdates([
 		...snapshotBuffers,
-		...updates.map((u) => new Uint8Array(u.update)),
+		...logicalUpdates.map((update) => new Uint8Array(update)),
 	]);
 	return { mergedUpdate, updates };
+}
+
+type StoredYjsUpdate = {
+	_creationTime: number;
+	update: ArrayBuffer;
+	chunkGroupId?: string;
+	chunkIndex?: number;
+	chunkCount?: number;
+};
+
+function reconstructLogicalUpdates(updates: StoredYjsUpdate[]): ArrayBuffer[] {
+	const logicalUpdates: ArrayBuffer[] = [];
+	const grouped = new Map<string, Map<number, ArrayBuffer>>();
+	const expectedChunkCounts = new Map<string, number>();
+
+	for (const update of updates) {
+		const { chunkGroupId, chunkIndex, chunkCount } = update;
+		if (
+			chunkGroupId === undefined ||
+			chunkIndex === undefined ||
+			chunkCount === undefined
+		) {
+			logicalUpdates.push(update.update);
+			continue;
+		}
+		let group = grouped.get(chunkGroupId);
+		if (!group) {
+			group = new Map<number, ArrayBuffer>();
+			grouped.set(chunkGroupId, group);
+		}
+		group.set(chunkIndex, update.update);
+		expectedChunkCounts.set(chunkGroupId, chunkCount);
+	}
+
+	for (const [chunkGroupId, chunkMap] of grouped) {
+		const expectedCount = expectedChunkCounts.get(chunkGroupId);
+		if (expectedCount === undefined || chunkMap.size !== expectedCount) {
+			// Skip incomplete groups and let a future pull recover once all chunks arrive.
+			continue;
+		}
+		const orderedChunks: Uint8Array[] = [];
+		let totalBytes = 0;
+		let missingChunk = false;
+		for (let i = 0; i < expectedCount; i++) {
+			const chunk = chunkMap.get(i);
+			if (!chunk) {
+				missingChunk = true;
+				break;
+			}
+			const bytes = new Uint8Array(chunk);
+			orderedChunks.push(bytes);
+			totalBytes += bytes.byteLength;
+		}
+		if (missingChunk) {
+			continue;
+		}
+		const merged = new Uint8Array(totalBytes);
+		let offset = 0;
+		for (const chunk of orderedChunks) {
+			merged.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		logicalUpdates.push(asArrayBuffer(merged));
+	}
+
+	return logicalUpdates;
+}
+
+function splitUpdateForStorage(update: ArrayBuffer): ArrayBuffer[] {
+	const bytes = new Uint8Array(update);
+	if (bytes.byteLength <= MAX_UPDATE_CHUNK_BYTES) {
+		return [update];
+	}
+	const chunks: ArrayBuffer[] = [];
+	for (let offset = 0; offset < bytes.byteLength; offset += MAX_UPDATE_CHUNK_BYTES) {
+		const end = Math.min(offset + MAX_UPDATE_CHUNK_BYTES, bytes.byteLength);
+		chunks.push(asArrayBuffer(bytes.slice(offset, end)));
+	}
+	return chunks;
 }
 
 function asArrayBuffer(bytes: Uint8Array): ArrayBuffer {

@@ -1,6 +1,6 @@
 import type { Extension } from "@codemirror/state";
 import type { App } from "obsidian";
-import { normalizePath } from "obsidian";
+import { normalizePath, TFile } from "obsidian";
 import type { ConvexClient } from "convex/browser";
 import { Awareness } from "y-protocols/awareness.js";
 import { yCollab } from "y-codemirror.next";
@@ -188,21 +188,36 @@ export class DocManager {
 	/** Register a new Markdown file on the server manifest (empty content) before first open. */
 	async onFileCreated(path: string): Promise<void> {
 		const emptyHash = await sha256Utf8("");
-		await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
-			convexSecret: this.convexSecret,
-			path: normalizePath(path),
-			contentHash: emptyHash,
-			sizeBytes: 0,
-			updatedAtMs: Date.now(),
-			clientId: this.clientId,
-		});
+		await this.registerTextManifestContent(path, emptyHash, 0);
+	}
+
+	/**
+	 * Fallback path for vault modify events when a Markdown file changes outside active
+	 * Yjs doc wiring (for example during startup races on newly created notes).
+	 */
+	async onFileModified(path: string): Promise<void> {
+		if (this.currentPath === path && this.current) {
+			return;
+		}
+		const abstract = this.app.vault.getAbstractFileByPath(path);
+		if (!(abstract instanceof TFile) || abstract.extension !== "md") {
+			return;
+		}
+		const content = await this.app.vault.cachedRead(abstract);
+		const hash = await sha256Utf8(content);
+		await this.registerTextManifestContent(
+			path,
+			hash,
+			new TextEncoder().encode(content).length,
+		);
 	}
 
 	async onFileRenamed(oldPath: string, newPath: string): Promise<void> {
 		const oldDocId = this.pathToDocId(oldPath);
 		const newDocId = this.pathToDocId(newPath);
+		const wasCurrentDoc = this.currentPath === oldPath;
 
-		if (this.currentPath === oldPath) {
+		if (wasCurrentDoc) {
 			await this.closeCurrentDoc();
 		}
 
@@ -248,6 +263,12 @@ export class DocManager {
 				provider.destroy();
 				doc.destroy();
 			}
+		}
+
+		// Obsidian may keep the renamed note open without emitting a new file-open event.
+		// Rebind immediately so edits after rename keep syncing to Convex in real time.
+		if (wasCurrentDoc) {
+			await this.onFileOpen(newPath);
 		}
 	}
 
@@ -304,11 +325,23 @@ export class DocManager {
 	private async registerTextManifest(path: string, doc: Y.Doc): Promise<void> {
 		const content = doc.getText("content").toString();
 		const hash = await sha256Utf8(content);
+		await this.registerTextManifestContent(
+			path,
+			hash,
+			new TextEncoder().encode(content).length,
+		);
+	}
+
+	private async registerTextManifestContent(
+		path: string,
+		contentHash: string,
+		sizeBytes: number,
+	): Promise<void> {
 		await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
 			convexSecret: this.convexSecret,
 			path: normalizePath(path),
-			contentHash: hash,
-			sizeBytes: new TextEncoder().encode(content).length,
+			contentHash,
+			sizeBytes,
 			updatedAtMs: Date.now(),
 			clientId: this.clientId,
 		});

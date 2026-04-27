@@ -191,6 +191,7 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 		registerVaultCrudEventHandlers({
 			registerEvent: (eventRef: EventRef) => this.registerEvent(eventRef),
 			vault: this.app.vault,
+			getActiveFile: () => this.app.workspace.getActiveFile(),
 			getDocManager: () => this.docManager,
 			getBinarySync: () => this.binarySync,
 		});
@@ -214,6 +215,10 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 					}
 				}),
 			);
+			const activeFile = this.app.workspace.getActiveFile();
+			if (activeFile?.extension === "md") {
+				void this.docManager.onFileOpen(activeFile.path);
+			}
 
 			this.register(() => {
 				void this.docManager?.dispose();

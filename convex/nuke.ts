@@ -26,6 +26,12 @@ const nukeTableName = v.union(
 );
 
 const DELETE_BATCH_SIZE = 256;
+const MIN_DELETE_BATCH_SIZE = 1;
+
+function isTooManyBytesReadError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.includes("Too many bytes read");
+}
 
 /**
  * Internal kill switch for development environments.
@@ -42,11 +48,21 @@ export const nuke = internalAction({
 		let deletedDocs = 0;
 
 		for (const tableName of NUKABLE_TABLES) {
+			let batchSize = DELETE_BATCH_SIZE;
 			while (true) {
-				const batch = await ctx.runMutation(internal.nuke._deleteTableBatch, {
-					tableName,
-					batchSize: DELETE_BATCH_SIZE,
-				});
+				let batch;
+				try {
+					batch = await ctx.runMutation(internal.nuke._deleteTableBatch, {
+						tableName,
+						batchSize,
+					});
+				} catch (error) {
+					if (isTooManyBytesReadError(error) && batchSize > MIN_DELETE_BATCH_SIZE) {
+						batchSize = Math.max(MIN_DELETE_BATCH_SIZE, Math.floor(batchSize / 2));
+						continue;
+					}
+					throw error;
+				}
 				deletedDocs += batch.deletedCount;
 				for (const storageId of batch.storageIds) {
 					storageIds.add(storageId);
