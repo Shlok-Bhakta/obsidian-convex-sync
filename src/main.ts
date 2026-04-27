@@ -241,27 +241,30 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 				realtimeClient,
 				this.settings.convexSecret.trim(),
 				this.presenceSessionId,
+				async (paths: string[]) => {
+					await this.docManager?.pullRemoteTextFiles(paths);
+				},
 			);
 			void (async () => {
 				try {
 					await this.binarySync?.start();
 				} catch (err: unknown) {
-					console.error("Convex binary sync catch-up failed", err);
+					console.error("Convex vault sync catch-up failed", err);
 				}
 				const secret = this.settings.convexSecret.trim();
 				if (!secret || !this.docManager) return;
 				try {
-					const snapshot = await this.getConvexHttpClient().query(api.fileSync.listSnapshot, {
+					const meta = await this.getConvexHttpClient().query(api.fileSync.listAllMetadata, {
 						convexSecret: secret,
 					});
-					const textPaths = snapshot.files
+					const textPaths = meta.files
 						.filter((f: { isText: boolean }) => f.isText)
 						.map((f: { path: string }) => f.path);
 					void this.docManager?.warmUpAllDocs(textPaths).catch((e: unknown) => {
 						console.warn("DocManager warmUp error", e);
 					});
 				} catch (e: unknown) {
-					console.warn("DocManager warmUp snapshot error", e);
+					console.warn("DocManager warmUp metadata error", e);
 				}
 			})();
 			this.register(() => {

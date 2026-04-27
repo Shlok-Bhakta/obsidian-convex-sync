@@ -41,6 +41,8 @@ type Snapshot = {
 	}>;
 };
 
+const SNAPSHOT_PAGE_SIZE = 200;
+
 type LocalFileEntry = {
 	path: string;
 	updatedAtMs: number;
@@ -50,6 +52,43 @@ type LocalFileEntry = {
 };
 
 const ARG_CHUNK_SIZE = 500;
+
+type SnapshotPage<T> = {
+	page: T[];
+	isDone: boolean;
+	continueCursor: string;
+};
+
+async function fetchSnapshot(client: ConvexHttpClient, secret: string): Promise<Snapshot> {
+	const files: Snapshot["files"] = [];
+	const folders: Snapshot["folders"] = [];
+	let fileCursor: string | null = null;
+	let folderCursor: string | null = null;
+	let filesDone = false;
+	let foldersDone = false;
+
+	while (!filesDone) {
+		const page = (await client.query(api.fileSync.listBinarySnapshotPage, {
+			convexSecret: secret,
+			paginationOpts: { cursor: fileCursor, numItems: SNAPSHOT_PAGE_SIZE },
+		})) as SnapshotPage<Snapshot["files"][number]>;
+		files.push(...page.page);
+		filesDone = page.isDone;
+		fileCursor = page.continueCursor;
+	}
+
+	while (!foldersDone) {
+		const page = (await client.query(api.fileSync.listFolderSnapshotPage, {
+			convexSecret: secret,
+			paginationOpts: { cursor: folderCursor, numItems: SNAPSHOT_PAGE_SIZE },
+		})) as SnapshotPage<Snapshot["folders"][number]>;
+		folders.push(...page.page);
+		foldersDone = page.isDone;
+		folderCursor = page.continueCursor;
+	}
+
+	return { files, folders };
+}
 
 function toHex(buffer: ArrayBuffer): string {
 	const bytes = new Uint8Array(buffer);
@@ -99,12 +138,30 @@ export async function readRemoteFileBytes(
 	if (!signed) {
 		return null;
 	}
-	const response = await fetch(signed.url, { method: "GET", cache: "no-store" });
-	if (!response.ok) {
-		throw new Error(`Failed downloading ${path}: HTTP ${response.status}`);
+	try {
+		const response = await fetch(signed.url, {
+			method: "GET",
+			cache: "no-store",
+		});
+		if (!response.ok) {
+			throw new Error(`Failed downloading ${path}: HTTP ${response.status}`);
+		}
+		const bytes = await response.arrayBuffer();
+		return { bytes, updatedAtMs: signed.updatedAtMs };
+	} catch (error) {
+		console.warn("[file-sync] signed download failed, falling back to Convex action", {
+			path,
+			message: error instanceof Error ? error.message : String(error),
+		});
+		const fallback = await client.action(api.fileSync.getFileBytes, {
+			convexSecret: secret,
+			path,
+		});
+		if (!fallback) {
+			return null;
+		}
+		return { bytes: fallback.bytes, updatedAtMs: fallback.updatedAtMs };
 	}
-	const bytes = await response.arrayBuffer();
-	return { bytes, updatedAtMs: signed.updatedAtMs };
 }
 
 /** Upload or replace a binary vault file (used by manual sync and realtime binary sync). */
@@ -298,9 +355,7 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		completed: 0,
 		total: 1,
 	});
-	const snapshot = (await client.query(api.fileSync.listSnapshot, {
-		convexSecret: secret,
-	})) as Snapshot;
+	const snapshot = await fetchSnapshot(client, secret);
 	const remoteByPath = new Map(
 		snapshot.files.filter((row) => !row.isText).map((row) => [row.path, row]),
 	);

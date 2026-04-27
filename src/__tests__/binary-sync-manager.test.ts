@@ -1,10 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mutationMock, readBinaryMock, uploadLocalFileMock } = vi.hoisted(() => ({
+const { mutationMock, readBinaryMock, uploadLocalFileMock, readRemoteFileBytesMock, noticeMock } = vi.hoisted(() => ({
 	mutationMock: vi.fn(),
 	readBinaryMock: vi.fn(),
 	uploadLocalFileMock: vi.fn(),
+	readRemoteFileBytesMock: vi.fn(),
+	noticeMock: vi.fn(),
 }));
+
+vi.mock("idb-keyval", () => {
+	const store = new Map<string, unknown>();
+	return {
+		createStore: vi.fn(() => ({})),
+		get: vi.fn(async (key: string) => store.get(String(key))),
+		set: vi.fn(async (key: string, value: unknown) => {
+			store.set(String(key), value);
+		}),
+		del: vi.fn(async (key: string) => {
+			store.delete(String(key));
+		}),
+		keys: vi.fn(async () => Array.from(store.keys())),
+	};
+});
 
 vi.mock("obsidian", () => {
 	class TFile {
@@ -16,9 +33,15 @@ vi.mock("obsidian", () => {
 		}
 	}
 	class TFolder {}
+	class Notice {
+		constructor(message: string, timeout?: number) {
+			noticeMock(message, timeout);
+		}
+	}
 	return {
 		TFile,
 		TFolder,
+		Notice,
 		normalizePath: (value: string) => value.replace(/\\/g, "/"),
 	};
 });
@@ -28,16 +51,19 @@ vi.mock("../file-sync", async () => {
 	return {
 		...actual,
 		uploadLocalFile: uploadLocalFileMock,
+		readRemoteFileBytes: readRemoteFileBytesMock,
 	};
 });
 
 import { TFile } from "obsidian";
 import { BinarySyncManager } from "../sync/binary-sync-manager";
+import { del, keys, set } from "idb-keyval";
 
 describe("BinarySyncManager", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		vi.useFakeTimers();
+		readRemoteFileBytesMock.mockResolvedValue({ bytes: new ArrayBuffer(4), updatedAtMs: Date.now() });
 	});
 	afterEach(() => {
 		vi.useRealTimers();
@@ -58,6 +84,7 @@ describe("BinarySyncManager", () => {
 			{} as never,
 			"secret",
 			"client",
+			async () => {},
 		);
 
 		await manager.onLocalFolderRenamed("old/folder", "new/folder");
@@ -102,6 +129,7 @@ describe("BinarySyncManager", () => {
 			{} as never,
 			"secret",
 			"client",
+			async () => {},
 		);
 
 		const createPromise = manager.onLocalFileCreated(liveFile);
@@ -114,5 +142,80 @@ describe("BinarySyncManager", () => {
 		await vi.waitFor(() => {
 			expect(uploadLocalFileMock).toHaveBeenCalledTimes(2);
 		});
+	});
+
+	it("notifies only when sync actually changes .obsidian paths", async () => {
+		for (const key of await keys()) {
+			await del(key);
+		}
+		const queryMock = vi.fn().mockResolvedValue({
+			files: [
+				{ path: ".obsidian/workspace.json", contentHash: "hash-a", updatedAtMs: 1, isText: false },
+			],
+			folders: [],
+		});
+		const manager = new BinarySyncManager(
+			{
+				vault: {
+					readBinary: readBinaryMock,
+					getAbstractFileByPath: vi.fn(),
+					adapter: {
+						exists: vi.fn().mockResolvedValue(true),
+						remove: vi.fn().mockResolvedValue(undefined),
+						stat: vi.fn().mockResolvedValue({ type: "file" }),
+						writeBinary: vi.fn(),
+					},
+					createFolder: vi.fn(),
+					createBinary: vi.fn(),
+					modifyBinary: vi.fn(),
+					delete: vi.fn(),
+				},
+			} as never,
+			{ query: queryMock, mutation: mutationMock } as never,
+			{ onUpdate: vi.fn() } as never,
+			"secret",
+			"client",
+			async () => {},
+		);
+
+		await set("binarySync:hash:.obsidian/workspace.json", "hash-a");
+
+		// First push: unchanged hash, no local sync write, no notice.
+		await (manager as unknown as {
+			onRemoteMetadata: (remote: {
+				files: Array<{
+					path: string;
+					contentHash: string;
+					updatedAtMs: number;
+					isText: boolean;
+				}>;
+				folders: Array<{ path: string; updatedAtMs: number; isExplicitlyEmpty: boolean }>;
+			}) => Promise<void>;
+		}).onRemoteMetadata({
+			files: [
+				{ path: ".obsidian/workspace.json", contentHash: "hash-a", updatedAtMs: 20, isText: false },
+			],
+			folders: [],
+		});
+		expect(noticeMock).not.toHaveBeenCalled();
+
+		// Second push: changed hash, sync applies remote bytes, notice shown once.
+		await (manager as unknown as {
+			onRemoteMetadata: (remote: {
+				files: Array<{
+					path: string;
+					contentHash: string;
+					updatedAtMs: number;
+					isText: boolean;
+				}>;
+				folders: Array<{ path: string; updatedAtMs: number; isExplicitlyEmpty: boolean }>;
+			}) => Promise<void>;
+		}).onRemoteMetadata({
+			files: [
+				{ path: ".obsidian/workspace.json", contentHash: "hash-b", updatedAtMs: 30, isText: false },
+			],
+			folders: [],
+		});
+		expect(noticeMock).toHaveBeenCalledTimes(1);
 	});
 });

@@ -72,9 +72,15 @@ export default defineSchema({
 		chunkIndex: v.optional(v.number()),
 		chunkCount: v.optional(v.number()),
 	}).index("by_doc_id", ["docId"]),
+	yjsDirtyDocs: defineTable({
+		docId: v.string(),
+	}).index("by_doc_id", ["docId"]),
 	/** Full merged Yjs state; inline bytes so reactive `pull` can read it (queries cannot use `storage.get`). */
 	yjsSnapshots: defineTable({
 		docId: v.string(),
 		data: v.bytes(),
+		chunkGroupId: v.optional(v.string()),
+		chunkIndex: v.optional(v.number()),
+		chunkCount: v.optional(v.number()),
 	}).index("by_doc_id", ["docId"]),
 });

@@ -28,6 +28,8 @@ export class DocManager {
 	private currentPath: string | null = null;
 	private destroyed = false;
 	private recoveringFromDivergence = false;
+	/** Paths currently being pulled from remote; suppresses onFileCreated empty-manifest registration. */
+	readonly pullingRemotePaths = new Set<string>();
 
 	/** Current Yjs awareness for the open collaborative doc (sidebar presence merge). */
 	getCurrentAwareness(): Awareness | null {
@@ -233,10 +235,36 @@ export class DocManager {
 		await this.closeCurrentDoc();
 	}
 
-	/** Register a new Markdown file on the server manifest (empty content) before first open. */
+	/** Register a new Markdown file on the server using current disk content before first open. */
 	async onFileCreated(path: string): Promise<void> {
-		const emptyHash = await sha256Utf8("");
-		await this.registerTextManifestContent(path, emptyHash, 0);
+		if (this.pullingRemotePaths.has(path)) return;
+		const norm = normalizePath(path);
+		const abstract = this.app.vault.getAbstractFileByPath(norm);
+		if (!(abstract instanceof TFile) || abstract.extension !== "md") {
+			const emptyHash = await sha256Utf8("");
+			await this.registerTextManifestContent(path, emptyHash, 0);
+			return;
+		}
+		const content = await this.app.vault.cachedRead(abstract);
+		if (content.length === 0) {
+			const emptyHash = await sha256Utf8("");
+			await this.registerTextManifestContent(path, emptyHash, 0);
+			return;
+		}
+
+		const docId = this.pathToDocId(path);
+		const doc = new Y.Doc();
+		doc.getText("content").insert(0, content);
+		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjs);
+		try {
+			await provider.init();
+			await provider.pushFullState();
+			await YjsLocalCache.save(docId, doc);
+			await this.registerTextManifest(path, doc);
+		} finally {
+			provider.destroy();
+			doc.destroy();
+		}
 	}
 
 	/**
@@ -366,6 +394,68 @@ export class DocManager {
 		}
 	}
 
+	/**
+	 * Pull Yjs state for a text file discovered from the remote metadata subscription,
+	 * create or update the local file on disk, and persist the local cache + manifest.
+	 */
+	async pullRemoteTextFile(path: string): Promise<void> {
+		const norm = normalizePath(path);
+		const docId = this.pathToDocId(path);
+		this.pullingRemotePaths.add(path);
+		const doc = new Y.Doc();
+		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjs);
+		try {
+			await provider.init();
+			const content = doc.getText("content").toString();
+
+			const parent = folderPathForFile(norm);
+			if (parent) {
+				const parentNorm = normalizePath(parent);
+				if (!(await this.app.vault.adapter.exists(parentNorm))) {
+					await this.app.vault.createFolder(parentNorm).catch(() => {});
+				}
+			}
+
+			const existing = this.app.vault.getAbstractFileByPath(norm);
+			if (existing instanceof TFile) {
+				await this.app.vault.modify(existing, content);
+			} else if (await this.app.vault.adapter.exists(norm)) {
+				await this.app.vault.adapter.write(norm, content);
+			} else {
+				await this.app.vault.create(norm, content);
+			}
+
+			if (content.length > 0) {
+				await YjsLocalCache.save(docId, doc);
+			}
+			await this.registerTextManifest(path, doc);
+		} catch (e) {
+			console.warn(`[DocManager] pullRemoteTextFile failed for ${path}`, e);
+		} finally {
+			provider.destroy();
+			doc.destroy();
+			this.pullingRemotePaths.delete(path);
+		}
+	}
+
+	/**
+	 * Batch-pull remote text files. Skips paths that are already cached or currently open.
+	 * Called by BinarySyncManager when it discovers remote text files from subscription/catch-up.
+	 */
+	async pullRemoteTextFiles(paths: string[]): Promise<void> {
+		for (const path of paths) {
+			if (this.destroyed) return;
+			if (this.currentPath === path) continue;
+			const docId = this.pathToDocId(path);
+			if (await YjsLocalCache.hasCachedState(docId)) {
+				const existing = this.app.vault.getAbstractFileByPath(normalizePath(path));
+				if (existing instanceof TFile) continue;
+			}
+			await this.pullRemoteTextFile(path);
+			await new Promise((r) => setTimeout(r, 50));
+		}
+	}
+
 	private pathToDocId(path: string): string {
 		return `${this.app.vault.getName()}::${normalizePath(path)}`;
 	}
@@ -438,4 +528,10 @@ function isValidCursorShape(cursor: Record<string, unknown>): boolean {
 		}
 	}
 	return true;
+}
+
+function folderPathForFile(filePath: string): string | null {
+	const slash = filePath.lastIndexOf("/");
+	if (slash < 0) return null;
+	return filePath.slice(0, slash);
 }

@@ -7,13 +7,19 @@ vi.mock("../_generated/server", () => ({
 	internalQuery: (config: unknown) => config,
 	internalAction: (config: unknown) => config,
 	action: (config: unknown) => config,
+	paginationOptsValidator: {},
 }));
 
 vi.mock("../security", () => ({
 	requirePluginSecret: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { listSnapshot, registerTextFile, removeFilesByPath, syncFolderState } from "../fileSync";
+import {
+	listBinarySnapshotPage,
+	registerTextFile,
+	removeFilesByPath,
+	syncFolderState,
+} from "../fileSync";
 
 type Handler<Args, Result> = (ctx: unknown, args: Args) => Promise<Result>;
 
@@ -169,31 +175,53 @@ describe("convex/fileSync", () => {
 		);
 	});
 
-	it("listSnapshot includes text docs discovered from yjs tables", async () => {
+	it("listBinarySnapshotPage returns paginated binary rows", async () => {
 		const { ctx } = makeCtx({
 			db: {
 				query: vi.fn((table: string) => {
-					if (table === "vaultFiles") return { collect: vi.fn().mockResolvedValue([]) };
-					if (table === "vaultFolders") return { collect: vi.fn().mockResolvedValue([]) };
-					if (table === "yjsSnapshots")
-						return { collect: vi.fn().mockResolvedValue([{ docId: "vault::notes/orphan.md" }]) };
-					if (table === "yjsUpdates") return { collect: vi.fn().mockResolvedValue([]) };
+					if (table === "vaultFiles") {
+						return {
+							withIndex: () => ({
+								paginate: vi.fn().mockResolvedValue({
+									page: [
+										{
+											path: "assets/image.png",
+											contentHash: "abc123",
+											sizeBytes: 100,
+											updatedAtMs: 12,
+											updatedByClientId: "client-1",
+											isText: false,
+											storageId: "storage-1",
+										},
+									],
+									isDone: true,
+									continueCursor: "end",
+								}),
+							}),
+						};
+					}
 					return { collect: vi.fn().mockResolvedValue([]) };
 				}),
 			},
 		});
 
-		const result = await invokeHandler<{ convexSecret: string }, { files: unknown[] }>(
-			listSnapshot,
+		const result = await invokeHandler<
+			{ convexSecret: string; paginationOpts: { cursor: string | null; numItems: number } },
+			{ page: unknown[]; isDone: boolean; continueCursor: string }
+		>(
+			listBinarySnapshotPage,
 			ctx,
-			{ convexSecret: "secret" },
+			{
+				convexSecret: "secret",
+				paginationOpts: { cursor: null, numItems: 200 },
+			},
 		);
-		expect(result.files).toContainEqual(
+		expect(result.page).toContainEqual(
 			expect.objectContaining({
-				path: "notes/orphan.md",
-				isText: true,
-				sizeBytes: 0,
-				contentHash: "",
+				path: "assets/image.png",
+				isText: false,
+				sizeBytes: 100,
+				contentHash: "abc123",
 			}),
 		);
 	});

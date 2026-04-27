@@ -16,11 +16,14 @@ export class ConvexYjsProvider {
 
 	private unsubscribePull: (() => void) | null = null;
 	private retryTimer: ReturnType<typeof setTimeout> | null = null;
+	private flushTimer: ReturnType<typeof setTimeout> | null = null;
 	private pendingUpdate: Uint8Array | null = null;
 	private pushInFlight = false;
 	private retryDelayMs = 500;
 	private destroyed = false;
 	private syncStarted = false;
+	private serverStateVector: Uint8Array | null = null;
+	private static readonly PUSH_DEBOUNCE_MS = 200;
 
 	/** Optional hook when applying remote updates fails (e.g. corrupt payload). */
 	onDivergence: (() => void) | null = null;
@@ -48,15 +51,18 @@ export class ConvexYjsProvider {
 		if (this.destroyed) return;
 
 		Y.applyUpdate(this.doc, toUint8Array(initial.update), this.remoteOrigin);
+		this.serverStateVector = toUint8Array(initial.serverStateVector);
 	}
 
 	startSync(): void {
 		if (this.destroyed || this.syncStarted) return;
 		this.syncStarted = true;
 		this.doc.on("update", this.onDocUpdate);
-		// Proactively push the current doc state so locally cached edits are not stuck
-		// waiting for a brand-new keystroke after reconnect/reopen.
-		this.enqueuePush(Y.encodeStateAsUpdate(this.doc));
+		// Push only local delta against last server vector instead of full state.
+		const localDelta = this.serverStateVector
+			? Y.encodeStateAsUpdate(this.doc, this.serverStateVector)
+			: Y.encodeStateAsUpdate(this.doc);
+		this.enqueuePush(localDelta);
 		this.unsubscribePull = this.client.onUpdate(
 			this.convexApi.pull as FunctionReference<"query">,
 			{ docId: this.docId },
@@ -70,6 +76,7 @@ export class ConvexYjsProvider {
 					if (delta.byteLength > 0) {
 						Y.applyUpdate(this.doc, delta, this.remoteOrigin);
 					}
+					this.serverStateVector = Y.encodeStateVectorFromUpdate(mergedRemote);
 				} catch (err: unknown) {
 					console.error("[ConvexYjsProvider] pull applyUpdate failed — re-sync suggested", err);
 					this.onDivergence?.();
@@ -99,6 +106,10 @@ export class ConvexYjsProvider {
 			clearTimeout(this.retryTimer);
 			this.retryTimer = null;
 		}
+		if (this.flushTimer) {
+			clearTimeout(this.flushTimer);
+			this.flushTimer = null;
+		}
 		this.doc.off("update", this.onDocUpdate);
 		this.unsubscribePull?.();
 		this.unsubscribePull = null;
@@ -109,7 +120,13 @@ export class ConvexYjsProvider {
 		this.pendingUpdate = this.pendingUpdate
 			? Y.mergeUpdates([this.pendingUpdate, update])
 			: update;
-		void this.flushPushQueue();
+		if (this.flushTimer) {
+			return;
+		}
+		this.flushTimer = setTimeout(() => {
+			this.flushTimer = null;
+			void this.flushPushQueue();
+		}, ConvexYjsProvider.PUSH_DEBOUNCE_MS);
 	}
 
 	private async flushPushQueue(): Promise<void> {
@@ -122,6 +139,7 @@ export class ConvexYjsProvider {
 				docId: this.docId,
 				update: toArrayBuffer(nextUpdate),
 			});
+			this.serverStateVector = Y.encodeStateVector(this.doc);
 			this.retryDelayMs = 500;
 		} catch (error: unknown) {
 			console.error("Convex Yjs push failed", error);

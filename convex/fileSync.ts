@@ -1,7 +1,20 @@
 import { ConvexError, v } from "convex/values";
 import { internal } from "./_generated/api";
-import { mutation, query } from "./_generated/server";
+import {
+	action,
+	internalQuery,
+	mutation,
+	query,
+} from "./_generated/server";
+import { paginationOptsValidator } from "convex/server";
 import { requirePluginSecret } from "./security";
+
+type FileBytesResult = {
+	bytes: ArrayBuffer;
+	contentHash: string;
+	sizeBytes: number;
+	updatedAtMs: number;
+} | null;
 
 function normalizePath(input: string): string {
 	const normalized = input.trim().replace(/\\/g, "/").replace(/^\/+/, "");
@@ -222,59 +235,19 @@ export const listFileHashes = query({
 	},
 });
 
-export const listSnapshot = query({
-	args: { convexSecret: v.string() },
+export const listBinarySnapshotPage = query({
+	args: {
+		convexSecret: v.string(),
+		paginationOpts: paginationOptsValidator,
+	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const [files, snapshots, updates] = await Promise.all([
-			ctx.db.query("vaultFiles").collect(),
-			ctx.db.query("yjsSnapshots").collect(),
-			ctx.db.query("yjsUpdates").collect(),
-		]);
-		type SnapshotFile = {
-			path: string;
-			contentHash: string;
-			sizeBytes: number;
-			updatedAtMs: number;
-			updatedByClientId: string;
-			isText: boolean;
-			storageId?: string;
-		};
-		const filesByPath = new Map<string, SnapshotFile>(
-			files.map((file) => [
-				file.path,
-				{
-					path: file.path,
-					contentHash: file.contentHash,
-					sizeBytes: file.sizeBytes,
-					updatedAtMs: file.updatedAtMs,
-					updatedByClientId: file.updatedByClientId,
-					isText: file.isText,
-					storageId: file.storageId,
-				},
-			]),
-		);
-		for (const row of [...snapshots, ...updates]) {
-			const separator = row.docId.indexOf("::");
-			if (separator < 0) {
-				continue;
-			}
-			const path = row.docId.slice(separator + 2);
-			if (!path || filesByPath.has(path)) {
-				continue;
-			}
-			filesByPath.set(path, {
-				path,
-				contentHash: "",
-				sizeBytes: 0,
-				updatedAtMs: 0,
-				updatedByClientId: "",
-				isText: true,
-			});
-		}
-		const folders = await ctx.db.query("vaultFolders").collect();
+		const page = await ctx.db
+			.query("vaultFiles")
+			.withIndex("by_isText_updatedAtMs", (q) => q.eq("isText", false))
+			.paginate(args.paginationOpts);
 		return {
-			files: [...filesByPath.values()].map((file) => ({
+			page: page.page.map((file) => ({
 				path: file.path,
 				contentHash: file.contentHash,
 				sizeBytes: file.sizeBytes,
@@ -283,12 +256,32 @@ export const listSnapshot = query({
 				isText: file.isText,
 				storageId: file.storageId,
 			})),
-			folders: folders.map((folder) => ({
+			isDone: page.isDone,
+			continueCursor: page.continueCursor,
+		};
+	},
+});
+
+export const listFolderSnapshotPage = query({
+	args: {
+		convexSecret: v.string(),
+		paginationOpts: paginationOptsValidator,
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const page = await ctx.db
+			.query("vaultFolders")
+			.withIndex("by_updatedAtMs")
+			.paginate(args.paginationOpts);
+		return {
+			page: page.page.map((folder) => ({
 				path: folder.path,
 				updatedAtMs: folder.updatedAtMs,
 				isExplicitlyEmpty: folder.isExplicitlyEmpty,
 				updatedByClientId: folder.updatedByClientId ?? "",
 			})),
+			isDone: page.isDone,
+			continueCursor: page.continueCursor,
 		};
 	},
 });
@@ -311,6 +304,55 @@ export const getDownloadUrl = query({
 		}
 		return {
 			url,
+			contentHash: row.contentHash,
+			sizeBytes: row.sizeBytes,
+			updatedAtMs: row.updatedAtMs,
+		};
+	},
+});
+
+export const getRowByPath = internalQuery({
+	args: { path: v.string() },
+	handler: async (ctx, args) => {
+		const path = normalizePath(args.path);
+		return await ctx.db
+			.query("vaultFiles")
+			.withIndex("by_path", (q) => q.eq("path", path))
+			.unique();
+	},
+});
+
+export const getFileBytes = action({
+	args: { convexSecret: v.string(), path: v.string() },
+	returns: v.union(
+		v.null(),
+		v.object({
+			bytes: v.bytes(),
+			contentHash: v.string(),
+			sizeBytes: v.number(),
+			updatedAtMs: v.number(),
+		}),
+	),
+	handler: async (ctx, args): Promise<FileBytesResult> => {
+		const auth = await ctx.runQuery(internal.security.validatePluginSecret, {
+			secret: args.convexSecret,
+		});
+		if (!auth.ok) {
+			throw new Error("The vault API key is invalid for this Convex deployment.");
+		}
+		const path = normalizePath(args.path);
+		const row = await ctx.runQuery((internal as any).fileSync.getRowByPath, {
+			path,
+		});
+		if (!row || !row.storageId) {
+			return null;
+		}
+		const blob = await ctx.storage.get(row.storageId as never);
+		if (!blob) {
+			return null;
+		}
+		return {
+			bytes: await blob.arrayBuffer(),
 			contentHash: row.contentHash,
 			sizeBytes: row.sizeBytes,
 			updatedAtMs: row.updatedAtMs,
@@ -410,6 +452,72 @@ export const removeFoldersByPath = mutation({
 				await ctx.db.delete(existing._id);
 			}
 		}
+	},
+});
+
+/** Reactive subscription: all vaultFiles (text+binary) + vaultFolders metadata. */
+export const listAllMetadata = query({
+	args: { convexSecret: v.string() },
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const [files, folders] = await Promise.all([
+			ctx.db.query("vaultFiles").collect(),
+			ctx.db.query("vaultFolders").collect(),
+		]);
+		return {
+			files: files.map((f) => ({
+				path: f.path,
+				contentHash: f.contentHash,
+				updatedAtMs: f.updatedAtMs,
+				isText: f.isText,
+			})),
+			folders: folders.map((f) => ({
+				path: f.path,
+				updatedAtMs: f.updatedAtMs,
+				isExplicitlyEmpty: f.isExplicitlyEmpty,
+			})),
+		};
+	},
+});
+
+/** Catch-up: all vaultFiles + vaultFolders changed since a server-anchored timestamp. */
+export const listAllChangesSince = query({
+	args: { convexSecret: v.string(), sinceMs: v.number() },
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const [files, folders] = await Promise.all([
+			ctx.db
+				.query("vaultFiles")
+				.withIndex("by_updatedAtMs", (q) => q.gt("updatedAtMs", args.sinceMs))
+				.collect(),
+			ctx.db
+				.query("vaultFolders")
+				.withIndex("by_updatedAtMs", (q) => q.gt("updatedAtMs", args.sinceMs))
+				.collect(),
+		]);
+		return {
+			files: files.map((f) => ({
+				path: f.path,
+				contentHash: f.contentHash,
+				updatedAtMs: f.updatedAtMs,
+				isText: f.isText,
+				sizeBytes: f.sizeBytes,
+			})),
+			folders: folders.map((f) => ({
+				path: f.path,
+				updatedAtMs: f.updatedAtMs,
+				isExplicitlyEmpty: f.isExplicitlyEmpty,
+			})),
+		};
+	},
+});
+
+/** Server-anchored timestamp so the client can store a sync watermark from Convex (not device clock). */
+export const getServerTimestamp = query({
+	args: { convexSecret: v.string() },
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		return { serverNowMs: Date.now() };
 	},
 });
 
