@@ -220,6 +220,16 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 				void this.docManager.onFileOpen(activeFile.path);
 			}
 
+			this.registerDomEvent(window, "error", (evt: Event) => {
+				const e = evt as ErrorEvent;
+				const msg =
+					e.message ??
+					(e.error instanceof Error ? e.error.message : String(e.error ?? ""));
+				if (msg.includes("Invalid change range")) {
+					void this.docManager?.recoverFromEditorSyncDivergence();
+				}
+			});
+
 			this.register(() => {
 				void this.docManager?.dispose();
 				this.docManager = null;

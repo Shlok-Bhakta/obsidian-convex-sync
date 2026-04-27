@@ -26,8 +26,6 @@ describe("convex/yjs snapshot lifecycle", () => {
 		const inserts: Array<Record<string, unknown>> = [];
 		const patches: Array<Record<string, unknown>> = [];
 		const deletedIds: string[] = [];
-		const deletedStorage: string[] = [];
-
 		const ctx = {
 			db: {
 				query: vi.fn((table: string) => {
@@ -45,8 +43,8 @@ describe("convex/yjs snapshot lifecycle", () => {
 						return {
 							withIndex: () => ({
 								collect: vi.fn().mockResolvedValue([
-									{ _id: "s1", fileId: "old1" },
-									{ _id: "s2", fileId: "old2" },
+									{ _id: "s1", data: new Uint8Array([1, 2]).buffer },
+									{ _id: "s2", data: new Uint8Array([3]).buffer },
 								]),
 							}),
 						};
@@ -64,23 +62,17 @@ describe("convex/yjs snapshot lifecycle", () => {
 					deletedIds.push(id);
 				}),
 			},
-			storage: {
-				delete: vi.fn(async (fileId: string) => {
-					deletedStorage.push(fileId);
-				}),
-			},
 		};
 
 		await invokeHandler(_createSnapshot, ctx, {
 			docId: "vault::notes/test.md",
 			timestamp: 123,
-			fileId: "new-file",
+			data: new Uint8Array([9, 9]).buffer,
 		});
 
 		expect(inserts.length).toBe(0);
-		expect(patches).toContainEqual({ fileId: "new-file" });
+		expect(patches.length).toBeGreaterThan(0);
+		expect(new Uint8Array(patches[0].data as ArrayBuffer)).toEqual(new Uint8Array([9, 9]));
 		expect(deletedIds).toContain("s2");
-		expect(deletedStorage).toContain("old1");
-		expect(deletedStorage).toContain("old2");
 	});
 });

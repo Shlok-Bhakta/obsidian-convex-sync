@@ -102,12 +102,6 @@ export const _deleteTableBatch = internalMutation({
 					storageIds.push(candidate);
 				}
 			}
-			if (args.tableName === "yjsSnapshots") {
-				const candidate = (doc as { fileId: Id<"_storage"> }).fileId;
-				if (candidate) {
-					storageIds.push(candidate);
-				}
-			}
 		}
 		await Promise.all(docs.map((doc) => ctx.db.delete(doc._id)));
 		return {

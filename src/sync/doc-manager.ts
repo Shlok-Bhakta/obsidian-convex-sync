@@ -8,6 +8,7 @@ import * as Y from "yjs";
 import type { api } from "../../convex/_generated/api";
 import { ConvexAwarenessSync } from "./convex-awareness-sync";
 import { ConvexYjsProvider } from "./ConvexYjsProvider";
+import { flushYjsTextToActiveMarkdownEditor } from "./flush-ytext-to-cm";
 import { YjsLocalCache } from "./yjs-local-cache";
 
 type DocEntry = {
@@ -26,6 +27,7 @@ export class DocManager {
 	private current: DocEntry | null = null;
 	private currentPath: string | null = null;
 	private destroyed = false;
+	private recoveringFromDivergence = false;
 
 	/** Current Yjs awareness for the open collaborative doc (sidebar presence merge). */
 	getCurrentAwareness(): Awareness | null {
@@ -59,6 +61,9 @@ export class DocManager {
 			doc,
 			this.convexApi.yjs,
 		);
+		provider.onDivergence = () => {
+			void this.recoverFromEditorSyncDivergence();
+		};
 		try {
 			await provider.init();
 			const cacheDelta = Y.encodeStateAsUpdate(cachedDoc, Y.encodeStateVector(doc));
@@ -100,6 +105,7 @@ export class DocManager {
 			removed: number[];
 		}): void => {
 			const currentDocLen = ytext.length;
+			const sanitizedClients: number[] = [];
 			for (const clientId of [...event.added, ...event.updated]) {
 				const state = awareness.getStates().get(clientId);
 				if (!state || typeof state !== "object") continue;
@@ -126,7 +132,17 @@ export class DocManager {
 				}
 				if (changed) {
 					awareness.getStates().set(clientId, stateObj);
+					sanitizedClients.push(clientId);
 				}
+			}
+			if (sanitizedClients.length > 0) {
+				const payload = {
+					added: [] as number[],
+					updated: sanitizedClients,
+					removed: [] as number[],
+				};
+				awareness.emit("change", [payload, "sanitizer"]);
+				awareness.emit("update", [payload, "sanitizer"]);
 			}
 		};
 		awareness.on("update", awarenessSanitizer);
@@ -143,6 +159,9 @@ export class DocManager {
 		this.extensions.length = 0;
 		this.extensions.push(yCollab(ytext, awareness));
 		this.app.workspace.updateOptions();
+		// Convex init ran before yCollab existed, so CM never received a Y→CM observe callback.
+		// Flush once now (and again after startSync) so disk cannot sit stale vs Y or poison Y via CM→Y.
+		flushYjsTextToActiveMarkdownEditor(this.app, path, ytext);
 
 		// Remote Yjs and awareness rows may arrive in the same turn as setup.
 		// Defer until after CM has applied yCollab so editor length matches Y.Text.
@@ -151,6 +170,7 @@ export class DocManager {
 			if (this.destroyed || this.current !== entry || awarenessAttached) return;
 			awarenessAttached = true;
 			provider.startSync();
+			flushYjsTextToActiveMarkdownEditor(this.app, path, ytext);
 			entry.awarenessSync =
 				this.convexSecret.trim() !== ""
 					? new ConvexAwarenessSync(
@@ -163,6 +183,24 @@ export class DocManager {
 					: null;
 		};
 		requestAnimationFrame(attachAwareness);
+	}
+
+	/**
+	 * Close and re-open the active note so Convex `init` + Yjs wiring runs again.
+	 * Used when CodeMirror throws after Yjs/remote divergence (e.g. invalid change range).
+	 */
+	async recoverFromEditorSyncDivergence(): Promise<void> {
+		if (this.recoveringFromDivergence) return;
+		const path = this.currentPath;
+		if (!path) return;
+		this.recoveringFromDivergence = true;
+		try {
+			console.warn("[DocManager] Yjs/CodeMirror divergence — re-syncing from server");
+			await this.closeCurrentDoc();
+			await this.onFileOpen(path);
+		} finally {
+			this.recoveringFromDivergence = false;
+		}
 	}
 
 	async closeCurrentDoc(): Promise<void> {
@@ -329,7 +367,7 @@ export class DocManager {
 	}
 
 	private pathToDocId(path: string): string {
-		return `${this.app.vault.getName()}::${path}`;
+		return `${this.app.vault.getName()}::${normalizePath(path)}`;
 	}
 
 	private async registerTextManifest(path: string, doc: Y.Doc): Promise<void> {

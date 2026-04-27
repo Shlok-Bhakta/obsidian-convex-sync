@@ -22,6 +22,9 @@ export class ConvexYjsProvider {
 	private destroyed = false;
 	private syncStarted = false;
 
+	/** Optional hook when applying remote updates fails (e.g. corrupt payload). */
+	onDivergence: (() => void) | null = null;
+
 	constructor(
 		private readonly client: ConvexClient,
 		private readonly docId: string,
@@ -59,7 +62,18 @@ export class ConvexYjsProvider {
 			{ docId: this.docId },
 			(serverUpdate) => {
 				if (this.destroyed) return;
-				Y.applyUpdate(this.doc, toUint8Array(serverUpdate), this.remoteOrigin);
+				try {
+					const mergedRemote = toUint8Array(serverUpdate);
+					// Apply only the missing prefix of the server merge relative to the local
+					// doc (covers init vs first-pull races and avoids redundant full-state replays).
+					const delta = Y.diffUpdate(mergedRemote, Y.encodeStateVector(this.doc));
+					if (delta.byteLength > 0) {
+						Y.applyUpdate(this.doc, delta, this.remoteOrigin);
+					}
+				} catch (err: unknown) {
+					console.error("[ConvexYjsProvider] pull applyUpdate failed — re-sync suggested", err);
+					this.onDivergence?.();
+				}
 			},
 			(error: Error) => {
 				console.error("Convex Yjs pull subscription failed", error);
@@ -80,6 +94,7 @@ export class ConvexYjsProvider {
 		if (this.destroyed) return;
 		this.destroyed = true;
 		this.syncStarted = false;
+		this.onDivergence = null;
 		if (this.retryTimer) {
 			clearTimeout(this.retryTimer);
 			this.retryTimer = null;

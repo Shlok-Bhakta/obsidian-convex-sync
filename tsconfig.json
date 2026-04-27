@@ -1,6 +1,9 @@
 {
 	"compilerOptions": {
 		"baseUrl": "src",
+		"paths": {
+			"y-internal-y-sync": ["../node_modules/y-codemirror.next/src/y-sync.js"]
+		},
 		"inlineSourceMap": true,
 		"inlineSources": true,
 		"module": "ESNext",
@@ -25,6 +28,7 @@
 		]
 	},
 	"include": [
-		"src/**/*.ts"
+		"src/**/*.ts",
+		"src/**/*.d.ts"
 	]
 }

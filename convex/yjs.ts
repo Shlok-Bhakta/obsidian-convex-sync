@@ -1,6 +1,8 @@
+import type { GenericActionCtx } from "convex/server";
 import { v } from "convex/values";
 import * as Y from "yjs";
 import { internal } from "./_generated/api";
+import type { DataModel } from "./_generated/dataModel";
 import {
 	action,
 	internalAction,
@@ -87,15 +89,24 @@ export const pull = query({
 	},
 	returns: v.bytes(),
 	handler: async (ctx, args) => {
-		// Pull must not truncate to a fixed batch size; subscribers need every
-		// outstanding update since their last state to avoid CRDT divergence.
-		const updates = await ctx.db
-			.query("yjsUpdates")
-			.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-			.collect();
-		const merged = Y.mergeUpdates(
-			reconstructLogicalUpdates(updates).map((update) => new Uint8Array(update)),
-		);
+		// Must match init/getDocData: snapshot compaction can delete all `yjsUpdates` rows
+		// while moving state into `yjsSnapshots`; pull-only-updates would return a no-op
+		// and leave clients permanently stale relative to the CRDT.
+		const [snapshots, updates] = await Promise.all([
+			ctx.db
+				.query("yjsSnapshots")
+				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
+				.collect(),
+			ctx.db
+				.query("yjsUpdates")
+				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
+				.collect(),
+		]);
+		const snapshotBuffers = snapshots.map((s) => new Uint8Array(s.data));
+		const merged = Y.mergeUpdates([
+			...snapshotBuffers,
+			...reconstructLogicalUpdates(updates).map((update) => new Uint8Array(update)),
+		]);
 		return asArrayBuffer(merged);
 	},
 });
@@ -109,17 +120,11 @@ export const _snapshotUpdates = internalAction({
 		if (!latestUpdate) {
 			return null;
 		}
-		const fileId = await ctx.storage.store(new Blob([asArrayBuffer(mergedUpdate)]));
-		try {
-			await ctx.runMutation(internal.yjs._createSnapshot, {
-				docId: args.docId,
-				timestamp: latestUpdate._creationTime,
-				fileId,
-			});
-		} catch (e) {
-			await ctx.storage.delete(fileId);
-			throw e;
-		}
+		await ctx.runMutation(internal.yjs._createSnapshot, {
+			docId: args.docId,
+			timestamp: latestUpdate._creationTime,
+			data: asArrayBuffer(mergedUpdate),
+		});
 		return null;
 	},
 });
@@ -128,7 +133,7 @@ export const _createSnapshot = internalMutation({
 	args: {
 		docId: v.string(),
 		timestamp: v.number(),
-		fileId: v.id("_storage"),
+		data: v.bytes(),
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
@@ -147,24 +152,20 @@ export const _createSnapshot = internalMutation({
 		const primarySnapshot = existingSnapshots[0] ?? null;
 		if (primarySnapshot) {
 			await ctx.db.patch(primarySnapshot._id, {
-				fileId: args.fileId,
+				data: args.data,
 			});
 		} else {
 			await ctx.db.insert("yjsSnapshots", {
 				docId: args.docId,
-				fileId: args.fileId,
+				data: args.data,
 			});
 		}
 
 		await Promise.all(
 			updatesToDelete.map((u) => ctx.db.delete(u._id)),
 		);
-		if (primarySnapshot) {
-			await ctx.storage.delete(primarySnapshot.fileId);
-		}
 		for (const duplicate of existingSnapshots.slice(1)) {
 			await ctx.db.delete(duplicate._id);
-			await ctx.storage.delete(duplicate.fileId);
 		}
 		return null;
 	},
@@ -198,7 +199,6 @@ export const _removeDoc = internalMutation({
 		}
 		for (const snapshot of snapshots) {
 			await ctx.db.delete(snapshot._id);
-			await ctx.storage.delete(snapshot.fileId);
 		}
 		return null;
 	},
@@ -240,7 +240,6 @@ export const _removeDocsByPathSuffix = internalMutation({
 			}
 			for (const snapshot of docSnapshots) {
 				await ctx.db.delete(snapshot._id);
-				await ctx.storage.delete(snapshot.fileId);
 			}
 		}
 		return null;
@@ -265,20 +264,15 @@ export const _getData = internalQuery({
 });
 
 type DocData = { mergedUpdate: Uint8Array; updates: Array<{ _creationTime: number; update: ArrayBuffer }> };
+
 async function getDocData(
-	ctx: { runQuery: (...args: any[]) => Promise<{ snapshots: Array<{ fileId: any }>; updates: Array<{ _creationTime: number; update: ArrayBuffer }> }>; storage: { get: (fileId: any) => Promise<Blob | null> } },
+	ctx: Pick<GenericActionCtx<DataModel>, "runQuery">,
 	docId: string,
 ): Promise<DocData> {
 	const { snapshots, updates } = await ctx.runQuery(internal.yjs._getData, {
 		docId,
 	});
-	const snapshotBuffers = await Promise.all(
-		snapshots.map(async (s) => {
-			const file = await ctx.storage.get(s.fileId);
-			if (!file) return new Uint8Array();
-			return new Uint8Array(await file.arrayBuffer());
-		}),
-	);
+	const snapshotBuffers = snapshots.map((s) => new Uint8Array(s.data));
 	const logicalUpdates = reconstructLogicalUpdates(updates);
 	const mergedUpdate = Y.mergeUpdates([
 		...snapshotBuffers,

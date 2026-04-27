@@ -1,6 +1,10 @@
 import esbuild from "esbuild";
+import path from "node:path";
 import process from "process";
-import { builtinModules } from 'node:module';
+import { fileURLToPath } from "node:url";
+import { builtinModules } from "node:module";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const banner =
 `/*
@@ -17,6 +21,12 @@ const context = await esbuild.context({
 	},
 	entryPoints: ["src/main.ts"],
 	bundle: true,
+	alias: {
+		"y-internal-y-sync": path.join(
+			__dirname,
+			"node_modules/y-codemirror.next/src/y-sync.js",
+		),
+	},
 	external: [
 		"obsidian",
 		"electron",
