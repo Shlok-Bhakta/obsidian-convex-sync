@@ -69,19 +69,19 @@ http.route({
 				headers: noStoreHeaders,
 			});
 		}
-		const blob = await ctx.storage.get(resolved.storageId);
-		if (!blob) {
+		const directUrl = await ctx.storage.getUrl(resolved.storageId);
+		if (!directUrl) {
 			return new Response("Archive not found", {
 				status: 404,
 				headers: noStoreHeaders,
 			});
 		}
-		return new Response(blob.stream(), {
-			status: 200,
+		// Large files: stream through Convex HTTP actions is capped (~20MB); redirect to signed storage URL.
+		return new Response(null, {
+			status: 307,
 			headers: {
 				...noStoreHeaders,
-				"Content-Type": "application/zip",
-				"Content-Disposition": `attachment; filename="${resolved.archiveName}"`,
+				Location: directUrl,
 			},
 		});
 	}),

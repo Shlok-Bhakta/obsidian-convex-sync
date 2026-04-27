@@ -1,29 +1,9 @@
 import { ConvexError, v } from "convex/values";
-import { zipSync } from "fflate";
-import * as Y from "yjs";
-import { api, internal } from "./_generated/api";
-import {
-	internalAction,
-	internalMutation,
-	internalQuery,
-	mutation,
-	query,
-} from "./_generated/server";
+import { internal } from "./_generated/api";
+import { internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { requirePluginSecret } from "./security";
 
 const TEN_MINUTES_MS = 10 * 60_000;
-
-function toHex(buffer: ArrayBuffer): string {
-	const bytes = new Uint8Array(buffer);
-	return Array.from(bytes)
-		.map((byte) => byte.toString(16).padStart(2, "0"))
-		.join("");
-}
-
-async function sha256Bytes(bytes: ArrayBuffer): Promise<string> {
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return toHex(digest);
-}
 
 type BootstrapRow = {
 	_id: string;
@@ -87,7 +67,7 @@ export const startBuild = mutation({
 			createdByClientId: args.clientId,
 		});
 
-		await ctx.scheduler.runAfter(0, internal.bootstrap.buildArchive, {
+		await ctx.scheduler.runAfter(0, internal.bootstrapArchive.buildArchive, {
 			bootstrapId: rowId,
 			convexSecret: args.convexSecret,
 			vaultName: args.vaultName,
@@ -148,6 +128,19 @@ export const cancelBootstrap = mutation({
 			expiresAtMs: Date.now(),
 		});
 		return { ok: true as const };
+	},
+});
+
+/** Allocates a one-shot upload URL for the bootstrap ZIP (used by the Node archive action). */
+export const issueZipUploadUrl = internalMutation({
+	args: { bootstrapId: v.id("vaultBootstraps") },
+	handler: async (ctx, args) => {
+		const row = await ctx.db.get(args.bootstrapId);
+		if (!row || row.status !== "building") {
+			throw new ConvexError("Bootstrap is not in a building state.");
+		}
+		const uploadUrl = await ctx.storage.generateUploadUrl();
+		return { uploadUrl };
 	},
 });
 
@@ -266,113 +259,6 @@ export const resolveDownloadByToken = internalQuery({
 	},
 });
 
-export const buildArchive = internalAction({
-	args: {
-		bootstrapId: v.id("vaultBootstraps"),
-		convexSecret: v.string(),
-		vaultName: v.string(),
-	},
-	handler: async (ctx, args) => {
-		try {
-			const docsWithPendingUpdates = await ctx.runQuery(
-				internal.yjsSync._listDocIdsWithPendingUpdates,
-				{},
-			);
-			for (const docId of docsWithPendingUpdates) {
-				await ctx.runAction(internal.yjsSync._snapshotUpdates, { docId });
-			}
-
-			const snapshot = await ctx.runQuery(internal.bootstrap._readSnapshot, {
-				convexSecret: args.convexSecret,
-			});
-			const archiveEntries: Record<string, Uint8Array> = {};
-			let filesProcessed = 0;
-			let bytesProcessed = 0;
-			const chunkInterval = 8;
-			const docIdPrefix = `${args.vaultName}::`;
-
-			for (const row of snapshot.files) {
-				try {
-					if (row.isText) {
-						const doc = new Y.Doc();
-						try {
-							const initial = await ctx.runAction(api.yjsSync.init, {
-								docId: `${docIdPrefix}${row.path}`,
-								// Valid minimal state vector (same as empty Y.Doc), not raw empty bytes.
-								stateVector: toArrayBuffer(Y.encodeStateVector(doc)),
-							});
-							if (
-								initial &&
-								typeof initial === "object" &&
-								"update" in initial &&
-								(initial as { update?: ArrayBuffer | Uint8Array }).update
-							) {
-								const raw = (initial as { update: ArrayBuffer | Uint8Array }).update;
-								Y.applyUpdate(
-									doc,
-									raw instanceof Uint8Array ? raw : new Uint8Array(raw),
-								);
-							}
-							const text = doc.getText("content").toString();
-							archiveEntries[row.path] = new TextEncoder().encode(text);
-						} finally {
-							doc.destroy();
-						}
-					} else {
-						if (!row.storageId) {
-							continue;
-						}
-						const blob = await ctx.storage.get(row.storageId);
-						if (!blob) {
-							continue;
-						}
-						const bytes = new Uint8Array(await blob.arrayBuffer());
-						archiveEntries[row.path] = bytes;
-					}
-				} catch (err) {
-					console.warn(`[bootstrap] skipping ${row.path}:`, err);
-				}
-				filesProcessed += 1;
-				bytesProcessed += row.sizeBytes;
-				if (filesProcessed % chunkInterval === 0) {
-					await ctx.runMutation(internal.bootstrap.updateProgress, {
-						bootstrapId: args.bootstrapId,
-						phase: `Collecting vault files (${filesProcessed}/${snapshot.files.length})`,
-						filesProcessed,
-						bytesProcessed,
-					});
-				}
-			}
-
-			await ctx.runMutation(internal.bootstrap.updateProgress, {
-				bootstrapId: args.bootstrapId,
-				phase: "Compressing archive",
-				filesProcessed,
-				bytesProcessed,
-			});
-			const zipped = zipSync(archiveEntries, { level: 6 });
-			const zipBytes = zipped.buffer.slice(
-				zipped.byteOffset,
-				zipped.byteOffset + zipped.byteLength,
-			) as ArrayBuffer;
-			const contentHash = await sha256Bytes(zipBytes);
-			const storageId = await ctx.storage.store(new Blob([zipBytes], { type: "application/zip" }));
-			await ctx.runMutation(internal.bootstrap.finalizeArchive, {
-				bootstrapId: args.bootstrapId,
-				storageId,
-				contentHash,
-				sizeBytes: zipped.byteLength,
-			});
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			await ctx.runMutation(internal.bootstrap.failBuild, {
-				bootstrapId: args.bootstrapId,
-				message,
-			});
-		}
-	},
-});
-
 export const _readSnapshot = internalQuery({
 	args: { convexSecret: v.string() },
 	handler: async (ctx, args) => {
@@ -388,10 +274,3 @@ export const _readSnapshot = internalQuery({
 		};
 	},
 });
-
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-	return bytes.buffer.slice(
-		bytes.byteOffset,
-		bytes.byteOffset + bytes.byteLength,
-	) as ArrayBuffer;
-}
