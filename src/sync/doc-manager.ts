@@ -159,6 +159,16 @@ export class DocManager {
 		if (!this.current) return;
 		const { doc, awareness, provider, awarenessSync, awarenessSanitizer } = this.current;
 		if (this.currentPath) {
+			const content = doc.getText("content").toString();
+			const hash = await sha256Utf8(content);
+			await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
+				convexSecret: this.convexSecret,
+				path: normalizePath(this.currentPath),
+				contentHash: hash,
+				sizeBytes: new TextEncoder().encode(content).length,
+				updatedAtMs: Date.now(),
+				clientId: this.clientId,
+			});
 			await YjsLocalCache.save(this.pathToDocId(this.currentPath), doc);
 		}
 		if (awarenessSync) {

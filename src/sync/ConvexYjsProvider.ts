@@ -11,17 +11,14 @@ export class ConvexYjsProvider {
 		if (origin === this.remoteOrigin || this.destroyed) {
 			return;
 		}
-		void this.client
-			.mutation(this.convexApi.push as FunctionReference<"mutation">, {
-				docId: this.docId,
-				update: toArrayBuffer(update),
-			})
-			.catch((error: unknown) => {
-				console.error("Convex Yjs push failed", error);
-			});
+		this.enqueuePush(update);
 	};
 
 	private unsubscribePull: (() => void) | null = null;
+	private retryTimer: ReturnType<typeof setTimeout> | null = null;
+	private pendingUpdate: Uint8Array | null = null;
+	private pushInFlight = false;
+	private retryDelayMs = 500;
 	private destroyed = false;
 
 	constructor(
@@ -49,6 +46,9 @@ export class ConvexYjsProvider {
 		Y.applyUpdate(this.doc, toUint8Array(initial.update), this.remoteOrigin);
 
 		this.doc.on("update", this.onDocUpdate);
+		// Proactively push the current doc state so locally cached edits are not stuck
+		// waiting for a brand-new keystroke after reconnect/reopen.
+		this.enqueuePush(Y.encodeStateAsUpdate(this.doc));
 		this.unsubscribePull = this.client.onUpdate(
 			this.convexApi.pull as FunctionReference<"query">,
 			{ docId: this.docId },
@@ -67,18 +67,63 @@ export class ConvexYjsProvider {
 		if (this.destroyed) return;
 		const update = Y.encodeStateAsUpdate(this.doc);
 		if (update.byteLength === 0) return;
-		await this.client.mutation(this.convexApi.push as FunctionReference<"mutation">, {
-			docId: this.docId,
-			update: toArrayBuffer(update),
-		});
+		this.enqueuePush(update);
+		await this.flushPushQueue();
 	}
 
 	destroy(): void {
 		if (this.destroyed) return;
 		this.destroyed = true;
+		if (this.retryTimer) {
+			clearTimeout(this.retryTimer);
+			this.retryTimer = null;
+		}
 		this.doc.off("update", this.onDocUpdate);
 		this.unsubscribePull?.();
 		this.unsubscribePull = null;
+	}
+
+	private enqueuePush(update: Uint8Array): void {
+		if (update.byteLength === 0 || this.destroyed) return;
+		this.pendingUpdate = this.pendingUpdate
+			? Y.mergeUpdates([this.pendingUpdate, update])
+			: update;
+		void this.flushPushQueue();
+	}
+
+	private async flushPushQueue(): Promise<void> {
+		if (this.destroyed || this.pushInFlight || !this.pendingUpdate) return;
+		const nextUpdate = this.pendingUpdate;
+		this.pendingUpdate = null;
+		this.pushInFlight = true;
+		try {
+			await this.client.mutation(this.convexApi.push as FunctionReference<"mutation">, {
+				docId: this.docId,
+				update: toArrayBuffer(nextUpdate),
+			});
+			this.retryDelayMs = 500;
+		} catch (error: unknown) {
+			console.error("Convex Yjs push failed", error);
+			this.pendingUpdate = this.pendingUpdate
+				? Y.mergeUpdates([nextUpdate, this.pendingUpdate])
+				: nextUpdate;
+			this.scheduleRetry();
+		} finally {
+			this.pushInFlight = false;
+		}
+		if (this.pendingUpdate && !this.retryTimer) {
+			void this.flushPushQueue();
+		}
+	}
+
+	private scheduleRetry(): void {
+		if (this.retryTimer || this.destroyed) return;
+		const delay = this.retryDelayMs;
+		this.retryTimer = setTimeout(() => {
+			this.retryTimer = null;
+			void this.flushPushQueue();
+		}, delay);
+		this.retryDelayMs = Math.min(this.retryDelayMs * 2, 10_000);
 	}
 }
 
