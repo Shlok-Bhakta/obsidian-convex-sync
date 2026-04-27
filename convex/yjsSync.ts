@@ -78,7 +78,10 @@ export const push = mutation({
 		if (hasInserts || hasDeletes) {
 			const chunks = splitUpdateForStorage(args.update);
 			if (chunks.length === 1) {
-				await ctx.db.insert("yjsUpdates", args);
+				await ctx.db.insert("yjsUpdates", {
+					docId: args.docId,
+					update: args.update,
+				});
 			} else {
 				const chunkGroupId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 				for (const [chunkIndex, chunk] of chunks.entries()) {

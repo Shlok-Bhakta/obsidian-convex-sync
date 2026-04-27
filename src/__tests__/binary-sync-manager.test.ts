@@ -372,7 +372,15 @@ describe("BinarySyncManager", () => {
 		expect(pulled).toEqual(["gone.md"]);
 
 		await onRemoteMetadata.call(manager, {
-			files: [{ path: "gone.md", contentHash: "h1", updatedAtMs: 1, isText: true }],
+			files: [
+				{
+					path: "gone.md",
+					contentHash: "h1",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: true,
+				},
+			],
 			folders: [],
 		});
 		expect(pulled).toEqual(["gone.md", "gone.md"]);
