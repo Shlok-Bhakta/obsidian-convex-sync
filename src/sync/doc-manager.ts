@@ -19,6 +19,8 @@ type DocEntry = {
 	awarenessSync: ConvexAwarenessSync | null;
 	/** Guards against stale remote awareness cursor offsets crashing CodeMirror. */
 	awarenessSanitizer: ((event: { added: number[]; updated: number[]; removed: number[] }) => void) | null;
+	/** Clears the debounced persist timer so a late fire cannot resurrect a deleted/renamed path on Convex. */
+	cancelPersistDebounced: () => void;
 };
 
 export class DocManager {
@@ -82,22 +84,27 @@ export class DocManager {
 		});
 		awareness.setLocalStateField("openFilePath", path);
 
-		const persistDocAndManifest = debounce(async () => {
-			await YjsLocalCache.save(docId, doc);
-			const content = doc.getText("content").toString();
-			const hash = await sha256Utf8(content);
-			await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
-				convexSecret: this.convexSecret,
-				path: normalizePath(path),
-				contentHash: hash,
-				sizeBytes: new TextEncoder().encode(content).length,
-				updatedAtMs: Date.now(),
-				clientId: this.clientId,
-			});
-		}, 500);
+		const normPath = normalizePath(path);
+		const { schedule: schedulePersist, cancel: cancelPersistDebounced } = debounceWithCancel(
+			async () => {
+				if (this.destroyed || this.currentPath !== normPath) return;
+				await YjsLocalCache.save(docId, doc);
+				const content = doc.getText("content").toString();
+				const hash = await sha256Utf8(content);
+				await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
+					convexSecret: this.convexSecret,
+					path: normPath,
+					contentHash: hash,
+					sizeBytes: new TextEncoder().encode(content).length,
+					updatedAtMs: Date.now(),
+					clientId: this.clientId,
+				});
+			},
+			500,
+		);
 
 		doc.on("update", () => {
-			persistDocAndManifest();
+			schedulePersist();
 		});
 
 		const ytext = doc.getText("content");
@@ -154,6 +161,7 @@ export class DocManager {
 			provider,
 			awarenessSync: null,
 			awarenessSanitizer,
+			cancelPersistDebounced,
 		};
 		this.current = entry;
 		this.currentPath = path;
@@ -207,7 +215,9 @@ export class DocManager {
 
 	async closeCurrentDoc(): Promise<void> {
 		if (!this.current) return;
-		const { doc, awareness, provider, awarenessSync, awarenessSanitizer } = this.current;
+		const { doc, awareness, provider, awarenessSync, awarenessSanitizer, cancelPersistDebounced } =
+			this.current;
+		cancelPersistDebounced();
 		if (this.currentPath) {
 			await this.registerTextManifest(this.currentPath, doc);
 			await YjsLocalCache.save(this.pathToDocId(this.currentPath), doc);
@@ -492,13 +502,23 @@ function hashColor(id: string): string {
 	return `hsl(${Math.abs(hash) % 360}, 70%, 45%)`;
 }
 
-function debounce(fn: () => Promise<void>, ms: number): () => void {
-	let timer: ReturnType<typeof setTimeout>;
-	return () => {
-		clearTimeout(timer);
-		timer = setTimeout(() => {
-			void fn();
-		}, ms);
+function debounceWithCancel(
+	fn: () => Promise<void>,
+	ms: number,
+): { schedule: () => void; cancel: () => void } {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	return {
+		schedule: () => {
+			if (timer !== undefined) clearTimeout(timer);
+			timer = setTimeout(() => {
+				timer = undefined;
+				void fn();
+			}, ms);
+		},
+		cancel: () => {
+			if (timer !== undefined) clearTimeout(timer);
+			timer = undefined;
+		},
 	};
 }
 

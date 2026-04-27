@@ -50,6 +50,7 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 		deps.vault.on("rename", (abstractFile, oldPath) => {
 			if (abstractFile instanceof TFile) {
 				if (abstractFile.extension === "md") {
+					deps.getBinarySync()?.noteLocalDeletePending(normalizePath(oldPath));
 					void (async () => {
 						const docManager = deps.getDocManager();
 						await docManager?.onFileRenamed(oldPath, abstractFile.path);
@@ -72,6 +73,7 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 		deps.vault.on("delete", (abstractFile) => {
 			if (abstractFile instanceof TFile) {
 				if (abstractFile.extension === "md") {
+					deps.getBinarySync()?.noteLocalDeletePending(normalizePath(abstractFile.path));
 					void deps.getDocManager()?.onFileDeleted(abstractFile.path);
 				} else {
 					void deps.getBinarySync()?.onLocalFileDeleted(abstractFile.path);

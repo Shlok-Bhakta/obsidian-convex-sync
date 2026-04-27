@@ -218,4 +218,69 @@ describe("BinarySyncManager", () => {
 		});
 		expect(noticeMock).toHaveBeenCalledTimes(1);
 	});
+
+	it("does not repull text paths while local delete is pending remote ack", async () => {
+		const pulled: string[] = [];
+		const queryMock = vi.fn().mockResolvedValue({
+			files: [
+				{ path: "gone.md", contentHash: "h1", updatedAtMs: 1, isText: true },
+			],
+			folders: [],
+		});
+		const manager = new BinarySyncManager(
+			{
+				vault: {
+					readBinary: readBinaryMock,
+					getAbstractFileByPath: vi.fn().mockReturnValue(undefined),
+					adapter: {
+						exists: vi.fn(),
+						remove: vi.fn().mockResolvedValue(undefined),
+					},
+					createFolder: vi.fn(),
+					delete: vi.fn(),
+				},
+			} as never,
+			{ query: queryMock, mutation: mutationMock } as never,
+			{ onUpdate: vi.fn() } as never,
+			"secret",
+			"client",
+			async (paths: string[]) => {
+				pulled.push(...paths);
+			},
+		);
+
+		const onRemoteMetadata = (manager as unknown as {
+			onRemoteMetadata: (remote: {
+				files: Array<{
+					path: string;
+					contentHash: string;
+					updatedAtMs: number;
+					isText: boolean;
+				}>;
+				folders: Array<{ path: string; updatedAtMs: number; isExplicitlyEmpty: boolean }>;
+			}) => Promise<void>;
+		}).onRemoteMetadata;
+
+		await onRemoteMetadata.call(manager, {
+			files: [{ path: "gone.md", contentHash: "h1", updatedAtMs: 1, isText: true }],
+			folders: [],
+		});
+		expect(pulled).toEqual(["gone.md"]);
+
+		manager.noteLocalDeletePending("gone.md");
+		await onRemoteMetadata.call(manager, {
+			files: [{ path: "gone.md", contentHash: "h1", updatedAtMs: 1, isText: true }],
+			folders: [],
+		});
+		expect(pulled).toEqual(["gone.md"]);
+
+		await onRemoteMetadata.call(manager, { files: [], folders: [] });
+		expect(pulled).toEqual(["gone.md"]);
+
+		await onRemoteMetadata.call(manager, {
+			files: [{ path: "gone.md", contentHash: "h1", updatedAtMs: 1, isText: true }],
+			folders: [],
+		});
+		expect(pulled).toEqual(["gone.md", "gone.md"]);
+	});
 });
