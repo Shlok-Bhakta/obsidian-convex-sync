@@ -14,16 +14,18 @@ export class ConvexYjsProvider {
 		this.enqueuePush(update);
 	};
 
-	private unsubscribePull: (() => void) | null = null;
 	private retryTimer: ReturnType<typeof setTimeout> | null = null;
 	private flushTimer: ReturnType<typeof setTimeout> | null = null;
+	private pullTimer: ReturnType<typeof setTimeout> | null = null;
 	private pendingUpdate: Uint8Array | null = null;
 	private pushInFlight = false;
+	private pullInFlight = false;
 	private retryDelayMs = 500;
 	private destroyed = false;
 	private syncStarted = false;
 	private serverStateVector: Uint8Array | null = null;
 	private static readonly PUSH_DEBOUNCE_MS = 200;
+	private static readonly PULL_INTERVAL_MS = 2_000;
 
 	/** Optional hook when applying remote updates fails (e.g. corrupt payload). */
 	onDivergence: (() => void) | null = null;
@@ -63,29 +65,7 @@ export class ConvexYjsProvider {
 			? Y.encodeStateAsUpdate(this.doc, this.serverStateVector)
 			: Y.encodeStateAsUpdate(this.doc);
 		this.enqueuePush(localDelta);
-		this.unsubscribePull = this.client.onUpdate(
-			this.convexApi.pull as FunctionReference<"query">,
-			{ docId: this.docId },
-			(serverUpdate) => {
-				if (this.destroyed) return;
-				try {
-					const mergedRemote = toUint8Array(serverUpdate);
-					// Apply only the missing prefix of the server merge relative to the local
-					// doc (covers init vs first-pull races and avoids redundant full-state replays).
-					const delta = Y.diffUpdate(mergedRemote, Y.encodeStateVector(this.doc));
-					if (delta.byteLength > 0) {
-						Y.applyUpdate(this.doc, delta, this.remoteOrigin);
-					}
-					this.serverStateVector = Y.encodeStateVectorFromUpdate(mergedRemote);
-				} catch (err: unknown) {
-					console.error("[ConvexYjsProvider] pull applyUpdate failed — re-sync suggested", err);
-					this.onDivergence?.();
-				}
-			},
-			(error: Error) => {
-				console.error("Convex Yjs pull subscription failed", error);
-			},
-		);
+		this.schedulePull(0);
 	}
 
 	/** Push the entire CRDT state (e.g. after rename when docId changes server-side). */
@@ -110,9 +90,11 @@ export class ConvexYjsProvider {
 			clearTimeout(this.flushTimer);
 			this.flushTimer = null;
 		}
+		if (this.pullTimer) {
+			clearTimeout(this.pullTimer);
+			this.pullTimer = null;
+		}
 		this.doc.off("update", this.onDocUpdate);
-		this.unsubscribePull?.();
-		this.unsubscribePull = null;
 	}
 
 	private enqueuePush(update: Uint8Array): void {
@@ -163,6 +145,40 @@ export class ConvexYjsProvider {
 			void this.flushPushQueue();
 		}, delay);
 		this.retryDelayMs = Math.min(this.retryDelayMs * 2, 10_000);
+	}
+
+	private schedulePull(delayMs: number): void {
+		if (this.pullTimer || this.destroyed) return;
+		this.pullTimer = setTimeout(() => {
+			this.pullTimer = null;
+			void this.pullServerState();
+		}, delayMs);
+	}
+
+	private async pullServerState(): Promise<void> {
+		if (this.destroyed || this.pullInFlight) return;
+		this.pullInFlight = true;
+		try {
+			const serverUpdate = await this.client.action(
+				this.convexApi.pull as FunctionReference<"action">,
+				{ docId: this.docId },
+			);
+			if (this.destroyed) return;
+			const mergedRemote = toUint8Array(serverUpdate);
+			// Apply only the missing prefix of the server merge relative to the local
+			// doc to avoid replaying full-state updates on every poll.
+			const delta = Y.diffUpdate(mergedRemote, Y.encodeStateVector(this.doc));
+			if (delta.byteLength > 0) {
+				Y.applyUpdate(this.doc, delta, this.remoteOrigin);
+			}
+			this.serverStateVector = Y.encodeStateVectorFromUpdate(mergedRemote);
+		} catch (err: unknown) {
+			console.error("[ConvexYjsProvider] pull action failed — re-sync suggested", err);
+			this.onDivergence?.();
+		} finally {
+			this.pullInFlight = false;
+			this.schedulePull(ConvexYjsProvider.PULL_INTERVAL_MS);
+		}
 	}
 }
 

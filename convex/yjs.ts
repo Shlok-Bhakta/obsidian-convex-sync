@@ -9,7 +9,6 @@ import {
 	internalMutation,
 	internalQuery,
 	mutation,
-	query,
 } from "./_generated/server";
 import { paginationOptsValidator } from "convex/server";
 
@@ -18,7 +17,9 @@ const UPDATES_TRIM_THRESHOLD = 25;
 const MAX_UPDATE_CHUNK_BYTES = 256 * 1024;
 const MAX_SNAPSHOT_CHUNK_BYTES = 256 * 1024;
 const SNAPSHOT_PRUNE_BATCH_SIZE = 16;
+const DOC_REMOVAL_BATCH_SIZE = 64;
 const GET_DOC_PAGE_SIZE = 32;
+const GET_DOC_PAGE_MAX_BYTES = 8 * 1024 * 1024;
 
 export const init = action({
 	args: {
@@ -95,33 +96,14 @@ export const push = mutation({
 	},
 });
 
-export const pull = query({
+export const pull = action({
 	args: {
 		docId: v.string(),
 	},
 	returns: v.bytes(),
 	handler: async (ctx, args) => {
-		// Must match init/getDocData: snapshot compaction can delete all `yjsUpdates` rows
-		// while moving state into `yjsSnapshots`; pull-only-updates would return a no-op
-		// and leave clients permanently stale relative to the CRDT.
-		const [snapshots, updates] = await Promise.all([
-			ctx.db
-				.query("yjsSnapshots")
-				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-				.collect(),
-			ctx.db
-				.query("yjsUpdates")
-				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-				.collect(),
-		]);
-		const snapshotBuffers = reconstructLogicalSnapshots(snapshots).map(
-			(snapshot) => new Uint8Array(snapshot),
-		);
-		const merged = Y.mergeUpdates([
-			...snapshotBuffers,
-			...reconstructLogicalUpdates(updates).map((update) => new Uint8Array(update)),
-		]);
-		return asArrayBuffer(merged);
+		const { mergedUpdate } = await getDocData(ctx, args.docId);
+		return asArrayBuffer(mergedUpdate);
 	},
 });
 
@@ -134,52 +116,32 @@ export const _snapshotUpdates = internalAction({
 		if (!latestUpdate) {
 			return null;
 		}
-		await ctx.runMutation(internal.yjs._createSnapshot, {
-			docId: args.docId,
-			timestamp: latestUpdate._creationTime,
-			data: asArrayBuffer(mergedUpdate),
-		});
-		return null;
-	},
-});
+		const timestamp = latestUpdate._creationTime;
 
-export const _createSnapshot = internalMutation({
-	args: {
-		docId: v.string(),
-		timestamp: v.number(),
-		data: v.bytes(),
-	},
-	returns: v.null(),
-	handler: async (ctx, args) => {
-		for (;;) {
-			const snapshotBatch = await ctx.db
-				.query("yjsSnapshots")
-				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-				.take(SNAPSHOT_PRUNE_BATCH_SIZE);
-			if (snapshotBatch.length === 0) {
-				break;
-			}
-			for (const snapshot of snapshotBatch) {
-				await ctx.db.delete(snapshot._id);
-			}
-			if (snapshotBatch.length < SNAPSHOT_PRUNE_BATCH_SIZE) {
-				break;
-			}
+		let moreSnapshots = true;
+		while (moreSnapshots) {
+			moreSnapshots = await ctx.runMutation(internal.yjs._pruneOldSnapshotsOnce, {
+				docId: args.docId,
+			});
 		}
-		const snapshotChunks = splitBytesForStorage(args.data, MAX_SNAPSHOT_CHUNK_BYTES);
+
+		const snapshotChunks = splitBytesForStorage(
+			asArrayBuffer(mergedUpdate),
+			MAX_SNAPSHOT_CHUNK_BYTES,
+		);
 		if (snapshotChunks.length === 1) {
 			const onlyChunk = snapshotChunks[0];
 			if (!onlyChunk) {
 				return null;
 			}
-			await ctx.db.insert("yjsSnapshots", {
+			await ctx.runMutation(internal.yjs._insertSnapshotChunk, {
 				docId: args.docId,
 				data: onlyChunk,
 			});
 		} else {
 			const chunkGroupId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 			for (const [chunkIndex, chunk] of snapshotChunks.entries()) {
-				await ctx.db.insert("yjsSnapshots", {
+				await ctx.runMutation(internal.yjs._insertSnapshotChunk, {
 					docId: args.docId,
 					data: chunk,
 					chunkGroupId,
@@ -189,23 +151,79 @@ export const _createSnapshot = internalMutation({
 			}
 		}
 
-		for (;;) {
-			const updateBatch = await ctx.db
-				.query("yjsUpdates")
-				.withIndex("by_doc_id", (q) =>
-					q.eq("docId", args.docId).lte("_creationTime", args.timestamp),
-				)
-				.take(SNAPSHOT_PRUNE_BATCH_SIZE);
-			if (updateBatch.length === 0) {
-				break;
-			}
-			for (const update of updateBatch) {
-				await ctx.db.delete(update._id);
-			}
-			if (updateBatch.length < SNAPSHOT_PRUNE_BATCH_SIZE) {
-				break;
-			}
+		let moreUpdates = true;
+		while (moreUpdates) {
+			moreUpdates = await ctx.runMutation(internal.yjs._pruneOldUpdatesOnce, {
+				docId: args.docId,
+				timestamp,
+			});
 		}
+
+		await ctx.runMutation(internal.yjs._markDocClean, { docId: args.docId });
+		return null;
+	},
+});
+
+export const _pruneOldSnapshotsOnce = internalMutation({
+	args: { docId: v.string() },
+	returns: v.boolean(),
+	handler: async (ctx, args) => {
+		const batch = await ctx.db
+			.query("yjsSnapshots")
+			.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
+			.take(SNAPSHOT_PRUNE_BATCH_SIZE);
+		for (const row of batch) {
+			await ctx.db.delete(row._id);
+		}
+		return batch.length === SNAPSHOT_PRUNE_BATCH_SIZE;
+	},
+});
+
+export const _pruneOldUpdatesOnce = internalMutation({
+	args: {
+		docId: v.string(),
+		timestamp: v.number(),
+	},
+	returns: v.boolean(),
+	handler: async (ctx, args) => {
+		const batch = await ctx.db
+			.query("yjsUpdates")
+			.withIndex("by_doc_id", (q) =>
+				q.eq("docId", args.docId).lte("_creationTime", args.timestamp),
+			)
+			.take(SNAPSHOT_PRUNE_BATCH_SIZE);
+		for (const row of batch) {
+			await ctx.db.delete(row._id);
+		}
+		return batch.length === SNAPSHOT_PRUNE_BATCH_SIZE;
+	},
+});
+
+export const _insertSnapshotChunk = internalMutation({
+	args: {
+		docId: v.string(),
+		data: v.bytes(),
+		chunkGroupId: v.optional(v.string()),
+		chunkIndex: v.optional(v.number()),
+		chunkCount: v.optional(v.number()),
+	},
+	returns: v.null(),
+	handler: async (ctx, args) => {
+		await ctx.db.insert("yjsSnapshots", {
+			docId: args.docId,
+			data: args.data,
+			chunkGroupId: args.chunkGroupId,
+			chunkIndex: args.chunkIndex,
+			chunkCount: args.chunkCount,
+		});
+		return null;
+	},
+});
+
+export const _markDocClean = internalMutation({
+	args: { docId: v.string() },
+	returns: v.null(),
+	handler: async (ctx, args) => {
 		const dirtyDoc = await ctx.db
 			.query("yjsDirtyDocs")
 			.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
@@ -226,83 +244,82 @@ export const _listDocIdsWithPendingUpdates = internalQuery({
 	},
 });
 
-export const _removeDoc = internalMutation({
+export const _removeDoc = internalAction({
 	args: { docId: v.string() },
 	returns: v.null(),
 	handler: async (ctx, args) => {
-		const [updates, snapshots] = await Promise.all([
-			ctx.db
-				.query("yjsUpdates")
-				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-				.collect(),
-			ctx.db
-				.query("yjsSnapshots")
-				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-				.collect(),
-		]);
-		for (const row of updates) {
-			await ctx.db.delete(row._id);
-		}
-		for (const snapshot of snapshots) {
-			await ctx.db.delete(snapshot._id);
-		}
-		const dirtyDoc = await ctx.db
-			.query("yjsDirtyDocs")
-			.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-			.unique();
-		if (dirtyDoc) {
-			await ctx.db.delete(dirtyDoc._id);
+		await removeDocRows(ctx, args.docId);
+		return null;
+	},
+});
+
+export const _removeDocsByPathSuffix = internalAction({
+	args: { path: v.string() },
+	returns: v.null(),
+	handler: async (ctx, args) => {
+		const suffix = `::${args.path}`;
+		for (const source of ["updates", "snapshots"] as const) {
+			let cursor: string | null = null;
+			let isDone = false;
+			while (!isDone) {
+				const page = (await ctx.runQuery(internal.yjs._listDocIdsBySuffixPage, {
+					suffix,
+					source,
+					paginationOpts: {
+						cursor,
+						numItems: DOC_REMOVAL_BATCH_SIZE,
+						maximumBytesRead: GET_DOC_PAGE_MAX_BYTES,
+					},
+				})) as PaginatedRows<{ docId: string }>;
+				const docIds = new Set(page.page.map((row) => row.docId));
+				for (const docId of docIds) {
+					await removeDocRows(ctx, docId);
+				}
+				cursor = page.continueCursor;
+				isDone = page.isDone;
+			}
 		}
 		return null;
 	},
 });
 
-export const _removeDocsByPathSuffix = internalMutation({
-	args: { path: v.string() },
-	returns: v.null(),
+export const _deleteUpdateRowsOnce = internalMutation({
+	args: { docId: v.string(), timestamp: v.optional(v.number()) },
+	returns: v.boolean(),
 	handler: async (ctx, args) => {
-		const suffix = `::${args.path}`;
-		const [updates, snapshots] = await Promise.all([
-			ctx.db.query("yjsUpdates").collect(),
-			ctx.db.query("yjsSnapshots").collect(),
-		]);
-		const docIds = new Set<string>();
-		for (const row of updates) {
-			if (row.docId.endsWith(suffix)) {
-				docIds.add(row.docId);
-			}
+		const batch = await ctx.db
+			.query("yjsUpdates")
+			.withIndex("by_doc_id", (q) => {
+				const docQuery = q.eq("docId", args.docId);
+				return args.timestamp === undefined
+					? docQuery
+					: docQuery.lte("_creationTime", args.timestamp);
+			})
+			.take(SNAPSHOT_PRUNE_BATCH_SIZE);
+		for (const row of batch) {
+			await ctx.db.delete(row._id);
 		}
-		for (const row of snapshots) {
-			if (row.docId.endsWith(suffix)) {
-				docIds.add(row.docId);
-			}
-		}
-		for (const docId of docIds) {
-			const [docUpdates, docSnapshots] = await Promise.all([
-				ctx.db
-					.query("yjsUpdates")
-					.withIndex("by_doc_id", (q) => q.eq("docId", docId))
-					.collect(),
-				ctx.db
-					.query("yjsSnapshots")
-					.withIndex("by_doc_id", (q) => q.eq("docId", docId))
-					.collect(),
-			]);
-			for (const row of docUpdates) {
-				await ctx.db.delete(row._id);
-			}
-			for (const snapshot of docSnapshots) {
-				await ctx.db.delete(snapshot._id);
-			}
-			const dirtyDoc = await ctx.db
-				.query("yjsDirtyDocs")
-				.withIndex("by_doc_id", (q) => q.eq("docId", docId))
-				.unique();
-			if (dirtyDoc) {
-				await ctx.db.delete(dirtyDoc._id);
-			}
-		}
-		return null;
+		return batch.length === SNAPSHOT_PRUNE_BATCH_SIZE;
+	},
+});
+
+export const _listDocIdsBySuffixPage = internalQuery({
+	args: {
+		suffix: v.string(),
+		source: v.union(v.literal("updates"), v.literal("snapshots")),
+		paginationOpts: paginationOptsValidator,
+	},
+	handler: async (ctx, args) => {
+		const rows = await (args.source === "updates"
+			? ctx.db.query("yjsUpdates")
+			: ctx.db.query("yjsSnapshots")
+		).paginate(args.paginationOpts);
+		return {
+			...rows,
+			page: rows.page
+				.filter((row) => row.docId.endsWith(args.suffix))
+				.map((row) => ({ docId: row.docId })),
+		};
 	},
 });
 
@@ -347,7 +364,11 @@ async function getDocData(
 	while (!snapshotsDone) {
 		const page = (await ctx.runQuery(internal.yjs._getSnapshotPage, {
 			docId,
-			paginationOpts: { cursor: snapshotCursor, numItems: GET_DOC_PAGE_SIZE },
+			paginationOpts: {
+				cursor: snapshotCursor,
+				numItems: GET_DOC_PAGE_SIZE,
+				maximumBytesRead: GET_DOC_PAGE_MAX_BYTES,
+			},
 		})) as PaginatedRows<StoredYjsSnapshot>;
 		snapshots.push(...page.page);
 		snapshotCursor = page.continueCursor;
@@ -356,7 +377,11 @@ async function getDocData(
 	while (!updatesDone) {
 		const page = (await ctx.runQuery(internal.yjs._getUpdatePage, {
 			docId,
-			paginationOpts: { cursor: updateCursor, numItems: GET_DOC_PAGE_SIZE },
+			paginationOpts: {
+				cursor: updateCursor,
+				numItems: GET_DOC_PAGE_SIZE,
+				maximumBytesRead: GET_DOC_PAGE_MAX_BYTES,
+			},
 		})) as PaginatedRows<StoredYjsUpdate>;
 		updates.push(...page.page);
 		updateCursor = page.continueCursor;
@@ -372,6 +397,21 @@ async function getDocData(
 		...logicalUpdates.map((update) => new Uint8Array(update)),
 	]);
 	return { mergedUpdate, updates };
+}
+
+async function removeDocRows(
+	ctx: Pick<GenericActionCtx<DataModel>, "runMutation">,
+	docId: string,
+): Promise<void> {
+	let moreSnapshots = true;
+	while (moreSnapshots) {
+		moreSnapshots = await ctx.runMutation(internal.yjs._pruneOldSnapshotsOnce, { docId });
+	}
+	let moreUpdates = true;
+	while (moreUpdates) {
+		moreUpdates = await ctx.runMutation(internal.yjs._deleteUpdateRowsOnce, { docId });
+	}
+	await ctx.runMutation(internal.yjs._markDocClean, { docId });
 }
 
 type StoredYjsSnapshot = {
