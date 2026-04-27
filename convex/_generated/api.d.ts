@@ -20,8 +20,8 @@ import type * as http from "../http.js";
 import type * as nuke from "../nuke.js";
 import type * as pluginSecretMint from "../pluginSecretMint.js";
 import type * as security from "../security.js";
-import type * as yjs from "../yjs.js";
 import type * as yjsAwareness from "../yjsAwareness.js";
+import type * as yjsSync from "../yjsSync.js";
 
 import type {
   ApiFromModules,
@@ -42,8 +42,8 @@ declare const fullApi: ApiFromModules<{
   nuke: typeof nuke;
   pluginSecretMint: typeof pluginSecretMint;
   security: typeof security;
-  yjs: typeof yjs;
   yjsAwareness: typeof yjsAwareness;
+  yjsSync: typeof yjsSync;
 }>;
 
 /**

@@ -275,11 +275,11 @@ export const buildArchive = internalAction({
 	handler: async (ctx, args) => {
 		try {
 			const docsWithPendingUpdates = await ctx.runQuery(
-				internal.yjs._listDocIdsWithPendingUpdates,
+				internal.yjsSync._listDocIdsWithPendingUpdates,
 				{},
 			);
 			for (const docId of docsWithPendingUpdates) {
-				await ctx.runAction(internal.yjs._snapshotUpdates, { docId });
+				await ctx.runAction(internal.yjsSync._snapshotUpdates, { docId });
 			}
 
 			const snapshot = await ctx.runQuery(internal.bootstrap._readSnapshot, {
@@ -296,7 +296,7 @@ export const buildArchive = internalAction({
 					if (row.isText) {
 						const doc = new Y.Doc();
 						try {
-							const initial = await ctx.runAction(api.yjs.init, {
+							const initial = await ctx.runAction(api.yjsSync.init, {
 								docId: `${docIdPrefix}${row.path}`,
 								// Valid minimal state vector (same as empty Y.Doc), not raw empty bytes.
 								stateVector: toArrayBuffer(Y.encodeStateVector(doc)),

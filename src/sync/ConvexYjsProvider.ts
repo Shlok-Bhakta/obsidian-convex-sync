@@ -3,7 +3,7 @@ import type { ConvexClient } from "convex/browser";
 import type { api } from "../../convex/_generated/api";
 import * as Y from "yjs";
 
-type YjsApi = typeof api.yjs;
+type YjsApi = typeof api.yjsSync;
 type YjsInitAction = FunctionReference<
 	"action",
 	"public",

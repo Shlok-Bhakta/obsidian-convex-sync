@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 
 const refs = vi.hoisted(() => ({
 	internal: {
-		yjs: {
-			_listDocIdsWithPendingUpdates: "internal.yjs._listDocIdsWithPendingUpdates",
-			_snapshotUpdates: "internal.yjs._snapshotUpdates",
+		yjsSync: {
+			_listDocIdsWithPendingUpdates: "internal.yjsSync._listDocIdsWithPendingUpdates",
+			_snapshotUpdates: "internal.yjsSync._snapshotUpdates",
 		},
 		bootstrap: {
 			_readSnapshot: "internal.bootstrap._readSnapshot",
@@ -14,8 +14,8 @@ const refs = vi.hoisted(() => ({
 		},
 	},
 	api: {
-		yjs: {
-			init: "api.yjs.init",
+		yjsSync: {
+			init: "api.yjsSync.init",
 		},
 	},
 }));
@@ -57,7 +57,7 @@ describe("convex/bootstrap", () => {
 		const ctx = {
 			runQuery: vi.fn(async (ref: string) => {
 				calls.push(`query:${ref}`);
-				if (ref === refs.internal.yjs._listDocIdsWithPendingUpdates) {
+				if (ref === refs.internal.yjsSync._listDocIdsWithPendingUpdates) {
 					return ["vault::notes/test.md"];
 				}
 				if (ref === refs.internal.bootstrap._readSnapshot) {
@@ -69,7 +69,7 @@ describe("convex/bootstrap", () => {
 			}),
 			runAction: vi.fn(async (ref: string) => {
 				calls.push(`action:${ref}`);
-				if (ref === refs.api.yjs.init) {
+				if (ref === refs.api.yjsSync.init) {
 					return { update: new ArrayBuffer(0), serverStateVector: new ArrayBuffer(0) };
 				}
 				return null;
@@ -90,16 +90,16 @@ describe("convex/bootstrap", () => {
 			vaultName: "vault",
 		});
 
-		expect(calls.indexOf(`action:${refs.internal.yjs._snapshotUpdates}`)).toBeGreaterThan(-1);
+		expect(calls.indexOf(`action:${refs.internal.yjsSync._snapshotUpdates}`)).toBeGreaterThan(-1);
 		expect(calls.indexOf(`query:${refs.internal.bootstrap._readSnapshot}`)).toBeGreaterThan(
-			calls.indexOf(`action:${refs.internal.yjs._snapshotUpdates}`),
+			calls.indexOf(`action:${refs.internal.yjsSync._snapshotUpdates}`),
 		);
 	});
 
 	it("handles missing Yjs state without failing build", async () => {
 		const ctx = {
 			runQuery: vi.fn(async (ref: string) => {
-				if (ref === refs.internal.yjs._listDocIdsWithPendingUpdates) {
+				if (ref === refs.internal.yjsSync._listDocIdsWithPendingUpdates) {
 					return [];
 				}
 				if (ref === refs.internal.bootstrap._readSnapshot) {
@@ -110,7 +110,7 @@ describe("convex/bootstrap", () => {
 				return null;
 			}),
 			runAction: vi.fn(async (ref: string) => {
-				if (ref === refs.api.yjs.init) {
+				if (ref === refs.api.yjsSync.init) {
 					return { update: new ArrayBuffer(0), serverStateVector: new ArrayBuffer(0) };
 				}
 				return null;

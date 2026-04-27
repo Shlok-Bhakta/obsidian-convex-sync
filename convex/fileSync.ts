@@ -32,6 +32,9 @@ export const issueUploadUrl = mutation({
 		updatedAtMs: v.number(),
 		sizeBytes: v.number(),
 		clientId: v.string(),
+		/** Newer clients send these; ignored until versioning / kind routing is unified server-side. */
+		contentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		retainBinaryVersions: v.optional(v.number()),
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
@@ -66,10 +69,15 @@ export const finalizeUpload = mutation({
 		updatedAtMs: v.number(),
 		sizeBytes: v.number(),
 		clientId: v.string(),
+		/** When set, row is indexed as text vs binary (`isText`). Defaults to binary for older clients. */
+		contentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		/** Reserved for future per-path binary version retention; accepted so clients do not fail validation. */
+		retainBinaryVersions: v.optional(v.number()),
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const path = normalizePath(args.path);
+		const isText = args.contentKind === "text";
 		const existing = await ctx.db
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -92,7 +100,7 @@ export const finalizeUpload = mutation({
 				sizeBytes: args.sizeBytes,
 				updatedAtMs: args.updatedAtMs,
 				updatedByClientId: args.clientId,
-				isText: false,
+				isText,
 			});
 		} else {
 			await ctx.db.insert("vaultFiles", {
@@ -102,7 +110,7 @@ export const finalizeUpload = mutation({
 				sizeBytes: args.sizeBytes,
 				updatedAtMs: args.updatedAtMs,
 				updatedByClientId: args.clientId,
-				isText: false,
+				isText,
 			});
 		}
 
@@ -427,7 +435,7 @@ export const removeFilesByPath = mutation({
 			}
 			await ctx.db.delete(row._id);
 			if (row.isText) {
-				await ctx.scheduler.runAfter(0, internal.yjs._removeDocsByPathSuffix, {
+				await ctx.scheduler.runAfter(0, internal.yjsSync._removeDocsByPathSuffix, {
 					path,
 				});
 			}

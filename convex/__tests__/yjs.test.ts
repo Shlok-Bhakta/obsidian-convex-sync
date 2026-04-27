@@ -3,11 +3,11 @@ import * as Y from "yjs";
 
 const refs = vi.hoisted(() => ({
 	internal: {
-		yjs: {
-			_pruneOldSnapshotsOnce: "internal.yjs._pruneOldSnapshotsOnce",
-			_insertSnapshotChunk: "internal.yjs._insertSnapshotChunk",
-			_pruneOldUpdatesOnce: "internal.yjs._pruneOldUpdatesOnce",
-			_markDocClean: "internal.yjs._markDocClean",
+		yjsSync: {
+			_pruneOldSnapshotsOnce: "internal.yjsSync._pruneOldSnapshotsOnce",
+			_insertSnapshotChunk: "internal.yjsSync._insertSnapshotChunk",
+			_pruneOldUpdatesOnce: "internal.yjsSync._pruneOldUpdatesOnce",
+			_markDocClean: "internal.yjsSync._markDocClean",
 		},
 	},
 }));
@@ -24,7 +24,7 @@ vi.mock("../_generated/server", () => ({
 
 vi.mock("../_generated/api", () => refs);
 
-import { _insertSnapshotChunk, _pruneOldSnapshotsOnce, _snapshotUpdates } from "../yjs";
+import { _insertSnapshotChunk, _pruneOldSnapshotsOnce, _snapshotUpdates } from "../yjsSync";
 
 type Handler<Args, Result> = (ctx: unknown, args: Args) => Promise<Result>;
 
@@ -36,7 +36,7 @@ function invokeHandler<Args, Result>(
 	return (registeredFn as { handler: Handler<Args, Result> }).handler(ctx, args);
 }
 
-describe("convex/yjs snapshot lifecycle", () => {
+describe("convex/yjsSync snapshot lifecycle", () => {
 	it("prunes old snapshot rows one bounded batch at a time", async () => {
 		const deletedIds: string[] = [];
 		const take = vi.fn().mockResolvedValue([
@@ -110,10 +110,10 @@ describe("convex/yjs snapshot lifecycle", () => {
 		});
 
 		expect(calls).toEqual([
-			refs.internal.yjs._pruneOldSnapshotsOnce,
-			refs.internal.yjs._insertSnapshotChunk,
-			refs.internal.yjs._pruneOldUpdatesOnce,
-			refs.internal.yjs._markDocClean,
+			refs.internal.yjsSync._pruneOldSnapshotsOnce,
+			refs.internal.yjsSync._insertSnapshotChunk,
+			refs.internal.yjsSync._pruneOldUpdatesOnce,
+			refs.internal.yjsSync._markDocClean,
 		]);
 	});
 });

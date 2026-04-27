@@ -61,7 +61,7 @@ export class DocManager {
 			this.client,
 			docId,
 			doc,
-			this.convexApi.yjs,
+			this.convexApi.yjsSync,
 		);
 		provider.onDivergence = () => {
 			void this.recoverFromEditorSyncDivergence();
@@ -255,7 +255,7 @@ export class DocManager {
 		const docId = this.pathToDocId(path);
 		const doc = new Y.Doc();
 		doc.getText("content").insert(0, content);
-		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjs);
+		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjsSync);
 		try {
 			await provider.init();
 			await provider.pushFullState();
@@ -319,7 +319,7 @@ export class DocManager {
 				this.client,
 				newDocId,
 				doc,
-				this.convexApi.yjs,
+				this.convexApi.yjsSync,
 			);
 			try {
 				await provider.init();
@@ -375,7 +375,7 @@ export class DocManager {
 				this.client,
 				docId,
 				doc,
-				this.convexApi.yjs,
+				this.convexApi.yjsSync,
 			);
 			try {
 				await provider.init();
@@ -403,7 +403,7 @@ export class DocManager {
 		const docId = this.pathToDocId(path);
 		this.pullingRemotePaths.add(path);
 		const doc = new Y.Doc();
-		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjs);
+		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjsSync);
 		try {
 			await provider.init();
 			const content = doc.getText("content").toString();
