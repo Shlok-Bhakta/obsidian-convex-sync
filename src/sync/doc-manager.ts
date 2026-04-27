@@ -46,10 +46,12 @@ export class DocManager {
 
 		const docId = this.pathToDocId(path);
 		const doc = new Y.Doc();
+		const cachedDoc = new Y.Doc();
 		const awareness = new Awareness(doc);
 
-		// Load cached state first for instant warm start.
-		await YjsLocalCache.load(docId, doc);
+		// Hydrate cache into a temp doc first. The live doc is hydrated from Convex
+		// first so stale cache never masks fresher remote/mobile edits on file-open.
+		await YjsLocalCache.load(docId, cachedDoc);
 
 		const provider = new ConvexYjsProvider(
 			this.client,
@@ -57,7 +59,15 @@ export class DocManager {
 			doc,
 			this.convexApi.yjs,
 		);
-		await provider.init();
+		try {
+			await provider.init();
+			const cacheDelta = Y.encodeStateAsUpdate(cachedDoc, Y.encodeStateVector(doc));
+			if (cacheDelta.byteLength > 0) {
+				Y.applyUpdate(doc, cacheDelta);
+			}
+		} finally {
+			cachedDoc.destroy();
+		}
 
 		awareness.setLocalStateField("user", {
 			name: this.clientId.slice(0, 8),
@@ -134,13 +144,13 @@ export class DocManager {
 		this.extensions.push(yCollab(ytext, awareness));
 		this.app.workspace.updateOptions();
 
-		// Remote awareness carries cursor positions. Convex may deliver rows in the same
-		// turn as subscription setup; defer until after CM has applied yCollab so length
-		// matches Y.Text (avoids RangeError: Invalid position N in document of length 0).
+		// Remote Yjs and awareness rows may arrive in the same turn as setup.
+		// Defer until after CM has applied yCollab so editor length matches Y.Text.
 		let awarenessAttached = false;
 		const attachAwareness = (): void => {
 			if (this.destroyed || this.current !== entry || awarenessAttached) return;
 			awarenessAttached = true;
+			provider.startSync();
 			entry.awarenessSync =
 				this.convexSecret.trim() !== ""
 					? new ConvexAwarenessSync(

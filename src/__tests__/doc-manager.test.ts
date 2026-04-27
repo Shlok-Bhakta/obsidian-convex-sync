@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mutationMock, hasCachedStateMock, saveMock } = vi.hoisted(() => ({
+const { mutationMock, hasCachedStateMock, saveMock, loadMock } = vi.hoisted(() => ({
 	mutationMock: vi.fn(),
 	hasCachedStateMock: vi.fn(),
 	saveMock: vi.fn(),
+	loadMock: vi.fn(),
 }));
 
 vi.mock("obsidian", () => ({
@@ -13,6 +14,7 @@ vi.mock("obsidian", () => ({
 vi.mock("../sync/yjs-local-cache", () => ({
 	YjsLocalCache: {
 		hasCachedState: hasCachedStateMock,
+		load: loadMock,
 		save: saveMock,
 	},
 }));
@@ -27,6 +29,7 @@ vi.mock("../sync/ConvexYjsProvider", () => ({
 		async init() {
 			this.doc.getText("content").insert(0, "Hello World");
 		}
+		startSync() {}
 		destroy() {}
 	},
 }));
@@ -37,6 +40,7 @@ describe("DocManager warm-up manifest sync", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		hasCachedStateMock.mockResolvedValue(false);
+		loadMock.mockResolvedValue(undefined);
 		saveMock.mockResolvedValue(undefined);
 		mutationMock.mockResolvedValue(undefined);
 	});

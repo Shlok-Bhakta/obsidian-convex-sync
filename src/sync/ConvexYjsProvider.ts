@@ -20,6 +20,7 @@ export class ConvexYjsProvider {
 	private pushInFlight = false;
 	private retryDelayMs = 500;
 	private destroyed = false;
+	private syncStarted = false;
 
 	constructor(
 		private readonly client: ConvexClient,
@@ -44,7 +45,11 @@ export class ConvexYjsProvider {
 		if (this.destroyed) return;
 
 		Y.applyUpdate(this.doc, toUint8Array(initial.update), this.remoteOrigin);
+	}
 
+	startSync(): void {
+		if (this.destroyed || this.syncStarted) return;
+		this.syncStarted = true;
 		this.doc.on("update", this.onDocUpdate);
 		// Proactively push the current doc state so locally cached edits are not stuck
 		// waiting for a brand-new keystroke after reconnect/reopen.
@@ -74,6 +79,7 @@ export class ConvexYjsProvider {
 	destroy(): void {
 		if (this.destroyed) return;
 		this.destroyed = true;
+		this.syncStarted = false;
 		if (this.retryTimer) {
 			clearTimeout(this.retryTimer);
 			this.retryTimer = null;
