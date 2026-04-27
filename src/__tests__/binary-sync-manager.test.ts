@@ -56,6 +56,7 @@ vi.mock("../file-sync", async () => {
 });
 
 import { TFile } from "obsidian";
+import { DEFAULT_SETTINGS } from "../settings/index";
 import { BinarySyncManager } from "../sync/binary-sync-manager";
 import { del, keys, set } from "idb-keyval";
 
@@ -85,6 +86,7 @@ describe("BinarySyncManager", () => {
 			"secret",
 			"client",
 			async () => {},
+			{ ...DEFAULT_SETTINGS },
 		);
 
 		await manager.onLocalFolderRenamed("old/folder", "new/folder");
@@ -130,6 +132,7 @@ describe("BinarySyncManager", () => {
 			"secret",
 			"client",
 			async () => {},
+			{ ...DEFAULT_SETTINGS },
 		);
 
 		const createPromise = manager.onLocalFileCreated(liveFile);
@@ -176,6 +179,7 @@ describe("BinarySyncManager", () => {
 			"secret",
 			"client",
 			async () => {},
+			{ ...DEFAULT_SETTINGS },
 		);
 
 		await set("binarySync:hash:.obsidian/workspace.json", "hash-a");
@@ -247,6 +251,7 @@ describe("BinarySyncManager", () => {
 			async (paths: string[]) => {
 				pulled.push(...paths);
 			},
+			{ ...DEFAULT_SETTINGS },
 		);
 
 		const onRemoteMetadata = (manager as unknown as {

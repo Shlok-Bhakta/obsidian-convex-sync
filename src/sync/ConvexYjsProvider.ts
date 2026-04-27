@@ -38,6 +38,8 @@ export class ConvexYjsProvider {
 	private serverStateVector: Uint8Array | null = null;
 	private static readonly PUSH_DEBOUNCE_MS = 200;
 	private static readonly PULL_INTERVAL_MS = 2_000;
+	private static readonly ACTION_RETRY_MAX_ATTEMPTS = 6;
+	private static readonly ACTION_RETRY_BASE_DELAY_MS = 400;
 
 	/** Optional hook when applying remote updates fails (e.g. corrupt payload). */
 	onDivergence: (() => void) | null = null;
@@ -51,16 +53,15 @@ export class ConvexYjsProvider {
 
 	async init(): Promise<void> {
 		if (this.destroyed) return;
-		const initial = await this.client.action(
-			this.convexApi.init as YjsInitAction,
-			{
+		const initial = await this.withConvexActionRetries("yjsSync:init", () =>
+			this.client.action(this.convexApi.init as YjsInitAction, {
 				docId: this.docId,
 				// Always request the full server update relative to an *empty* Y.Doc state vector
 				// (not encodeStateVector(this.doc) after idb load). Otherwise diffUpdate omits
 				// server-side deletes the cache never saw. Never use Uint8Array(0): Y.diffUpdate
 				// throws "Unexpected end of array" for zero-length state vectors.
 				stateVector: toArrayBuffer(Y.encodeStateVector(new Y.Doc())),
-			},
+			}),
 		);
 		if (this.destroyed) return;
 
@@ -171,9 +172,8 @@ export class ConvexYjsProvider {
 		if (this.destroyed || this.pullInFlight) return;
 		this.pullInFlight = true;
 		try {
-			const serverUpdate = await this.client.action(
-				this.convexApi.pull as YjsPullAction,
-				{ docId: this.docId },
+			const serverUpdate = await this.withConvexActionRetries("yjsSync:pull", () =>
+				this.client.action(this.convexApi.pull as YjsPullAction, { docId: this.docId }),
 			);
 			if (this.destroyed) return;
 			const mergedRemote = toUint8Array(serverUpdate);
@@ -185,12 +185,59 @@ export class ConvexYjsProvider {
 			}
 			this.serverStateVector = Y.encodeStateVectorFromUpdate(mergedRemote);
 		} catch (err: unknown) {
-			console.error("[ConvexYjsProvider] pull action failed — re-sync suggested", err);
-			this.onDivergence?.();
+			if (ConvexYjsProvider.isTransientConvexClientError(err)) {
+				console.warn("[ConvexYjsProvider] pull action failed (transient); will retry on next poll", err);
+			} else {
+				console.error("[ConvexYjsProvider] pull action failed — re-sync suggested", err);
+				this.onDivergence?.();
+			}
 		} finally {
 			this.pullInFlight = false;
 			this.schedulePull(ConvexYjsProvider.PULL_INTERVAL_MS);
 		}
+	}
+
+	private async withConvexActionRetries<T>(label: string, fn: () => Promise<T>): Promise<T> {
+		let attempt = 0;
+		while (true) {
+			if (this.destroyed) {
+				throw new Error(`[CONVEX A(${label})] provider destroyed`);
+			}
+			attempt++;
+			try {
+				return await fn();
+			} catch (e: unknown) {
+				if (this.destroyed) throw e;
+				const retriable =
+					ConvexYjsProvider.isTransientConvexClientError(e) &&
+					attempt < ConvexYjsProvider.ACTION_RETRY_MAX_ATTEMPTS;
+				if (!retriable) throw e;
+				const delay = Math.min(
+					ConvexYjsProvider.ACTION_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+					10_000,
+				);
+				console.warn(`[ConvexYjsProvider] ${label} failed (attempt ${attempt}); retrying in ${delay}ms`, e);
+				await new Promise((r) => setTimeout(r, delay));
+			}
+		}
+	}
+
+	private static isTransientConvexClientError(error: unknown): boolean {
+		const msg =
+			error instanceof Error
+				? error.message
+				: typeof error === "string"
+					? error
+					: "";
+		return (
+			msg.includes("Connection lost") ||
+			msg.includes("connection lost") ||
+			msg.includes("Failed to fetch") ||
+			msg.includes("NetworkError") ||
+			msg.includes("Load failed") ||
+			msg.includes("The operation was aborted") ||
+			msg.includes("Network request failed")
+		);
 	}
 }
 

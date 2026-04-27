@@ -3,7 +3,13 @@ import type { ConvexClient, ConvexHttpClient } from "convex/browser";
 import { del, get, keys, set } from "idb-keyval";
 import { normalizePath, Notice, TFile, TFolder, type App } from "obsidian";
 import { api } from "../../convex/_generated/api";
-import { isTextSyncFile, readRemoteFileBytes, uploadLocalFile } from "../file-sync";
+import {
+	binaryTransferOpts,
+	isTextSyncFile,
+	readRemoteFileBytes,
+	uploadLocalFile,
+} from "../file-sync";
+import type { MyPluginSettings } from "../settings";
 import { obsidianConvexIdbStore } from "./yjs-local-cache";
 
 const VAULT_SYNC_TIMESTAMP_KEY = "vaultSync:lastServerTimestamp";
@@ -111,6 +117,8 @@ export class BinarySyncManager {
 		private readonly clientId: string,
 		/** Called when remote text files are discovered (new/modified from another device). */
 		private readonly onRemoteTextFilesDiscovered: (paths: string[]) => Promise<void>,
+		/** Same object as plugin settings (mutated on save); read per call for live toggles. */
+		private readonly pluginSettings: MyPluginSettings,
 	) {}
 
 	/** Call synchronously when the vault file is already gone locally but `removeFilesByPath` may still be in flight. */
@@ -294,7 +302,12 @@ export class BinarySyncManager {
 
 	private async syncBinaryFile(file: RemoteFileMeta): Promise<boolean> {
 		if (file.isText) return false;
-		const result = await readRemoteFileBytes(this.httpClient, this.convexSecret, file.path);
+		const result = await readRemoteFileBytes(
+			this.httpClient,
+			this.convexSecret,
+			file.path,
+			binaryTransferOpts(this.pluginSettings),
+		);
 		if (!result) {
 			await this.app.vault.adapter.remove(file.path).catch(() => {});
 			await del(hashKeyForPath(file.path), obsidianConvexIdbStore);
@@ -473,6 +486,7 @@ export class BinarySyncManager {
 				path,
 				bytes,
 				liveFile.stat.mtime,
+				binaryTransferOpts(this.pluginSettings),
 			);
 		} finally {
 			this.uploadsInFlight.delete(path);

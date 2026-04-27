@@ -18,12 +18,16 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 				if (abstractFile.extension === "md") {
 					void (async () => {
 						const docManager = deps.getDocManager();
-						await docManager?.onFileCreated(abstractFile.path);
-						// Some note-creation flows may not emit a reliable file-open event.
-						// If the created note is already active, bind Yjs immediately.
-						const activeFile = deps.getActiveFile();
-						if (activeFile?.path === abstractFile.path) {
-							await docManager?.onFileOpen(abstractFile.path);
+						try {
+							await docManager?.onFileCreated(abstractFile.path);
+							// Some note-creation flows may not emit a reliable file-open event.
+							// If the created note is already active, bind Yjs immediately.
+							const activeFile = deps.getActiveFile();
+							if (activeFile?.path === abstractFile.path) {
+								await docManager?.onFileOpen(abstractFile.path);
+							}
+						} catch (e: unknown) {
+							console.warn("[DocManager] vault create handler failed", e);
 						}
 					})();
 				} else {
@@ -53,12 +57,16 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 					deps.getBinarySync()?.noteLocalDeletePending(normalizePath(oldPath));
 					void (async () => {
 						const docManager = deps.getDocManager();
-						await docManager?.onFileRenamed(oldPath, abstractFile.path);
-						// Name-edit rename may leave the file active without a follow-up file-open.
-						// Ensure the renamed active note is immediately bound for live sync.
-						const activeFile = deps.getActiveFile();
-						if (activeFile?.path === abstractFile.path) {
-							await docManager?.onFileOpen(abstractFile.path);
+						try {
+							await docManager?.onFileRenamed(oldPath, abstractFile.path);
+							// Name-edit rename may leave the file active without a follow-up file-open.
+							// Ensure the renamed active note is immediately bound for live sync.
+							const activeFile = deps.getActiveFile();
+							if (activeFile?.path === abstractFile.path) {
+								await docManager?.onFileOpen(abstractFile.path);
+							}
+						} catch (e: unknown) {
+							console.warn("[DocManager] vault rename handler failed", e);
 						}
 					})();
 				} else {

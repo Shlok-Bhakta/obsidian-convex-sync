@@ -74,6 +74,15 @@ export class DocManager {
 			if (cacheDelta.byteLength > 0) {
 				Y.applyUpdate(doc, cacheDelta);
 			}
+		} catch (e: unknown) {
+			console.warn(
+				"[DocManager] Convex Yjs init failed after retries; opening from local cache until the connection recovers",
+				e,
+			);
+			const fromCache = Y.encodeStateAsUpdate(cachedDoc);
+			if (fromCache.byteLength > 0) {
+				Y.applyUpdate(doc, fromCache);
+			}
 		} finally {
 			cachedDoc.destroy();
 		}
@@ -208,6 +217,8 @@ export class DocManager {
 			console.warn("[DocManager] Yjs/CodeMirror divergence — re-syncing from server");
 			await this.closeCurrentDoc();
 			await this.onFileOpen(path);
+		} catch (e: unknown) {
+			console.warn("[DocManager] recoverFromEditorSyncDivergence failed", e);
 		} finally {
 			this.recoveringFromDivergence = false;
 		}

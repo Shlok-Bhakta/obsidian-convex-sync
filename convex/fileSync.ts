@@ -9,12 +9,20 @@ import {
 import { paginationOptsValidator } from "convex/server";
 import { requirePluginSecret } from "./security";
 
-type FileBytesResult = {
-	bytes: ArrayBuffer;
-	contentHash: string;
-	sizeBytes: number;
-	updatedAtMs: number;
-} | null;
+/** Convex action return payload must stay under ~16 MiB; keep chunks below that. */
+const DEFAULT_FILE_CHUNK_BYTES = 8 * 1024 * 1024;
+const MAX_FILE_CHUNK_BYTES = 12 * 1024 * 1024;
+
+type GetFileBytesChunkResult =
+	| null
+	| {
+			bytes: ArrayBuffer;
+			contentHash: string;
+			sizeBytes: number;
+			updatedAtMs: number;
+			byteOffset: number;
+			isLast: boolean;
+	  };
 
 function normalizePath(input: string): string {
 	const normalized = input.trim().replace(/\\/g, "/").replace(/^\/+/, "");
@@ -330,8 +338,17 @@ export const getRowByPath = internalQuery({
 	},
 });
 
-export const getFileBytes = action({
-	args: { convexSecret: v.string(), path: v.string() },
+/**
+ * Reads a byte range from file storage (fallback when signed URL download fails).
+ * Use sequential chunks; each response stays under the Convex action size limit.
+ */
+export const getFileBytesChunk = action({
+	args: {
+		convexSecret: v.string(),
+		path: v.string(),
+		byteOffset: v.number(),
+		maxBytes: v.optional(v.number()),
+	},
 	returns: v.union(
 		v.null(),
 		v.object({
@@ -339,31 +356,60 @@ export const getFileBytes = action({
 			contentHash: v.string(),
 			sizeBytes: v.number(),
 			updatedAtMs: v.number(),
+			byteOffset: v.number(),
+			isLast: v.boolean(),
 		}),
 	),
-	handler: async (ctx, args): Promise<FileBytesResult> => {
+	handler: async (ctx, args): Promise<GetFileBytesChunkResult> => {
 		const auth = await ctx.runQuery(internal.security.validatePluginSecret, {
 			secret: args.convexSecret,
 		});
 		if (!auth.ok) {
 			throw new Error("The vault API key is invalid for this Convex deployment.");
 		}
+		if (args.byteOffset < 0 || !Number.isFinite(args.byteOffset)) {
+			throw new ConvexError("byteOffset must be a non-negative finite number.");
+		}
+		const requested =
+			args.maxBytes === undefined
+				? DEFAULT_FILE_CHUNK_BYTES
+				: Math.min(MAX_FILE_CHUNK_BYTES, Math.max(1, args.maxBytes));
 		const path = normalizePath(args.path);
-		const row = await ctx.runQuery((internal as any).fileSync.getRowByPath, {
+		const row = await ctx.runQuery(internal.fileSync.getRowByPath, {
 			path,
 		});
 		if (!row || !row.storageId) {
 			return null;
 		}
-		const blob = await ctx.storage.get(row.storageId as never);
+		const blob = await ctx.storage.get(row.storageId);
 		if (!blob) {
 			return null;
 		}
+		const totalSize =
+			typeof blob.size === "number" && blob.size > 0 ? blob.size : row.sizeBytes;
+		if (totalSize === 0 && args.byteOffset === 0) {
+			return {
+				bytes: new ArrayBuffer(0),
+				contentHash: row.contentHash,
+				sizeBytes: 0,
+				updatedAtMs: row.updatedAtMs,
+				byteOffset: 0,
+				isLast: true,
+			};
+		}
+		if (args.byteOffset >= totalSize) {
+			return null;
+		}
+		const end = Math.min(args.byteOffset + requested, totalSize);
+		const slice = blob.slice(args.byteOffset, end);
+		const bytes = await slice.arrayBuffer();
 		return {
-			bytes: await blob.arrayBuffer(),
+			bytes,
 			contentHash: row.contentHash,
-			sizeBytes: row.sizeBytes,
+			sizeBytes: totalSize,
 			updatedAtMs: row.updatedAtMs,
+			byteOffset: args.byteOffset,
+			isLast: end >= totalSize,
 		};
 	},
 });
