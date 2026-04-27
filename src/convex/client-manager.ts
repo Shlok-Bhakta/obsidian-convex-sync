@@ -1,5 +1,8 @@
 import { ConvexClient, ConvexHttpClient } from "convex/browser";
 import type { MyPluginSettings } from "../settings";
+import { createObsidianBackedFetch } from "./obsidian-fetch";
+
+const convexHttpFetch = createObsidianBackedFetch();
 
 export class ConvexClientManager {
 	private convexHttpClientCache: { client: ConvexHttpClient; url: string } | null =
@@ -28,7 +31,10 @@ export class ConvexClientManager {
 			);
 		}
 		if (!this.convexHttpClientCache || this.convexHttpClientCache.url !== url) {
-			this.convexHttpClientCache = { client: new ConvexHttpClient(url), url };
+			this.convexHttpClientCache = {
+				client: new ConvexHttpClient(url, { fetch: convexHttpFetch }),
+				url,
+			};
 		}
 		return this.convexHttpClientCache.client;
 	}
@@ -53,7 +59,7 @@ export class ConvexClientManager {
 		const url = settings.convexUrl.trim();
 		return new ConvexHttpClient(url, {
 			fetch: (input, init) =>
-				globalThis.fetch(input, {
+				convexHttpFetch(input, {
 					...init,
 					keepalive: true,
 				}),

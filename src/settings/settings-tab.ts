@@ -62,7 +62,9 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Convex URL")
-			.setDesc("Deployment URL (CONVEX_URL).")
+			.setDesc(
+				"Deployment URL (CONVEX_URL). Convex HTTP uses Obsidian requestUrl, so browser CORS on app:// does not apply. If markdown live sync fails but vault file sync works, fix WSS through your proxy and origin timeouts (HTTP 524 usually means Cloudflare gave up waiting for your Convex origin).",
+			)
 			.addText((text) =>
 				text
 					.setPlaceholder("http://...")

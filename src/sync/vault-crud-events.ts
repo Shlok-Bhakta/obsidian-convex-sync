@@ -11,6 +11,12 @@ type VaultCrudEventDeps = {
 	getBinarySync: () => BinarySyncManager | null;
 };
 
+function voidBinary(p: Promise<void> | undefined): void {
+	void p?.catch((e: unknown) => {
+		console.warn("[BinarySync] vault event handler failed", e);
+	});
+}
+
 export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 	deps.registerEvent(
 		deps.vault.on("create", (abstractFile) => {
@@ -31,10 +37,10 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 						}
 					})();
 				} else {
-					void deps.getBinarySync()?.onLocalFileCreated(abstractFile);
+					voidBinary(deps.getBinarySync()?.onLocalFileCreated(abstractFile));
 				}
 			} else if (abstractFile instanceof TFolder) {
-				void deps.getBinarySync()?.onLocalFolderCreated(abstractFile.path);
+				voidBinary(deps.getBinarySync()?.onLocalFolderCreated(abstractFile.path));
 			}
 		}),
 	);
@@ -43,9 +49,11 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 			if (abstractFile instanceof TFile) {
 				const path = normalizePath(abstractFile.path);
 				if (isTextSyncFile(path)) {
-					void deps.getDocManager()?.onFileModified(path);
+					void deps.getDocManager()?.onFileModified(path).catch((e: unknown) => {
+						console.warn("[DocManager] onFileModified failed", e);
+					});
 				} else {
-					void deps.getBinarySync()?.onLocalFileModified(abstractFile);
+					voidBinary(deps.getBinarySync()?.onLocalFileModified(abstractFile));
 				}
 			}
 		}),
@@ -70,10 +78,10 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 						}
 					})();
 				} else {
-					void deps.getBinarySync()?.onLocalFileRenamed(oldPath, abstractFile);
+					voidBinary(deps.getBinarySync()?.onLocalFileRenamed(oldPath, abstractFile));
 				}
 			} else if (abstractFile instanceof TFolder) {
-				void deps.getBinarySync()?.onLocalFolderRenamed(oldPath, abstractFile.path);
+				voidBinary(deps.getBinarySync()?.onLocalFolderRenamed(oldPath, abstractFile.path));
 			}
 		}),
 	);
@@ -82,12 +90,14 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 			if (abstractFile instanceof TFile) {
 				if (abstractFile.extension === "md") {
 					deps.getBinarySync()?.noteLocalDeletePending(normalizePath(abstractFile.path));
-					void deps.getDocManager()?.onFileDeleted(abstractFile.path);
+					void deps.getDocManager()?.onFileDeleted(abstractFile.path).catch((e: unknown) => {
+						console.warn("[DocManager] onFileDeleted failed", e);
+					});
 				} else {
-					void deps.getBinarySync()?.onLocalFileDeleted(abstractFile.path);
+					voidBinary(deps.getBinarySync()?.onLocalFileDeleted(abstractFile.path));
 				}
 			} else if (abstractFile instanceof TFolder) {
-				void deps.getBinarySync()?.onLocalFolderDeleted(abstractFile.path);
+				voidBinary(deps.getBinarySync()?.onLocalFolderDeleted(abstractFile.path));
 			}
 		}),
 	);

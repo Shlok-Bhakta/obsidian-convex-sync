@@ -32,6 +32,8 @@ export class DocManager {
 	private recoveringFromDivergence = false;
 	/** Paths currently being pulled from remote; suppresses onFileCreated empty-manifest registration. */
 	readonly pullingRemotePaths = new Set<string>();
+	/** Prevents overlapping `pullRemoteTextFile` runs for the same path (subscription bursts / catch-up races). */
+	private readonly activeRemoteTextPulls = new Set<string>();
 
 	/** Current Yjs awareness for the open collaborative doc (sidebar presence merge). */
 	getCurrentAwareness(): Awareness | null {
@@ -47,10 +49,17 @@ export class DocManager {
 	) {}
 
 	async onFileOpen(path: string): Promise<void> {
-		if (path === this.currentPath) return;
+		const normPath = normalizePath(path);
+		if (this.currentPath != null && normalizePath(this.currentPath) === normPath) {
+			return;
+		}
 		await this.closeCurrentDoc();
 
-		const docId = this.pathToDocId(path);
+		// Reserve immediately after close so background text pulls skip `vault.modify` for this
+		// path during cache load + Convex init (avoids CM/Yjs seeing repeated disk writes).
+		this.currentPath = normPath;
+
+		const docId = this.pathToDocId(normPath);
 		const doc = new Y.Doc();
 		const cachedDoc = new Y.Doc();
 		const awareness = new Awareness(doc);
@@ -91,9 +100,8 @@ export class DocManager {
 			name: this.clientId.slice(0, 8),
 			color: hashColor(this.clientId),
 		});
-		awareness.setLocalStateField("openFilePath", path);
+		awareness.setLocalStateField("openFilePath", normPath);
 
-		const normPath = normalizePath(path);
 		const { schedule: schedulePersist, cancel: cancelPersistDebounced } = debounceWithCancel(
 			async () => {
 				if (this.destroyed || this.currentPath !== normPath) return;
@@ -173,14 +181,13 @@ export class DocManager {
 			cancelPersistDebounced,
 		};
 		this.current = entry;
-		this.currentPath = path;
 
 		this.extensions.length = 0;
 		this.extensions.push(yCollab(ytext, awareness));
 		this.app.workspace.updateOptions();
 		// Convex init ran before yCollab existed, so CM never received a Y→CM observe callback.
 		// Flush once now (and again after startSync) so disk cannot sit stale vs Y or poison Y via CM→Y.
-		flushYjsTextToActiveMarkdownEditor(this.app, path, ytext);
+		flushYjsTextToActiveMarkdownEditor(this.app, normPath, ytext);
 
 		// Remote Yjs and awareness rows may arrive in the same turn as setup.
 		// Defer until after CM has applied yCollab so editor length matches Y.Text.
@@ -189,7 +196,7 @@ export class DocManager {
 			if (this.destroyed || this.current !== entry || awarenessAttached) return;
 			awarenessAttached = true;
 			provider.startSync();
-			flushYjsTextToActiveMarkdownEditor(this.app, path, ytext);
+			flushYjsTextToActiveMarkdownEditor(this.app, normPath, ytext);
 			entry.awarenessSync =
 				this.convexSecret.trim() !== ""
 					? new ConvexAwarenessSync(
@@ -258,8 +265,8 @@ export class DocManager {
 
 	/** Register a new Markdown file on the server using current disk content before first open. */
 	async onFileCreated(path: string): Promise<void> {
-		if (this.pullingRemotePaths.has(path)) return;
 		const norm = normalizePath(path);
+		if (this.pullingRemotePaths.has(norm)) return;
 		const abstract = this.app.vault.getAbstractFileByPath(norm);
 		if (!(abstract instanceof TFile) || abstract.extension !== "md") {
 			const emptyHash = await sha256Utf8("");
@@ -293,7 +300,11 @@ export class DocManager {
 	 * Yjs doc wiring (for example during startup races on newly created notes).
 	 */
 	async onFileModified(path: string): Promise<void> {
-		if (this.currentPath === path && this.current) {
+		if (
+			this.current != null &&
+			this.currentPath != null &&
+			normalizePath(this.currentPath) === normalizePath(path)
+		) {
 			return;
 		}
 		const abstract = this.app.vault.getAbstractFileByPath(path);
@@ -312,7 +323,8 @@ export class DocManager {
 	async onFileRenamed(oldPath: string, newPath: string): Promise<void> {
 		const oldDocId = this.pathToDocId(oldPath);
 		const newDocId = this.pathToDocId(newPath);
-		const wasCurrentDoc = this.currentPath === oldPath;
+		const wasCurrentDoc =
+			this.currentPath != null && normalizePath(this.currentPath) === normalizePath(oldPath);
 
 		if (wasCurrentDoc) {
 			await this.closeCurrentDoc();
@@ -371,7 +383,7 @@ export class DocManager {
 
 	async onFileDeleted(path: string): Promise<void> {
 		const docId = this.pathToDocId(path);
-		if (this.currentPath === path) {
+		if (this.currentPath != null && normalizePath(this.currentPath) === normalizePath(path)) {
 			await this.closeCurrentDoc();
 		}
 		await YjsLocalCache.remove(docId);
@@ -421,8 +433,10 @@ export class DocManager {
 	 */
 	async pullRemoteTextFile(path: string): Promise<void> {
 		const norm = normalizePath(path);
-		const docId = this.pathToDocId(path);
-		this.pullingRemotePaths.add(path);
+		if (this.activeRemoteTextPulls.has(norm)) return;
+		this.activeRemoteTextPulls.add(norm);
+		const docId = this.pathToDocId(norm);
+		this.pullingRemotePaths.add(norm);
 		const doc = new Y.Doc();
 		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjsSync);
 		try {
@@ -449,13 +463,14 @@ export class DocManager {
 			if (content.length > 0) {
 				await YjsLocalCache.save(docId, doc);
 			}
-			await this.registerTextManifest(path, doc);
+			await this.registerTextManifest(norm, doc);
 		} catch (e) {
 			console.warn(`[DocManager] pullRemoteTextFile failed for ${path}`, e);
 		} finally {
 			provider.destroy();
 			doc.destroy();
-			this.pullingRemotePaths.delete(path);
+			this.pullingRemotePaths.delete(norm);
+			this.activeRemoteTextPulls.delete(norm);
 		}
 	}
 
@@ -466,7 +481,12 @@ export class DocManager {
 	async pullRemoteTextFiles(paths: string[]): Promise<void> {
 		for (const path of paths) {
 			if (this.destroyed) return;
-			if (this.currentPath === path) continue;
+			if (
+				this.currentPath != null &&
+				normalizePath(this.currentPath) === normalizePath(path)
+			) {
+				continue;
+			}
 			const docId = this.pathToDocId(path);
 			if (await YjsLocalCache.hasCachedState(docId)) {
 				const existing = this.app.vault.getAbstractFileByPath(normalizePath(path));
