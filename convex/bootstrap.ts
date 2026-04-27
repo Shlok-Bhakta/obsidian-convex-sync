@@ -274,6 +274,14 @@ export const buildArchive = internalAction({
 	},
 	handler: async (ctx, args) => {
 		try {
+			const docsWithPendingUpdates = await ctx.runQuery(
+				internal.yjs._listDocIdsWithPendingUpdates,
+				{},
+			);
+			for (const docId of docsWithPendingUpdates) {
+				await ctx.runAction(internal.yjs._snapshotUpdates, { docId });
+			}
+
 			const snapshot = await ctx.runQuery(internal.bootstrap._readSnapshot, {
 				convexSecret: args.convexSecret,
 			});

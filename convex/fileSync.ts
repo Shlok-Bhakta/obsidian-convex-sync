@@ -1,4 +1,5 @@
 import { ConvexError, v } from "convex/values";
+import { internal } from "./_generated/api";
 import { mutation, query } from "./_generated/server";
 import { requirePluginSecret } from "./security";
 
@@ -225,10 +226,55 @@ export const listSnapshot = query({
 	args: { convexSecret: v.string() },
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const files = await ctx.db.query("vaultFiles").collect();
+		const [files, snapshots, updates] = await Promise.all([
+			ctx.db.query("vaultFiles").collect(),
+			ctx.db.query("yjsSnapshots").collect(),
+			ctx.db.query("yjsUpdates").collect(),
+		]);
+		type SnapshotFile = {
+			path: string;
+			contentHash: string;
+			sizeBytes: number;
+			updatedAtMs: number;
+			updatedByClientId: string;
+			isText: boolean;
+			storageId?: string;
+		};
+		const filesByPath = new Map<string, SnapshotFile>(
+			files.map((file) => [
+				file.path,
+				{
+					path: file.path,
+					contentHash: file.contentHash,
+					sizeBytes: file.sizeBytes,
+					updatedAtMs: file.updatedAtMs,
+					updatedByClientId: file.updatedByClientId,
+					isText: file.isText,
+					storageId: file.storageId,
+				},
+			]),
+		);
+		for (const row of [...snapshots, ...updates]) {
+			const separator = row.docId.indexOf("::");
+			if (separator < 0) {
+				continue;
+			}
+			const path = row.docId.slice(separator + 2);
+			if (!path || filesByPath.has(path)) {
+				continue;
+			}
+			filesByPath.set(path, {
+				path,
+				contentHash: "",
+				sizeBytes: 0,
+				updatedAtMs: 0,
+				updatedByClientId: "",
+				isText: true,
+			});
+		}
 		const folders = await ctx.db.query("vaultFolders").collect();
 		return {
-			files: files.map((file) => ({
+			files: [...filesByPath.values()].map((file) => ({
 				path: file.path,
 				contentHash: file.contentHash,
 				sizeBytes: file.sizeBytes,
@@ -287,11 +333,22 @@ export const syncFolderState = mutation({
 		const existing = await ctx.db.query("vaultFolders").collect();
 		for (const folder of existing) {
 			const shouldBeEmpty = normalizedEmpty.has(folder.path);
-			await ctx.db.patch(folder._id, {
-				updatedAtMs: args.scannedAtMs,
-				isExplicitlyEmpty: shouldBeEmpty,
-				updatedByClientId: args.clientId,
-			});
+			// Keep "explicitly empty" monotonic for existing rows during full scans.
+			// This avoids re-marking a folder as empty if events changed it mid-scan.
+			if (shouldBeEmpty) {
+				if (folder.isExplicitlyEmpty) {
+					await ctx.db.patch(folder._id, {
+						updatedAtMs: args.scannedAtMs,
+						updatedByClientId: args.clientId,
+					});
+				}
+			} else if (folder.isExplicitlyEmpty) {
+				await ctx.db.patch(folder._id, {
+					updatedAtMs: args.scannedAtMs,
+					isExplicitlyEmpty: false,
+					updatedByClientId: args.clientId,
+				});
+			}
 			normalizedEmpty.delete(folder.path);
 		}
 		for (const path of normalizedEmpty) {
@@ -327,6 +384,11 @@ export const removeFilesByPath = mutation({
 				await ctx.storage.delete(row.storageId);
 			}
 			await ctx.db.delete(row._id);
+			if (row.isText) {
+				await ctx.scheduler.runAfter(0, internal.yjs._removeDocsByPathSuffix, {
+					path,
+				});
+			}
 		}
 	},
 });

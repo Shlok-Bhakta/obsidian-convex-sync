@@ -1,4 +1,15 @@
-import { App, Modal, Notice, Plugin, Setting, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
+import {
+	App,
+	type EventRef,
+	Modal,
+	Notice,
+	Plugin,
+	Setting,
+	TFile,
+	TFolder,
+	WorkspaceLeaf,
+	normalizePath,
+} from "obsidian";
 import {
 	ClientsPresenceView,
 	CLIENTS_PRESENCE_VIEW_TYPE,
@@ -21,6 +32,7 @@ import {
 } from "./settings";
 import { BinarySyncManager } from "./sync/binary-sync-manager";
 import { DocManager } from "./sync/doc-manager";
+import { registerVaultCrudEventHandlers } from "./sync/vault-crud-events";
 import { YjsLocalCache } from "./sync/yjs-local-cache";
 
 const DANGEROUS_RESET_PHRASE = "DELETE EVERYTHING";
@@ -176,6 +188,13 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 		this.syncStatusBarItemEl.setText("Convex sync: idle");
 		this.addSettingTab(new ConvexSyncSettingTab(this.app, this));
 
+		registerVaultCrudEventHandlers({
+			registerEvent: (eventRef: EventRef) => this.registerEvent(eventRef),
+			vault: this.app.vault,
+			getDocManager: () => this.docManager,
+			getBinarySync: () => this.binarySync,
+		});
+
 		const realtimeClient = this.convex.getRealtime();
 		if (realtimeClient) {
 			this.docManager = new DocManager(
@@ -192,56 +211,6 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 						void this.docManager?.onFileOpen(file.path);
 					} else {
 						void this.docManager?.closeCurrentDoc();
-					}
-				}),
-			);
-
-			this.registerEvent(
-				this.app.vault.on("create", (abstractFile) => {
-					if (abstractFile instanceof TFile) {
-						if (abstractFile.extension === "md") {
-							void this.docManager?.onFileCreated(abstractFile.path);
-						} else {
-							void this.binarySync?.onLocalFileCreated(abstractFile);
-						}
-					} else if (abstractFile instanceof TFolder) {
-						void this.binarySync?.onLocalFolderCreated(abstractFile.path);
-					}
-				}),
-			);
-			this.registerEvent(
-				this.app.vault.on("modify", (abstractFile) => {
-					if (abstractFile instanceof TFile) {
-						const path = normalizePath(abstractFile.path);
-						if (!isTextSyncFile(path)) {
-							void this.binarySync?.onLocalFileModified(abstractFile);
-						}
-					}
-				}),
-			);
-			this.registerEvent(
-				this.app.vault.on("rename", (abstractFile, oldPath) => {
-					if (abstractFile instanceof TFile) {
-						if (abstractFile.extension === "md") {
-							void this.docManager?.onFileRenamed(oldPath, abstractFile.path);
-						} else {
-							void this.binarySync?.onLocalFileRenamed(oldPath, abstractFile);
-						}
-					} else if (abstractFile instanceof TFolder) {
-						void this.binarySync?.onLocalFolderRenamed(oldPath, abstractFile.path);
-					}
-				}),
-			);
-			this.registerEvent(
-				this.app.vault.on("delete", (abstractFile) => {
-					if (abstractFile instanceof TFile) {
-						if (abstractFile.extension === "md") {
-							void this.docManager?.onFileDeleted(abstractFile.path);
-						} else {
-							void this.binarySync?.onLocalFileDeleted(abstractFile.path);
-						}
-					} else if (abstractFile instanceof TFolder) {
-						void this.binarySync?.onLocalFolderDeleted(abstractFile.path);
 					}
 				}),
 			);

@@ -159,16 +159,7 @@ export class DocManager {
 		if (!this.current) return;
 		const { doc, awareness, provider, awarenessSync, awarenessSanitizer } = this.current;
 		if (this.currentPath) {
-			const content = doc.getText("content").toString();
-			const hash = await sha256Utf8(content);
-			await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
-				convexSecret: this.convexSecret,
-				path: normalizePath(this.currentPath),
-				contentHash: hash,
-				sizeBytes: new TextEncoder().encode(content).length,
-				updatedAtMs: Date.now(),
-				clientId: this.clientId,
-			});
+			await this.registerTextManifest(this.currentPath, doc);
 			await YjsLocalCache.save(this.pathToDocId(this.currentPath), doc);
 		}
 		if (awarenessSync) {
@@ -196,19 +187,15 @@ export class DocManager {
 
 	/** Register a new Markdown file on the server manifest (empty content) before first open. */
 	async onFileCreated(path: string): Promise<void> {
-		const docId = this.pathToDocId(path);
-		const doc = new Y.Doc();
-		const content = doc.getText("content").toString();
-		const hash = await sha256Utf8(content);
+		const emptyHash = await sha256Utf8("");
 		await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
 			convexSecret: this.convexSecret,
 			path: normalizePath(path),
-			contentHash: hash,
+			contentHash: emptyHash,
 			sizeBytes: 0,
 			updatedAtMs: Date.now(),
 			clientId: this.clientId,
 		});
-		doc.destroy();
 	}
 
 	async onFileRenamed(oldPath: string, newPath: string): Promise<void> {
@@ -295,9 +282,11 @@ export class DocManager {
 			);
 			try {
 				await provider.init();
-				if (doc.getText("content").toString().length > 0) {
+				const content = doc.getText("content").toString();
+				if (content.length > 0) {
 					await YjsLocalCache.save(docId, doc);
 				}
+				await this.registerTextManifest(path, doc);
 			} catch (e) {
 				console.warn(`[DocManager] warmUp failed for ${path}`, e);
 			} finally {
@@ -310,6 +299,19 @@ export class DocManager {
 
 	private pathToDocId(path: string): string {
 		return `${this.app.vault.getName()}::${path}`;
+	}
+
+	private async registerTextManifest(path: string, doc: Y.Doc): Promise<void> {
+		const content = doc.getText("content").toString();
+		const hash = await sha256Utf8(content);
+		await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
+			convexSecret: this.convexSecret,
+			path: normalizePath(path),
+			contentHash: hash,
+			sizeBytes: new TextEncoder().encode(content).length,
+			updatedAtMs: Date.now(),
+			clientId: this.clientId,
+		});
 	}
 }
 

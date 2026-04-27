@@ -126,17 +126,105 @@ export const _createSnapshot = internalMutation({
 				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
 				.collect(),
 		]);
-		await Promise.all([
-			ctx.db.insert("yjsSnapshots", {
+		const primarySnapshot = existingSnapshots[0] ?? null;
+		if (primarySnapshot) {
+			await ctx.db.patch(primarySnapshot._id, {
+				fileId: args.fileId,
+			});
+		} else {
+			await ctx.db.insert("yjsSnapshots", {
 				docId: args.docId,
 				fileId: args.fileId,
-			}),
-			...updatesToDelete.map((u) => ctx.db.delete(u._id)),
-			...existingSnapshots.map(async (s) => {
-				await ctx.db.delete(s._id);
-				await ctx.storage.delete(s.fileId);
-			}),
+			});
+		}
+
+		await Promise.all(
+			updatesToDelete.map((u) => ctx.db.delete(u._id)),
+		);
+		if (primarySnapshot) {
+			await ctx.storage.delete(primarySnapshot.fileId);
+		}
+		for (const duplicate of existingSnapshots.slice(1)) {
+			await ctx.db.delete(duplicate._id);
+			await ctx.storage.delete(duplicate.fileId);
+		}
+		return null;
+	},
+});
+
+export const _listDocIdsWithPendingUpdates = internalQuery({
+	args: {},
+	returns: v.array(v.string()),
+	handler: async (ctx) => {
+		const updates = await ctx.db.query("yjsUpdates").collect();
+		return [...new Set(updates.map((row) => row.docId))];
+	},
+});
+
+export const _removeDoc = internalMutation({
+	args: { docId: v.string() },
+	returns: v.null(),
+	handler: async (ctx, args) => {
+		const [updates, snapshots] = await Promise.all([
+			ctx.db
+				.query("yjsUpdates")
+				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
+				.collect(),
+			ctx.db
+				.query("yjsSnapshots")
+				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
+				.collect(),
 		]);
+		for (const row of updates) {
+			await ctx.db.delete(row._id);
+		}
+		for (const snapshot of snapshots) {
+			await ctx.db.delete(snapshot._id);
+			await ctx.storage.delete(snapshot.fileId);
+		}
+		return null;
+	},
+});
+
+export const _removeDocsByPathSuffix = internalMutation({
+	args: { path: v.string() },
+	returns: v.null(),
+	handler: async (ctx, args) => {
+		const suffix = `::${args.path}`;
+		const [updates, snapshots] = await Promise.all([
+			ctx.db.query("yjsUpdates").collect(),
+			ctx.db.query("yjsSnapshots").collect(),
+		]);
+		const docIds = new Set<string>();
+		for (const row of updates) {
+			if (row.docId.endsWith(suffix)) {
+				docIds.add(row.docId);
+			}
+		}
+		for (const row of snapshots) {
+			if (row.docId.endsWith(suffix)) {
+				docIds.add(row.docId);
+			}
+		}
+		for (const docId of docIds) {
+			const [docUpdates, docSnapshots] = await Promise.all([
+				ctx.db
+					.query("yjsUpdates")
+					.withIndex("by_doc_id", (q) => q.eq("docId", docId))
+					.collect(),
+				ctx.db
+					.query("yjsSnapshots")
+					.withIndex("by_doc_id", (q) => q.eq("docId", docId))
+					.collect(),
+			]);
+			for (const row of docUpdates) {
+				await ctx.db.delete(row._id);
+			}
+			for (const snapshot of docSnapshots) {
+				await ctx.db.delete(snapshot._id);
+				await ctx.storage.delete(snapshot.fileId);
+			}
+		}
 		return null;
 	},
 });

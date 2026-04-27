@@ -97,6 +97,8 @@ async function writeLocalFile(app: App, path: string, bytes: ArrayBuffer): Promi
 export class BinarySyncManager {
 	private realtimeUnsub: (() => void) | null = null;
 	private readonly modifyDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly uploadsInFlight = new Set<string>();
+	private readonly pendingUploadPaths = new Set<string>();
 	private remoteFoldersDebounce: ReturnType<typeof setTimeout> | null = null;
 	/** Paths last seen as explicitly-empty on Convex; used to prune local folders when remote removes the row. */
 	private lastExplicitEmptyRemotePaths = new Set<string>();
@@ -231,15 +233,7 @@ export class BinarySyncManager {
 	async onLocalFileCreated(file: TFile): Promise<void> {
 		const path = normalizePath(file.path);
 		if (isTextSyncFile(path)) return;
-		const bytes = await this.app.vault.readBinary(file);
-		await uploadLocalFile(
-			this.httpClient,
-			this.convexSecret,
-			this.clientId,
-			path,
-			bytes,
-			file.stat.mtime,
-		);
+		await this.uploadPath(path, file);
 	}
 
 	async onLocalFileModified(file: TFile): Promise<void> {
@@ -251,7 +245,7 @@ export class BinarySyncManager {
 			path,
 			setTimeout(() => {
 				this.modifyDebounceTimers.delete(path);
-				void this.onLocalFileCreated(file);
+				void this.uploadPath(path, file);
 			}, 800),
 		);
 	}
@@ -289,6 +283,36 @@ export class BinarySyncManager {
 
 	async onLocalFolderRenamed(oldPath: string, newPath: string): Promise<void> {
 		await this.onLocalFolderDeleted(oldPath);
+		await this.onLocalFolderCreated(newPath);
+	}
+
+	private async uploadPath(path: string, fallbackFile?: TFile): Promise<void> {
+		if (this.uploadsInFlight.has(path)) {
+			this.pendingUploadPaths.add(path);
+			return;
+		}
+		this.uploadsInFlight.add(path);
+		try {
+			const abstract = this.app.vault.getAbstractFileByPath(path);
+			const liveFile = abstract instanceof TFile ? abstract : fallbackFile;
+			if (!liveFile || isTextSyncFile(path)) {
+				return;
+			}
+			const bytes = await this.app.vault.readBinary(liveFile);
+			await uploadLocalFile(
+				this.httpClient,
+				this.convexSecret,
+				this.clientId,
+				path,
+				bytes,
+				liveFile.stat.mtime,
+			);
+		} finally {
+			this.uploadsInFlight.delete(path);
+			if (this.pendingUploadPaths.delete(path)) {
+				void this.uploadPath(path);
+			}
+		}
 	}
 
 	dispose(): void {
@@ -300,6 +324,8 @@ export class BinarySyncManager {
 			clearTimeout(t);
 		}
 		this.modifyDebounceTimers.clear();
+		this.uploadsInFlight.clear();
+		this.pendingUploadPaths.clear();
 		this.realtimeUnsub?.();
 		this.realtimeUnsub = null;
 	}
