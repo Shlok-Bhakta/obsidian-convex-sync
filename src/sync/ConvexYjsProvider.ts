@@ -4,6 +4,18 @@ import type { api } from "../../convex/_generated/api";
 import * as Y from "yjs";
 
 type YjsApi = typeof api.yjs;
+type YjsInitAction = FunctionReference<
+	"action",
+	"public",
+	{ docId: string; stateVector: ArrayBuffer },
+	{ update: ArrayBuffer; serverStateVector: ArrayBuffer }
+>;
+type YjsPullAction = FunctionReference<
+	"action",
+	"public",
+	{ docId: string },
+	ArrayBuffer
+>;
 
 export class ConvexYjsProvider {
 	private readonly remoteOrigin = { source: "convex-yjs-provider" };
@@ -40,7 +52,7 @@ export class ConvexYjsProvider {
 	async init(): Promise<void> {
 		if (this.destroyed) return;
 		const initial = await this.client.action(
-			this.convexApi.init as FunctionReference<"action">,
+			this.convexApi.init as YjsInitAction,
 			{
 				docId: this.docId,
 				// Always request the full server update relative to an *empty* Y.Doc state vector
@@ -160,7 +172,7 @@ export class ConvexYjsProvider {
 		this.pullInFlight = true;
 		try {
 			const serverUpdate = await this.client.action(
-				this.convexApi.pull as FunctionReference<"action">,
+				this.convexApi.pull as YjsPullAction,
 				{ docId: this.docId },
 			);
 			if (this.destroyed) return;
@@ -190,5 +202,5 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 	return bytes.buffer.slice(
 		bytes.byteOffset,
 		bytes.byteOffset + bytes.byteLength,
-	) as ArrayBuffer;
+	);
 }

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import * as Y from "yjs";
 
 const refs = vi.hoisted(() => ({
 	internal: {
@@ -84,13 +85,20 @@ describe("convex/yjs snapshot lifecycle", () => {
 
 	it("orchestrates snapshot cleanup and chunk insertion from the action", async () => {
 		const calls: string[] = [];
-		const update = new Uint8Array([1, 2, 3]);
+		const doc = new Y.Doc();
+		doc.getText("content").insert(0, "hello");
+		const update = Y.encodeStateAsUpdate(doc);
+		doc.destroy();
+		let queryCount = 0;
 		const ctx = {
-			runQuery: vi.fn(async () => ({
-				page: [{ _creationTime: 123, update: update.buffer }],
-				isDone: true,
-				continueCursor: "end",
-			})),
+			runQuery: vi.fn(async () => {
+				queryCount += 1;
+				return {
+					page: queryCount === 1 ? [] : [{ _creationTime: 123, update: update.buffer }],
+					isDone: true,
+					continueCursor: "end",
+				};
+			}),
 			runMutation: vi.fn(async (ref: string) => {
 				calls.push(ref);
 				return false;
