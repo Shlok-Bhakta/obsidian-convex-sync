@@ -1,4 +1,5 @@
 import { ConvexHttpClient } from "convex/browser";
+import { createObsidianBackedFetch } from "./convex/obsidian-fetch";
 import type { MyPluginSettings } from "./settings";
 
 /**
@@ -14,7 +15,7 @@ export function createConvexHttpClient(
 			"Convex URL is empty. Open plugin settings and set Convex URL (deployment URL).",
 		);
 	}
-	return new ConvexHttpClient(url);
+	return new ConvexHttpClient(url, { fetch: createObsidianBackedFetch() });
 }
 
 /** Origin for Convex HTTP routes / actions (`CONVEX_SITE_URL`), no trailing slash. */

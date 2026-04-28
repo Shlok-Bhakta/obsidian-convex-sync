@@ -12,7 +12,9 @@ import type * as _lib_auth from "../_lib/auth.js";
 import type * as _lib_constants from "../_lib/constants.js";
 import type * as _lib_storage_finalize from "../_lib/storage_finalize.js";
 import type * as _lib_validators from "../_lib/validators.js";
+import type * as _lib_vaultFiles from "../_lib/vaultFiles.js";
 import type * as bootstrap from "../bootstrap.js";
+import type * as bootstrapArchive from "../bootstrapArchive.js";
 import type * as clients from "../clients.js";
 import type * as crons from "../crons.js";
 import type * as fileSync from "../fileSync.js";
@@ -20,8 +22,8 @@ import type * as http from "../http.js";
 import type * as nuke from "../nuke.js";
 import type * as pluginSecretMint from "../pluginSecretMint.js";
 import type * as security from "../security.js";
-import type * as yjs from "../yjs.js";
 import type * as yjsAwareness from "../yjsAwareness.js";
+import type * as yjsSync from "../yjsSync.js";
 
 import type {
   ApiFromModules,
@@ -34,7 +36,9 @@ declare const fullApi: ApiFromModules<{
   "_lib/constants": typeof _lib_constants;
   "_lib/storage_finalize": typeof _lib_storage_finalize;
   "_lib/validators": typeof _lib_validators;
+  "_lib/vaultFiles": typeof _lib_vaultFiles;
   bootstrap: typeof bootstrap;
+  bootstrapArchive: typeof bootstrapArchive;
   clients: typeof clients;
   crons: typeof crons;
   fileSync: typeof fileSync;
@@ -42,8 +46,8 @@ declare const fullApi: ApiFromModules<{
   nuke: typeof nuke;
   pluginSecretMint: typeof pluginSecretMint;
   security: typeof security;
-  yjs: typeof yjs;
   yjsAwareness: typeof yjsAwareness;
+  yjsSync: typeof yjsSync;
 }>;
 
 /**

@@ -209,7 +209,9 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			this.registerEvent(
 				this.app.workspace.on("file-open", (file) => {
 					if (file?.extension === "md") {
-						void this.docManager?.onFileOpen(file.path);
+						void this.docManager?.onFileOpen(file.path).catch((e: unknown) => {
+							console.warn("[DocManager] onFileOpen failed", e);
+						});
 					} else {
 						void this.docManager?.closeCurrentDoc();
 					}
@@ -217,7 +219,9 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 			);
 			const activeFile = this.app.workspace.getActiveFile();
 			if (activeFile?.extension === "md") {
-				void this.docManager.onFileOpen(activeFile.path);
+				void this.docManager.onFileOpen(activeFile.path).catch((e: unknown) => {
+					console.warn("[DocManager] onFileOpen (startup) failed", e);
+				});
 			}
 
 			this.registerDomEvent(window, "error", (evt: Event) => {
@@ -226,7 +230,9 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 					e.message ??
 					(e.error instanceof Error ? e.error.message : String(e.error ?? ""));
 				if (msg.includes("Invalid change range")) {
-					void this.docManager?.recoverFromEditorSyncDivergence();
+					void this.docManager?.recoverFromEditorSyncDivergence().catch((e: unknown) => {
+						console.warn("[DocManager] recoverFromEditorSyncDivergence", e);
+					});
 				}
 			});
 
@@ -244,6 +250,7 @@ export default class ObsidianConvexSyncPlugin extends Plugin {
 				async (paths: string[]) => {
 					await this.docManager?.pullRemoteTextFiles(paths);
 				},
+				this.settings,
 			);
 			void (async () => {
 				try {

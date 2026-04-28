@@ -62,7 +62,9 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Convex URL")
-			.setDesc("Deployment URL (CONVEX_URL).")
+			.setDesc(
+				"Deployment URL (CONVEX_URL). Convex HTTP uses Obsidian requestUrl, so browser CORS on app:// does not apply. If markdown live sync fails but vault file sync works, fix WSS through your proxy and origin timeouts (HTTP 524 usually means Cloudflare gave up waiting for your Convex origin).",
+			)
 			.addText((text) =>
 				text
 					.setPlaceholder("http://...")
@@ -131,6 +133,20 @@ export class ConvexSyncSettingTab extends PluginSettingTab {
 			.addText((text) => {
 				text.setValue(this.plugin.settings.convexSecret).setDisabled(true);
 			});
+
+		new Setting(containerEl)
+			.setName("Relax binary sync bandwidth pacing")
+			.setDesc(
+				"By default the plugin waits after each binary upload and briefly between download chunks so Convex Cloud deployments are less likely to hit write-throughput errors. Self-hosted or dedicated backends often have no such cap—enable this to remove those client-side delays. Chunk sizes still follow Convex action payload limits (not configurable from the plugin).",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.relaxBinarySyncBandwidthPacing)
+					.onChange(async (value) => {
+						this.plugin.settings.relaxBinarySyncBandwidthPacing = value;
+						await this.plugin.saveSettings();
+					}),
+			);
 
 		this.renderBootstrapSection(containerEl);
 		if (!this.hasHydratedBootstrapState) {

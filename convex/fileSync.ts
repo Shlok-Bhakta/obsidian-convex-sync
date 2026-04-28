@@ -8,21 +8,22 @@ import {
 } from "./_generated/server";
 import { paginationOptsValidator } from "convex/server";
 import { requirePluginSecret } from "./security";
+import { normalizeVaultPath, upsertTextVaultFile } from "./_lib/vaultFiles";
 
-type FileBytesResult = {
-	bytes: ArrayBuffer;
-	contentHash: string;
-	sizeBytes: number;
-	updatedAtMs: number;
-} | null;
+/** Convex action return payload must stay under ~16 MiB; keep chunks below that. */
+const DEFAULT_FILE_CHUNK_BYTES = 8 * 1024 * 1024;
+const MAX_FILE_CHUNK_BYTES = 12 * 1024 * 1024;
 
-function normalizePath(input: string): string {
-	const normalized = input.trim().replace(/\\/g, "/").replace(/^\/+/, "");
-	if (normalized.includes("..")) {
-		throw new ConvexError("Path traversal is not allowed.");
-	}
-	return normalized;
-}
+type GetFileBytesChunkResult =
+	| null
+	| {
+			bytes: ArrayBuffer;
+			contentHash: string;
+			sizeBytes: number;
+			updatedAtMs: number;
+			byteOffset: number;
+			isLast: boolean;
+	  };
 
 export const issueUploadUrl = mutation({
 	args: {
@@ -32,10 +33,13 @@ export const issueUploadUrl = mutation({
 		updatedAtMs: v.number(),
 		sizeBytes: v.number(),
 		clientId: v.string(),
+		/** Newer clients send these; ignored until versioning / kind routing is unified server-side. */
+		contentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		retainBinaryVersions: v.optional(v.number()),
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const path = normalizePath(args.path);
+		const path = normalizeVaultPath(args.path);
 		const existing = await ctx.db
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -66,10 +70,15 @@ export const finalizeUpload = mutation({
 		updatedAtMs: v.number(),
 		sizeBytes: v.number(),
 		clientId: v.string(),
+		/** When set, row is indexed as text vs binary (`isText`). Defaults to binary for older clients. */
+		contentKind: v.optional(v.union(v.literal("text"), v.literal("binary"))),
+		/** Reserved for future per-path binary version retention; accepted so clients do not fail validation. */
+		retainBinaryVersions: v.optional(v.number()),
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const path = normalizePath(args.path);
+		const path = normalizeVaultPath(args.path);
+		const isText = args.contentKind === "text";
 		const existing = await ctx.db
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -92,7 +101,7 @@ export const finalizeUpload = mutation({
 				sizeBytes: args.sizeBytes,
 				updatedAtMs: args.updatedAtMs,
 				updatedByClientId: args.clientId,
-				isText: false,
+				isText,
 			});
 		} else {
 			await ctx.db.insert("vaultFiles", {
@@ -102,7 +111,7 @@ export const finalizeUpload = mutation({
 				sizeBytes: args.sizeBytes,
 				updatedAtMs: args.updatedAtMs,
 				updatedByClientId: args.clientId,
-				isText: false,
+				isText,
 			});
 		}
 
@@ -125,33 +134,7 @@ export const registerTextFile = mutation({
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const path = normalizePath(args.path);
-		const existing = await ctx.db
-			.query("vaultFiles")
-			.withIndex("by_path", (q) => q.eq("path", path))
-			.unique();
-		if (existing) {
-			if (existing.storageId) {
-				await ctx.storage.delete(existing.storageId);
-			}
-			await ctx.db.patch(existing._id, {
-				contentHash: args.contentHash,
-				sizeBytes: args.sizeBytes,
-				updatedAtMs: args.updatedAtMs,
-				updatedByClientId: args.clientId,
-				isText: true,
-				storageId: undefined,
-			});
-		} else {
-			await ctx.db.insert("vaultFiles", {
-				path,
-				contentHash: args.contentHash,
-				sizeBytes: args.sizeBytes,
-				updatedAtMs: args.updatedAtMs,
-				updatedByClientId: args.clientId,
-				isText: true,
-			});
-		}
+		await upsertTextVaultFile(ctx, args);
 	},
 });
 
@@ -290,7 +273,7 @@ export const getDownloadUrl = query({
 	args: { convexSecret: v.string(), path: v.string() },
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const path = normalizePath(args.path);
+		const path = normalizeVaultPath(args.path);
 		const row = await ctx.db
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -314,7 +297,7 @@ export const getDownloadUrl = query({
 export const getRowByPath = internalQuery({
 	args: { path: v.string() },
 	handler: async (ctx, args) => {
-		const path = normalizePath(args.path);
+		const path = normalizeVaultPath(args.path);
 		return await ctx.db
 			.query("vaultFiles")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -322,8 +305,17 @@ export const getRowByPath = internalQuery({
 	},
 });
 
-export const getFileBytes = action({
-	args: { convexSecret: v.string(), path: v.string() },
+/**
+ * Reads a byte range from file storage (fallback when signed URL download fails).
+ * Use sequential chunks; each response stays under the Convex action size limit.
+ */
+export const getFileBytesChunk = action({
+	args: {
+		convexSecret: v.string(),
+		path: v.string(),
+		byteOffset: v.number(),
+		maxBytes: v.optional(v.number()),
+	},
 	returns: v.union(
 		v.null(),
 		v.object({
@@ -331,31 +323,60 @@ export const getFileBytes = action({
 			contentHash: v.string(),
 			sizeBytes: v.number(),
 			updatedAtMs: v.number(),
+			byteOffset: v.number(),
+			isLast: v.boolean(),
 		}),
 	),
-	handler: async (ctx, args): Promise<FileBytesResult> => {
+	handler: async (ctx, args): Promise<GetFileBytesChunkResult> => {
 		const auth = await ctx.runQuery(internal.security.validatePluginSecret, {
 			secret: args.convexSecret,
 		});
 		if (!auth.ok) {
 			throw new Error("The vault API key is invalid for this Convex deployment.");
 		}
-		const path = normalizePath(args.path);
-		const row = await ctx.runQuery((internal as any).fileSync.getRowByPath, {
+		if (args.byteOffset < 0 || !Number.isFinite(args.byteOffset)) {
+			throw new ConvexError("byteOffset must be a non-negative finite number.");
+		}
+		const requested =
+			args.maxBytes === undefined
+				? DEFAULT_FILE_CHUNK_BYTES
+				: Math.min(MAX_FILE_CHUNK_BYTES, Math.max(1, args.maxBytes));
+		const path = normalizeVaultPath(args.path);
+		const row = await ctx.runQuery(internal.fileSync.getRowByPath, {
 			path,
 		});
 		if (!row || !row.storageId) {
 			return null;
 		}
-		const blob = await ctx.storage.get(row.storageId as never);
+		const blob = await ctx.storage.get(row.storageId);
 		if (!blob) {
 			return null;
 		}
+		const totalSize =
+			typeof blob.size === "number" && blob.size > 0 ? blob.size : row.sizeBytes;
+		if (totalSize === 0 && args.byteOffset === 0) {
+			return {
+				bytes: new ArrayBuffer(0),
+				contentHash: row.contentHash,
+				sizeBytes: 0,
+				updatedAtMs: row.updatedAtMs,
+				byteOffset: 0,
+				isLast: true,
+			};
+		}
+		if (args.byteOffset >= totalSize) {
+			return null;
+		}
+		const end = Math.min(args.byteOffset + requested, totalSize);
+		const slice = blob.slice(args.byteOffset, end);
+		const bytes = await slice.arrayBuffer();
 		return {
-			bytes: await blob.arrayBuffer(),
+			bytes,
 			contentHash: row.contentHash,
-			sizeBytes: row.sizeBytes,
+			sizeBytes: totalSize,
 			updatedAtMs: row.updatedAtMs,
+			byteOffset: args.byteOffset,
+			isLast: end >= totalSize,
 		};
 	},
 });
@@ -370,7 +391,7 @@ export const syncFolderState = mutation({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const normalizedEmpty = new Set(
-			args.emptyFolderPaths.map((path) => normalizePath(path)),
+			args.emptyFolderPaths.map((path) => normalizeVaultPath(path)),
 		);
 		const existing = await ctx.db.query("vaultFolders").collect();
 		for (const folder of existing) {
@@ -412,7 +433,7 @@ export const removeFilesByPath = mutation({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		const normalizedPaths = new Set(
-			args.removedPaths.map((path) => normalizePath(path)),
+			args.removedPaths.map((path) => normalizeVaultPath(path)),
 		);
 		for (const path of normalizedPaths) {
 			const row = await ctx.db
@@ -427,7 +448,7 @@ export const removeFilesByPath = mutation({
 			}
 			await ctx.db.delete(row._id);
 			if (row.isText) {
-				await ctx.scheduler.runAfter(0, internal.yjs._removeDocsByPathSuffix, {
+				await ctx.scheduler.runAfter(0, internal.yjsSync._removeDocsByPathSuffix, {
 					path,
 				});
 			}
@@ -443,7 +464,7 @@ export const removeFoldersByPath = mutation({
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
 		for (const raw of args.removedPaths) {
-			const path = normalizePath(raw);
+			const path = normalizeVaultPath(raw);
 			const existing = await ctx.db
 				.query("vaultFolders")
 				.withIndex("by_path", (q) => q.eq("path", path))
@@ -469,11 +490,13 @@ export const listAllMetadata = query({
 				path: f.path,
 				contentHash: f.contentHash,
 				updatedAtMs: f.updatedAtMs,
+				updatedByClientId: f.updatedByClientId,
 				isText: f.isText,
 			})),
 			folders: folders.map((f) => ({
 				path: f.path,
 				updatedAtMs: f.updatedAtMs,
+				updatedByClientId: f.updatedByClientId ?? "",
 				isExplicitlyEmpty: f.isExplicitlyEmpty,
 			})),
 		};
@@ -500,12 +523,14 @@ export const listAllChangesSince = query({
 				path: f.path,
 				contentHash: f.contentHash,
 				updatedAtMs: f.updatedAtMs,
+				updatedByClientId: f.updatedByClientId,
 				isText: f.isText,
 				sizeBytes: f.sizeBytes,
 			})),
 			folders: folders.map((f) => ({
 				path: f.path,
 				updatedAtMs: f.updatedAtMs,
+				updatedByClientId: f.updatedByClientId ?? "",
 				isExplicitlyEmpty: f.isExplicitlyEmpty,
 			})),
 		};
@@ -531,7 +556,7 @@ export const registerExplicitEmptyFolder = mutation({
 	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const path = normalizePath(args.path);
+		const path = normalizeVaultPath(args.path);
 		const existing = await ctx.db
 			.query("vaultFolders")
 			.withIndex("by_path", (q) => q.eq("path", path))
@@ -553,3 +578,26 @@ export const registerExplicitEmptyFolder = mutation({
 	},
 });
 
+export const getTextFileState = query({
+	args: {
+		convexSecret: v.string(),
+		path: v.string(),
+	},
+	handler: async (ctx, args) => {
+		await requirePluginSecret(ctx, args.convexSecret);
+		const row = await ctx.db
+			.query("vaultFiles")
+			.withIndex("by_path", (q) => q.eq("path", normalizeVaultPath(args.path)))
+			.unique();
+		if (!row || !row.isText) {
+			return null;
+		}
+		return {
+			path: row.path,
+			contentHash: row.contentHash,
+			sizeBytes: row.sizeBytes,
+			updatedAtMs: row.updatedAtMs,
+			updatedByClientId: row.updatedByClientId,
+		};
+	},
+});

@@ -11,6 +11,12 @@ type VaultCrudEventDeps = {
 	getBinarySync: () => BinarySyncManager | null;
 };
 
+function voidBinary(p: Promise<void> | undefined): void {
+	void p?.catch((e: unknown) => {
+		console.warn("[BinarySync] vault event handler failed", e);
+	});
+}
+
 export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 	deps.registerEvent(
 		deps.vault.on("create", (abstractFile) => {
@@ -18,19 +24,23 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 				if (abstractFile.extension === "md") {
 					void (async () => {
 						const docManager = deps.getDocManager();
-						await docManager?.onFileCreated(abstractFile.path);
-						// Some note-creation flows may not emit a reliable file-open event.
-						// If the created note is already active, bind Yjs immediately.
-						const activeFile = deps.getActiveFile();
-						if (activeFile?.path === abstractFile.path) {
-							await docManager?.onFileOpen(abstractFile.path);
+						try {
+							await docManager?.onFileCreated(abstractFile.path);
+							// Some note-creation flows may not emit a reliable file-open event.
+							// If the created note is already active, bind Yjs immediately.
+							const activeFile = deps.getActiveFile();
+							if (activeFile?.path === abstractFile.path) {
+								await docManager?.onFileOpen(abstractFile.path);
+							}
+						} catch (e: unknown) {
+							console.warn("[DocManager] vault create handler failed", e);
 						}
 					})();
 				} else {
-					void deps.getBinarySync()?.onLocalFileCreated(abstractFile);
+					voidBinary(deps.getBinarySync()?.onLocalFileCreated(abstractFile));
 				}
 			} else if (abstractFile instanceof TFolder) {
-				void deps.getBinarySync()?.onLocalFolderCreated(abstractFile.path);
+				voidBinary(deps.getBinarySync()?.onLocalFolderCreated(abstractFile.path));
 			}
 		}),
 	);
@@ -39,9 +49,11 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 			if (abstractFile instanceof TFile) {
 				const path = normalizePath(abstractFile.path);
 				if (isTextSyncFile(path)) {
-					void deps.getDocManager()?.onFileModified(path);
+					void deps.getDocManager()?.onFileModified(path).catch((e: unknown) => {
+						console.warn("[DocManager] onFileModified failed", e);
+					});
 				} else {
-					void deps.getBinarySync()?.onLocalFileModified(abstractFile);
+					voidBinary(deps.getBinarySync()?.onLocalFileModified(abstractFile));
 				}
 			}
 		}),
@@ -50,21 +62,26 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 		deps.vault.on("rename", (abstractFile, oldPath) => {
 			if (abstractFile instanceof TFile) {
 				if (abstractFile.extension === "md") {
+					deps.getBinarySync()?.noteLocalDeletePending(normalizePath(oldPath));
 					void (async () => {
 						const docManager = deps.getDocManager();
-						await docManager?.onFileRenamed(oldPath, abstractFile.path);
-						// Name-edit rename may leave the file active without a follow-up file-open.
-						// Ensure the renamed active note is immediately bound for live sync.
-						const activeFile = deps.getActiveFile();
-						if (activeFile?.path === abstractFile.path) {
-							await docManager?.onFileOpen(abstractFile.path);
+						try {
+							await docManager?.onFileRenamed(oldPath, abstractFile.path);
+							// Name-edit rename may leave the file active without a follow-up file-open.
+							// Ensure the renamed active note is immediately bound for live sync.
+							const activeFile = deps.getActiveFile();
+							if (activeFile?.path === abstractFile.path) {
+								await docManager?.onFileOpen(abstractFile.path);
+							}
+						} catch (e: unknown) {
+							console.warn("[DocManager] vault rename handler failed", e);
 						}
 					})();
 				} else {
-					void deps.getBinarySync()?.onLocalFileRenamed(oldPath, abstractFile);
+					voidBinary(deps.getBinarySync()?.onLocalFileRenamed(oldPath, abstractFile));
 				}
 			} else if (abstractFile instanceof TFolder) {
-				void deps.getBinarySync()?.onLocalFolderRenamed(oldPath, abstractFile.path);
+				voidBinary(deps.getBinarySync()?.onLocalFolderRenamed(oldPath, abstractFile.path));
 			}
 		}),
 	);
@@ -72,12 +89,15 @@ export function registerVaultCrudEventHandlers(deps: VaultCrudEventDeps): void {
 		deps.vault.on("delete", (abstractFile) => {
 			if (abstractFile instanceof TFile) {
 				if (abstractFile.extension === "md") {
-					void deps.getDocManager()?.onFileDeleted(abstractFile.path);
+					deps.getBinarySync()?.noteLocalDeletePending(normalizePath(abstractFile.path));
+					void deps.getDocManager()?.onFileDeleted(abstractFile.path).catch((e: unknown) => {
+						console.warn("[DocManager] onFileDeleted failed", e);
+					});
 				} else {
-					void deps.getBinarySync()?.onLocalFileDeleted(abstractFile.path);
+					voidBinary(deps.getBinarySync()?.onLocalFileDeleted(abstractFile.path));
 				}
 			} else if (abstractFile instanceof TFolder) {
-				void deps.getBinarySync()?.onLocalFolderDeleted(abstractFile.path);
+				voidBinary(deps.getBinarySync()?.onLocalFolderDeleted(abstractFile.path));
 			}
 		}),
 	);

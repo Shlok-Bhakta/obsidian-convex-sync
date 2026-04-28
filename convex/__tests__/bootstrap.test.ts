@@ -1,22 +1,23 @@
-import { describe, expect, it, vi } from "vitest";
+import { Readable, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const refs = vi.hoisted(() => ({
 	internal: {
-		yjs: {
-			_listDocIdsWithPendingUpdates: "internal.yjs._listDocIdsWithPendingUpdates",
-			_snapshotUpdates: "internal.yjs._snapshotUpdates",
+		yjsSync: {
+			_snapshotUpdates: "internal.yjsSync._snapshotUpdates",
+			_readTextForBootstrap: "internal.yjsSync._readTextForBootstrap",
 		},
 		bootstrap: {
-			_readSnapshot: "internal.bootstrap._readSnapshot",
+			_readFilePage: "internal.bootstrap._readFilePage",
+			issueZipUploadUrl: "internal.bootstrap.issueZipUploadUrl",
 			updateProgress: "internal.bootstrap.updateProgress",
 			finalizeArchive: "internal.bootstrap.finalizeArchive",
 			failBuild: "internal.bootstrap.failBuild",
 		},
 	},
 	api: {
-		yjs: {
-			init: "api.yjs.init",
-		},
+		yjsSync: {},
 	},
 }));
 
@@ -35,11 +36,31 @@ vi.mock("../security", () => ({
 	requirePluginSecret: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock("fflate", () => ({
-	zipSync: vi.fn(() => new Uint8Array([80, 75, 3, 4])),
-}));
+import { buildArchive } from "../bootstrapArchive";
 
-import { buildArchive } from "../bootstrap";
+function mockZipUpload() {
+	vi.stubGlobal(
+		"fetch",
+		vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+			const body = init?.body;
+			if (body instanceof Readable) {
+				await pipeline(
+					body,
+					new Writable({
+						write(_chunk, _enc, cb) {
+							cb();
+						},
+					}),
+				);
+			}
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({ storageId: "zip-storage" }),
+			};
+		}),
+	);
+}
 
 type Handler<Args, Result> = (ctx: unknown, args: Args) => Promise<Result>;
 
@@ -52,34 +73,40 @@ function invokeHandler<Args, Result>(
 }
 
 describe("convex/bootstrap", () => {
-	it("snapshots pending updates before reading file snapshot", async () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("pages files and reads text without preflushing dirty Yjs docs", async () => {
+		mockZipUpload();
 		const calls: string[] = [];
 		const ctx = {
 			runQuery: vi.fn(async (ref: string) => {
 				calls.push(`query:${ref}`);
-				if (ref === refs.internal.yjs._listDocIdsWithPendingUpdates) {
-					return ["vault::notes/test.md"];
-				}
-				if (ref === refs.internal.bootstrap._readSnapshot) {
+				if (ref === refs.internal.bootstrap._readFilePage) {
 					return {
-						files: [{ path: "notes/test.md", isText: true, sizeBytes: 0 }],
+						page: [{ path: "notes/test.md", isText: true, sizeBytes: 0 }],
+						isDone: true,
+						continueCursor: "end",
 					};
 				}
 				return null;
 			}),
 			runAction: vi.fn(async (ref: string) => {
 				calls.push(`action:${ref}`);
-				if (ref === refs.api.yjs.init) {
-					return { update: new ArrayBuffer(0), serverStateVector: new ArrayBuffer(0) };
+				if (ref === refs.internal.yjsSync._readTextForBootstrap) {
+					return "hello";
 				}
 				return null;
 			}),
 			runMutation: vi.fn(async (ref: string) => {
 				calls.push(`mutation:${ref}`);
+				if (ref === refs.internal.bootstrap.issueZipUploadUrl) {
+					return { uploadUrl: "https://example/upload" };
+				}
 				return null;
 			}),
 			storage: {
-				store: vi.fn().mockResolvedValue("storage-zip"),
 				get: vi.fn(),
 			},
 		};
@@ -90,34 +117,41 @@ describe("convex/bootstrap", () => {
 			vaultName: "vault",
 		});
 
-		expect(calls.indexOf(`action:${refs.internal.yjs._snapshotUpdates}`)).toBeGreaterThan(-1);
-		expect(calls.indexOf(`query:${refs.internal.bootstrap._readSnapshot}`)).toBeGreaterThan(
-			calls.indexOf(`action:${refs.internal.yjs._snapshotUpdates}`),
+		expect(calls).not.toContain(`action:${refs.internal.yjsSync._snapshotUpdates}`);
+		expect(calls.filter((call) => call === `query:${refs.internal.bootstrap._readFilePage}`)).toHaveLength(2);
+		expect(
+			calls.indexOf(`action:${refs.internal.yjsSync._readTextForBootstrap}`),
+		).toBeGreaterThan(
+			calls.indexOf(`query:${refs.internal.bootstrap._readFilePage}`),
 		);
 	});
 
 	it("handles missing Yjs state without failing build", async () => {
+		mockZipUpload();
 		const ctx = {
 			runQuery: vi.fn(async (ref: string) => {
-				if (ref === refs.internal.yjs._listDocIdsWithPendingUpdates) {
-					return [];
-				}
-				if (ref === refs.internal.bootstrap._readSnapshot) {
+				if (ref === refs.internal.bootstrap._readFilePage) {
 					return {
-						files: [{ path: "notes/orphan.md", isText: true, sizeBytes: 10 }],
+						page: [{ path: "notes/orphan.md", isText: true, sizeBytes: 10 }],
+						isDone: true,
+						continueCursor: "end",
 					};
 				}
 				return null;
 			}),
 			runAction: vi.fn(async (ref: string) => {
-				if (ref === refs.api.yjs.init) {
-					return { update: new ArrayBuffer(0), serverStateVector: new ArrayBuffer(0) };
+				if (ref === refs.internal.yjsSync._readTextForBootstrap) {
+					return "";
 				}
 				return null;
 			}),
-			runMutation: vi.fn(async () => null),
+			runMutation: vi.fn(async (ref: string) => {
+				if (ref === refs.internal.bootstrap.issueZipUploadUrl) {
+					return { uploadUrl: "https://example/upload" };
+				}
+				return null;
+			}),
 			storage: {
-				store: vi.fn().mockResolvedValue("zip-storage"),
 				get: vi.fn(),
 			},
 		};

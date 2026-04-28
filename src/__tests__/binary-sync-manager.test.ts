@@ -56,6 +56,7 @@ vi.mock("../file-sync", async () => {
 });
 
 import { TFile } from "obsidian";
+import { DEFAULT_SETTINGS } from "../settings/index";
 import { BinarySyncManager } from "../sync/binary-sync-manager";
 import { del, keys, set } from "idb-keyval";
 
@@ -85,6 +86,7 @@ describe("BinarySyncManager", () => {
 			"secret",
 			"client",
 			async () => {},
+			{ ...DEFAULT_SETTINGS },
 		);
 
 		await manager.onLocalFolderRenamed("old/folder", "new/folder");
@@ -130,6 +132,7 @@ describe("BinarySyncManager", () => {
 			"secret",
 			"client",
 			async () => {},
+			{ ...DEFAULT_SETTINGS },
 		);
 
 		const createPromise = manager.onLocalFileCreated(liveFile);
@@ -150,7 +153,13 @@ describe("BinarySyncManager", () => {
 		}
 		const queryMock = vi.fn().mockResolvedValue({
 			files: [
-				{ path: ".obsidian/workspace.json", contentHash: "hash-a", updatedAtMs: 1, isText: false },
+				{
+					path: ".obsidian/workspace.json",
+					contentHash: "hash-a",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: false,
+				},
 			],
 			folders: [],
 		});
@@ -176,6 +185,7 @@ describe("BinarySyncManager", () => {
 			"secret",
 			"client",
 			async () => {},
+			{ ...DEFAULT_SETTINGS },
 		);
 
 		await set("binarySync:hash:.obsidian/workspace.json", "hash-a");
@@ -187,13 +197,56 @@ describe("BinarySyncManager", () => {
 					path: string;
 					contentHash: string;
 					updatedAtMs: number;
+					updatedByClientId: string;
 					isText: boolean;
 				}>;
-				folders: Array<{ path: string; updatedAtMs: number; isExplicitlyEmpty: boolean }>;
+				folders: Array<{
+					path: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isExplicitlyEmpty: boolean;
+				}>;
 			}) => Promise<void>;
 		}).onRemoteMetadata({
 			files: [
-				{ path: ".obsidian/workspace.json", contentHash: "hash-a", updatedAtMs: 20, isText: false },
+				{
+					path: ".obsidian/workspace.json",
+					contentHash: "hash-a",
+					updatedAtMs: 20,
+					updatedByClientId: "remote",
+					isText: false,
+				},
+			],
+			folders: [],
+		});
+		expect(noticeMock).not.toHaveBeenCalled();
+
+		// Baseline snapshot: same remote hash again should remain quiet.
+		await (manager as unknown as {
+			onRemoteMetadata: (remote: {
+				files: Array<{
+					path: string;
+					contentHash: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isText: boolean;
+				}>;
+				folders: Array<{
+					path: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isExplicitlyEmpty: boolean;
+				}>;
+			}) => Promise<void>;
+		}).onRemoteMetadata({
+			files: [
+				{
+					path: ".obsidian/workspace.json",
+					contentHash: "hash-a",
+					updatedAtMs: 21,
+					updatedByClientId: "remote",
+					isText: false,
+				},
 			],
 			folders: [],
 		});
@@ -206,16 +259,130 @@ describe("BinarySyncManager", () => {
 					path: string;
 					contentHash: string;
 					updatedAtMs: number;
+					updatedByClientId: string;
 					isText: boolean;
 				}>;
-				folders: Array<{ path: string; updatedAtMs: number; isExplicitlyEmpty: boolean }>;
+				folders: Array<{
+					path: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isExplicitlyEmpty: boolean;
+				}>;
 			}) => Promise<void>;
 		}).onRemoteMetadata({
 			files: [
-				{ path: ".obsidian/workspace.json", contentHash: "hash-b", updatedAtMs: 30, isText: false },
+				{
+					path: ".obsidian/workspace.json",
+					contentHash: "hash-b",
+					updatedAtMs: 30,
+					updatedByClientId: "remote",
+					isText: false,
+				},
 			],
 			folders: [],
 		});
 		expect(noticeMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not repull text paths while local delete is pending remote ack", async () => {
+		const pulled: string[] = [];
+		const queryMock = vi.fn().mockResolvedValue({
+			files: [
+				{
+					path: "gone.md",
+					contentHash: "h1",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: true,
+				},
+			],
+			folders: [],
+		});
+		const manager = new BinarySyncManager(
+			{
+				vault: {
+					readBinary: readBinaryMock,
+					getAbstractFileByPath: vi.fn().mockReturnValue(undefined),
+					adapter: {
+						exists: vi.fn(),
+						remove: vi.fn().mockResolvedValue(undefined),
+					},
+					createFolder: vi.fn(),
+					delete: vi.fn(),
+				},
+			} as never,
+			{ query: queryMock, mutation: mutationMock } as never,
+			{ onUpdate: vi.fn() } as never,
+			"secret",
+			"client",
+			async (paths: string[]) => {
+				pulled.push(...paths);
+			},
+			{ ...DEFAULT_SETTINGS },
+		);
+
+		const onRemoteMetadata = (manager as unknown as {
+			onRemoteMetadata: (remote: {
+				files: Array<{
+					path: string;
+					contentHash: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isText: boolean;
+				}>;
+				folders: Array<{
+					path: string;
+					updatedAtMs: number;
+					updatedByClientId: string;
+					isExplicitlyEmpty: boolean;
+				}>;
+			}) => Promise<void>;
+		}).onRemoteMetadata;
+
+		await onRemoteMetadata.call(manager, {
+			files: [
+				{
+					path: "gone.md",
+					contentHash: "h1",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: true,
+				},
+			],
+			folders: [],
+		});
+		expect(pulled).toEqual(["gone.md"]);
+
+		manager.noteLocalDeletePending("gone.md");
+		await onRemoteMetadata.call(manager, {
+			files: [
+				{
+					path: "gone.md",
+					contentHash: "h1",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: true,
+				},
+			],
+			folders: [],
+		});
+		expect(pulled).toEqual(["gone.md"]);
+
+		await onRemoteMetadata.call(manager, { files: [], folders: [] });
+		expect(pulled).toEqual(["gone.md"]);
+
+		await onRemoteMetadata.call(manager, {
+			files: [
+				{
+					path: "gone.md",
+					contentHash: "h1",
+					updatedAtMs: 1,
+					updatedByClientId: "remote",
+					isText: true,
+				},
+			],
+			folders: [],
+		});
+		expect(pulled).toEqual(["gone.md", "gone.md"]);
 	});
 });

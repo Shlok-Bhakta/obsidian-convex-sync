@@ -9,6 +9,12 @@ import type { api } from "../../convex/_generated/api";
 import { ConvexAwarenessSync } from "./convex-awareness-sync";
 import { ConvexYjsProvider } from "./ConvexYjsProvider";
 import { flushYjsTextToActiveMarkdownEditor } from "./flush-ytext-to-cm";
+import { isLocalChangeSuppressed, withSuppressedLocalChange } from "./local-change-suppressor";
+import {
+	pushTextContentSnapshot,
+	readRemoteTextContent,
+} from "./text-sync-transport";
+import { createTextYDoc, textDocIdForPath } from "./text-sync-shared";
 import { YjsLocalCache } from "./yjs-local-cache";
 
 type DocEntry = {
@@ -19,6 +25,8 @@ type DocEntry = {
 	awarenessSync: ConvexAwarenessSync | null;
 	/** Guards against stale remote awareness cursor offsets crashing CodeMirror. */
 	awarenessSanitizer: ((event: { added: number[]; updated: number[]; removed: number[] }) => void) | null;
+	/** Clears the debounced persist timer so a late fire cannot resurrect a deleted/renamed path on Convex. */
+	cancelPersistDebounced: () => void;
 };
 
 export class DocManager {
@@ -28,8 +36,10 @@ export class DocManager {
 	private currentPath: string | null = null;
 	private destroyed = false;
 	private recoveringFromDivergence = false;
-	/** Paths currently being pulled from remote; suppresses onFileCreated empty-manifest registration. */
+	/** Paths currently being pulled from remote; prevents overlapping remote fetches for the same path. */
 	readonly pullingRemotePaths = new Set<string>();
+	/** Prevents overlapping `pullRemoteTextFile` runs for the same path (subscription bursts / catch-up races). */
+	private readonly activeRemoteTextPulls = new Set<string>();
 
 	/** Current Yjs awareness for the open collaborative doc (sidebar presence merge). */
 	getCurrentAwareness(): Awareness | null {
@@ -45,10 +55,17 @@ export class DocManager {
 	) {}
 
 	async onFileOpen(path: string): Promise<void> {
-		if (path === this.currentPath) return;
+		const normPath = normalizePath(path);
+		if (this.currentPath != null && normalizePath(this.currentPath) === normPath) {
+			return;
+		}
 		await this.closeCurrentDoc();
 
-		const docId = this.pathToDocId(path);
+		// Reserve immediately after close so background text pulls skip `vault.modify` for this
+		// path during cache load + Convex init (avoids CM/Yjs seeing repeated disk writes).
+		this.currentPath = normPath;
+
+		const docId = this.pathToDocId(normPath);
 		const doc = new Y.Doc();
 		const cachedDoc = new Y.Doc();
 		const awareness = new Awareness(doc);
@@ -60,8 +77,11 @@ export class DocManager {
 		const provider = new ConvexYjsProvider(
 			this.client,
 			docId,
+			normPath,
 			doc,
-			this.convexApi.yjs,
+			this.convexApi,
+			this.convexSecret,
+			this.clientId,
 		);
 		provider.onDivergence = () => {
 			void this.recoverFromEditorSyncDivergence();
@@ -72,6 +92,15 @@ export class DocManager {
 			if (cacheDelta.byteLength > 0) {
 				Y.applyUpdate(doc, cacheDelta);
 			}
+		} catch (e: unknown) {
+			console.warn(
+				"[DocManager] Convex Yjs init failed after retries; opening from local cache until the connection recovers",
+				e,
+			);
+			const fromCache = Y.encodeStateAsUpdate(cachedDoc);
+			if (fromCache.byteLength > 0) {
+				Y.applyUpdate(doc, fromCache);
+			}
 		} finally {
 			cachedDoc.destroy();
 		}
@@ -80,24 +109,16 @@ export class DocManager {
 			name: this.clientId.slice(0, 8),
 			color: hashColor(this.clientId),
 		});
-		awareness.setLocalStateField("openFilePath", path);
+		awareness.setLocalStateField("openFilePath", normPath);
 
-		const persistDocAndManifest = debounce(async () => {
-			await YjsLocalCache.save(docId, doc);
-			const content = doc.getText("content").toString();
-			const hash = await sha256Utf8(content);
-			await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
-				convexSecret: this.convexSecret,
-				path: normalizePath(path),
-				contentHash: hash,
-				sizeBytes: new TextEncoder().encode(content).length,
-				updatedAtMs: Date.now(),
-				clientId: this.clientId,
-			});
-		}, 500);
+		const { schedule: schedulePersist, cancel: cancelPersistDebounced } =
+			debounceWithCancel(async () => {
+				if (this.destroyed || this.currentPath !== normPath) return;
+				await YjsLocalCache.save(docId, doc);
+			}, 500);
 
 		doc.on("update", () => {
-			persistDocAndManifest();
+			schedulePersist();
 		});
 
 		const ytext = doc.getText("content");
@@ -154,16 +175,16 @@ export class DocManager {
 			provider,
 			awarenessSync: null,
 			awarenessSanitizer,
+			cancelPersistDebounced,
 		};
 		this.current = entry;
-		this.currentPath = path;
 
 		this.extensions.length = 0;
 		this.extensions.push(yCollab(ytext, awareness));
 		this.app.workspace.updateOptions();
 		// Convex init ran before yCollab existed, so CM never received a Y→CM observe callback.
 		// Flush once now (and again after startSync) so disk cannot sit stale vs Y or poison Y via CM→Y.
-		flushYjsTextToActiveMarkdownEditor(this.app, path, ytext);
+		flushYjsTextToActiveMarkdownEditor(this.app, normPath, ytext);
 
 		// Remote Yjs and awareness rows may arrive in the same turn as setup.
 		// Defer until after CM has applied yCollab so editor length matches Y.Text.
@@ -172,7 +193,7 @@ export class DocManager {
 			if (this.destroyed || this.current !== entry || awarenessAttached) return;
 			awarenessAttached = true;
 			provider.startSync();
-			flushYjsTextToActiveMarkdownEditor(this.app, path, ytext);
+			flushYjsTextToActiveMarkdownEditor(this.app, normPath, ytext);
 			entry.awarenessSync =
 				this.convexSecret.trim() !== ""
 					? new ConvexAwarenessSync(
@@ -200,6 +221,8 @@ export class DocManager {
 			console.warn("[DocManager] Yjs/CodeMirror divergence — re-syncing from server");
 			await this.closeCurrentDoc();
 			await this.onFileOpen(path);
+		} catch (e: unknown) {
+			console.warn("[DocManager] recoverFromEditorSyncDivergence failed", e);
 		} finally {
 			this.recoveringFromDivergence = false;
 		}
@@ -207,9 +230,11 @@ export class DocManager {
 
 	async closeCurrentDoc(): Promise<void> {
 		if (!this.current) return;
-		const { doc, awareness, provider, awarenessSync, awarenessSanitizer } = this.current;
+		const { doc, awareness, provider, awarenessSync, awarenessSanitizer, cancelPersistDebounced } =
+			this.current;
+		cancelPersistDebounced();
 		if (this.currentPath) {
-			await this.registerTextManifest(this.currentPath, doc);
+			await provider.flush();
 			await YjsLocalCache.save(this.pathToDocId(this.currentPath), doc);
 		}
 		if (awarenessSync) {
@@ -237,34 +262,14 @@ export class DocManager {
 
 	/** Register a new Markdown file on the server using current disk content before first open. */
 	async onFileCreated(path: string): Promise<void> {
-		if (this.pullingRemotePaths.has(path)) return;
 		const norm = normalizePath(path);
+		if (this.pullingRemotePaths.has(norm) || isLocalChangeSuppressed(norm)) return;
 		const abstract = this.app.vault.getAbstractFileByPath(norm);
-		if (!(abstract instanceof TFile) || abstract.extension !== "md") {
-			const emptyHash = await sha256Utf8("");
-			await this.registerTextManifestContent(path, emptyHash, 0);
-			return;
-		}
-		const content = await this.app.vault.cachedRead(abstract);
-		if (content.length === 0) {
-			const emptyHash = await sha256Utf8("");
-			await this.registerTextManifestContent(path, emptyHash, 0);
-			return;
-		}
-
-		const docId = this.pathToDocId(path);
-		const doc = new Y.Doc();
-		doc.getText("content").insert(0, content);
-		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjs);
-		try {
-			await provider.init();
-			await provider.pushFullState();
-			await YjsLocalCache.save(docId, doc);
-			await this.registerTextManifest(path, doc);
-		} finally {
-			provider.destroy();
-			doc.destroy();
-		}
+		const content =
+			abstract instanceof TFile && abstract.extension === "md"
+				? await this.app.vault.cachedRead(abstract)
+				: "";
+		await this.pushDiskSnapshot(norm, content);
 	}
 
 	/**
@@ -272,7 +277,14 @@ export class DocManager {
 	 * Yjs doc wiring (for example during startup races on newly created notes).
 	 */
 	async onFileModified(path: string): Promise<void> {
-		if (this.currentPath === path && this.current) {
+		if (
+			this.current != null &&
+			this.currentPath != null &&
+			normalizePath(this.currentPath) === normalizePath(path)
+		) {
+			return;
+		}
+		if (isLocalChangeSuppressed(path)) {
 			return;
 		}
 		const abstract = this.app.vault.getAbstractFileByPath(path);
@@ -280,66 +292,30 @@ export class DocManager {
 			return;
 		}
 		const content = await this.app.vault.cachedRead(abstract);
-		const hash = await sha256Utf8(content);
-		await this.registerTextManifestContent(
-			path,
-			hash,
-			new TextEncoder().encode(content).length,
-		);
+		await this.pushDiskSnapshot(path, content, abstract.stat.mtime);
 	}
 
 	async onFileRenamed(oldPath: string, newPath: string): Promise<void> {
 		const oldDocId = this.pathToDocId(oldPath);
-		const newDocId = this.pathToDocId(newPath);
-		const wasCurrentDoc = this.currentPath === oldPath;
+		const wasCurrentDoc =
+			this.currentPath != null && normalizePath(this.currentPath) === normalizePath(oldPath);
 
 		if (wasCurrentDoc) {
 			await this.closeCurrentDoc();
 		}
 
-		const hadCached = await YjsLocalCache.hasCachedState(oldDocId);
-		if (hadCached) {
-			const tempDoc = new Y.Doc();
-			await YjsLocalCache.load(oldDocId, tempDoc);
-			await YjsLocalCache.save(newDocId, tempDoc);
-			tempDoc.destroy();
-		}
 		await YjsLocalCache.remove(oldDocId);
 
 		await this.client.mutation(this.convexApi.fileSync.removeFilesByPath, {
 			convexSecret: this.convexSecret,
 			removedPaths: [normalizePath(oldPath)],
 		});
-		await this.onFileCreated(newPath);
-
-		if (hadCached) {
-			const doc = new Y.Doc();
-			await YjsLocalCache.load(newDocId, doc);
-			const provider = new ConvexYjsProvider(
-				this.client,
-				newDocId,
-				doc,
-				this.convexApi.yjs,
-			);
-			try {
-				await provider.init();
-				await provider.pushFullState();
-				const content = doc.getText("content").toString();
-				const hash = await sha256Utf8(content);
-				await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
-					convexSecret: this.convexSecret,
-					path: normalizePath(newPath),
-					contentHash: hash,
-					sizeBytes: new TextEncoder().encode(content).length,
-					updatedAtMs: Date.now(),
-					clientId: this.clientId,
-				});
-				await YjsLocalCache.save(newDocId, doc);
-			} finally {
-				provider.destroy();
-				doc.destroy();
-			}
-		}
+		const renamed = this.app.vault.getAbstractFileByPath(normalizePath(newPath));
+		const content =
+			renamed instanceof TFile && renamed.extension === "md"
+				? await this.app.vault.cachedRead(renamed)
+				: "";
+		await this.pushDiskSnapshot(newPath, content);
 
 		// Obsidian may keep the renamed note open without emitting a new file-open event.
 		// Rebind immediately so edits after rename keep syncing to Convex in real time.
@@ -349,8 +325,11 @@ export class DocManager {
 	}
 
 	async onFileDeleted(path: string): Promise<void> {
+		if (isLocalChangeSuppressed(path)) {
+			return;
+		}
 		const docId = this.pathToDocId(path);
-		if (this.currentPath === path) {
+		if (this.currentPath != null && normalizePath(this.currentPath) === normalizePath(path)) {
 			await this.closeCurrentDoc();
 		}
 		await YjsLocalCache.remove(docId);
@@ -369,25 +348,22 @@ export class DocManager {
 			if (this.destroyed) return;
 			const docId = this.pathToDocId(path);
 			if (await YjsLocalCache.hasCachedState(docId)) continue;
-
 			const doc = new Y.Doc();
-			const provider = new ConvexYjsProvider(
-				this.client,
-				docId,
-				doc,
-				this.convexApi.yjs,
-			);
 			try {
-				await provider.init();
-				const content = doc.getText("content").toString();
-				if (content.length > 0) {
+				const remoteContent = await readRemoteTextContent({
+					client: this.client,
+					convexApi: this.convexApi,
+					convexSecret: this.convexSecret,
+					vaultName: this.app.vault.getName(),
+					path,
+				});
+				doc.getText("content").insert(0, remoteContent);
+				if (remoteContent.length > 0) {
 					await YjsLocalCache.save(docId, doc);
 				}
-				await this.registerTextManifest(path, doc);
 			} catch (e) {
 				console.warn(`[DocManager] warmUp failed for ${path}`, e);
 			} finally {
-				provider.destroy();
 				doc.destroy();
 			}
 			await new Promise((r) => setTimeout(r, 50));
@@ -400,41 +376,48 @@ export class DocManager {
 	 */
 	async pullRemoteTextFile(path: string): Promise<void> {
 		const norm = normalizePath(path);
-		const docId = this.pathToDocId(path);
-		this.pullingRemotePaths.add(path);
-		const doc = new Y.Doc();
-		const provider = new ConvexYjsProvider(this.client, docId, doc, this.convexApi.yjs);
+		if (this.activeRemoteTextPulls.has(norm)) return;
+		this.activeRemoteTextPulls.add(norm);
+		const docId = this.pathToDocId(norm);
+		this.pullingRemotePaths.add(norm);
 		try {
-			await provider.init();
-			const content = doc.getText("content").toString();
+			const content = await readRemoteTextContent({
+				client: this.client,
+				convexApi: this.convexApi,
+				convexSecret: this.convexSecret,
+				vaultName: this.app.vault.getName(),
+				path: norm,
+			});
+			const doc = createTextYDoc(content);
 
 			const parent = folderPathForFile(norm);
 			if (parent) {
 				const parentNorm = normalizePath(parent);
 				if (!(await this.app.vault.adapter.exists(parentNorm))) {
-					await this.app.vault.createFolder(parentNorm).catch(() => {});
+					await withSuppressedLocalChange(parentNorm, async () => {
+						await this.app.vault.createFolder(parentNorm).catch(() => {});
+					});
 				}
 			}
 
 			const existing = this.app.vault.getAbstractFileByPath(norm);
-			if (existing instanceof TFile) {
-				await this.app.vault.modify(existing, content);
-			} else if (await this.app.vault.adapter.exists(norm)) {
-				await this.app.vault.adapter.write(norm, content);
-			} else {
-				await this.app.vault.create(norm, content);
-			}
+			await withSuppressedLocalChange(norm, async () => {
+				if (existing instanceof TFile) {
+					await this.app.vault.modify(existing, content);
+				} else if (await this.app.vault.adapter.exists(norm)) {
+					await this.app.vault.adapter.write(norm, content);
+				} else {
+					await this.app.vault.create(norm, content);
+				}
+			});
 
-			if (content.length > 0) {
-				await YjsLocalCache.save(docId, doc);
-			}
-			await this.registerTextManifest(path, doc);
+			await YjsLocalCache.save(docId, doc);
+			doc.destroy();
 		} catch (e) {
 			console.warn(`[DocManager] pullRemoteTextFile failed for ${path}`, e);
 		} finally {
-			provider.destroy();
-			doc.destroy();
-			this.pullingRemotePaths.delete(path);
+			this.pullingRemotePaths.delete(norm);
+			this.activeRemoteTextPulls.delete(norm);
 		}
 	}
 
@@ -443,13 +426,13 @@ export class DocManager {
 	 * Called by BinarySyncManager when it discovers remote text files from subscription/catch-up.
 	 */
 	async pullRemoteTextFiles(paths: string[]): Promise<void> {
-		for (const path of paths) {
+		for (const path of new Set(paths)) {
 			if (this.destroyed) return;
-			if (this.currentPath === path) continue;
-			const docId = this.pathToDocId(path);
-			if (await YjsLocalCache.hasCachedState(docId)) {
-				const existing = this.app.vault.getAbstractFileByPath(normalizePath(path));
-				if (existing instanceof TFile) continue;
+			if (
+				this.currentPath != null &&
+				normalizePath(this.currentPath) === normalizePath(path)
+			) {
+				continue;
 			}
 			await this.pullRemoteTextFile(path);
 			await new Promise((r) => setTimeout(r, 50));
@@ -457,32 +440,30 @@ export class DocManager {
 	}
 
 	private pathToDocId(path: string): string {
-		return `${this.app.vault.getName()}::${normalizePath(path)}`;
+		return textDocIdForPath(this.app.vault.getName(), path);
 	}
 
-	private async registerTextManifest(path: string, doc: Y.Doc): Promise<void> {
-		const content = doc.getText("content").toString();
-		const hash = await sha256Utf8(content);
-		await this.registerTextManifestContent(
-			path,
-			hash,
-			new TextEncoder().encode(content).length,
-		);
-	}
-
-	private async registerTextManifestContent(
+	private async pushDiskSnapshot(
 		path: string,
-		contentHash: string,
-		sizeBytes: number,
+		content: string,
+		updatedAtMs = Date.now(),
 	): Promise<void> {
-		await this.client.mutation(this.convexApi.fileSync.registerTextFile, {
+		const norm = normalizePath(path);
+		const doc = await pushTextContentSnapshot({
+			client: this.client,
+			convexApi: this.convexApi,
 			convexSecret: this.convexSecret,
-			path: normalizePath(path),
-			contentHash,
-			sizeBytes,
-			updatedAtMs: Date.now(),
 			clientId: this.clientId,
+			vaultName: this.app.vault.getName(),
+			path: norm,
+			content,
+			updatedAtMs,
 		});
+		try {
+			await YjsLocalCache.save(this.pathToDocId(norm), doc);
+		} finally {
+			doc.destroy();
+		}
 	}
 }
 
@@ -492,27 +473,24 @@ function hashColor(id: string): string {
 	return `hsl(${Math.abs(hash) % 360}, 70%, 45%)`;
 }
 
-function debounce(fn: () => Promise<void>, ms: number): () => void {
-	let timer: ReturnType<typeof setTimeout>;
-	return () => {
-		clearTimeout(timer);
-		timer = setTimeout(() => {
-			void fn();
-		}, ms);
+function debounceWithCancel(
+	fn: () => Promise<void>,
+	ms: number,
+): { schedule: () => void; cancel: () => void } {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	return {
+		schedule: () => {
+			if (timer !== undefined) clearTimeout(timer);
+			timer = setTimeout(() => {
+				timer = undefined;
+				void fn();
+			}, ms);
+		},
+		cancel: () => {
+			if (timer !== undefined) clearTimeout(timer);
+			timer = undefined;
+		},
 	};
-}
-
-function toHex(buffer: ArrayBuffer): string {
-	const bytes = new Uint8Array(buffer);
-	return Array.from(bytes)
-		.map((byte) => byte.toString(16).padStart(2, "0"))
-		.join("");
-}
-
-async function sha256Utf8(text: string): Promise<string> {
-	const bytes = new TextEncoder().encode(text);
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return toHex(digest);
 }
 
 function clamp(value: number, min: number, max: number): number {

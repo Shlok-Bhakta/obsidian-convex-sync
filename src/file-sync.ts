@@ -2,6 +2,12 @@ import { ConvexHttpClient } from "convex/browser";
 import { Notice, TFile, TFolder, normalizePath } from "obsidian";
 import { api } from "../convex/_generated/api";
 import type { MyPluginSettings } from "./settings";
+import { withSuppressedLocalChange } from "./sync/local-change-suppressor";
+import {
+	pushTextDocumentSnapshot,
+	readRemoteTextContent,
+} from "./sync/text-sync-transport";
+import { createTextYDoc, sha256Utf8, textByteLength } from "./sync/text-sync-shared";
 
 // INTENTIONAL: Only .md files use Yjs. Other text-like files (.json, .canvas, .svg, etc.)
 // sync as binary blobs — no CRDT merge semantics required unless we extend this later.
@@ -21,6 +27,15 @@ type FileSyncHost = {
 	}) => void;
 };
 
+/** Optional client-side pacing (see `MyPluginSettings.relaxBinarySyncBandwidthPacing`). */
+export type BinaryVaultTransferOptions = {
+	relaxBandwidthPacing?: boolean;
+};
+
+export function binaryTransferOpts(settings: MyPluginSettings): BinaryVaultTransferOptions {
+	return settings.relaxBinarySyncBandwidthPacing ? { relaxBandwidthPacing: true } : {};
+}
+
 type App = import("obsidian").App;
 
 type Snapshot = {
@@ -37,7 +52,7 @@ type Snapshot = {
 		path: string;
 		updatedAtMs: number;
 		isExplicitlyEmpty: boolean;
-		updatedByClientId: string;
+		updatedByClientId?: string;
 	}>;
 };
 
@@ -50,8 +65,6 @@ type LocalFileEntry = {
 	writeBytes: (bytes: ArrayBuffer) => Promise<void>;
 	createBytes: (bytes: ArrayBuffer) => Promise<void>;
 };
-
-const ARG_CHUNK_SIZE = 500;
 
 type SnapshotPage<T> = {
 	page: T[];
@@ -102,6 +115,32 @@ async function sha256Bytes(bytes: ArrayBuffer): Promise<string> {
 	return toHex(digest);
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isConvexWriteBandwidthError(message: string): boolean {
+	return (
+		message.includes("Too many writes per second") ||
+		message.includes("bytes written per 1 second")
+	);
+}
+
+/**
+ * Convex Cloud limits binary write throughput per deployment; spacing finalizes avoids bursts
+ * after large uploads (patch + old blob delete count toward the limit). Self-hosted backends
+ * can disable this via settings (`relaxBinarySyncBandwidthPacing`).
+ */
+async function paceAfterBinaryFinalize(sizeBytes: number, relaxPacing: boolean): Promise<void> {
+	if (relaxPacing) return;
+	const msPerMb = 400;
+	const mb = sizeBytes / (1024 * 1024);
+	const waitMs = Math.min(5000, Math.max(90, Math.ceil(mb * msPerMb)));
+	await sleep(waitMs);
+}
+
+const REMOTE_DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+
 function folderPathForFile(filePath: string): string | null {
 	const slash = filePath.lastIndexOf("/");
 	if (slash < 0) {
@@ -123,14 +162,38 @@ async function ensureFolderExists(app: App, path: string): Promise<void> {
 	if (parent) {
 		await ensureFolderExists(app, parent);
 	}
-	await app.vault.createFolder(normalized);
+	await withSuppressedLocalChange(normalized, async () => {
+		await app.vault.createFolder(normalized);
+	});
+}
+
+async function writeLocalTextFile(app: App, path: string, content: string): Promise<void> {
+	const normalized = normalizePath(path);
+	const parent = folderPathForFile(normalized);
+	if (parent) {
+		await ensureFolderExists(app, parent);
+	}
+	const existing = app.vault.getAbstractFileByPath(normalized);
+	await withSuppressedLocalChange(normalized, async () => {
+		if (existing instanceof TFile) {
+			await app.vault.modify(existing, content);
+			return;
+		}
+		if (await app.vault.adapter.exists(normalized)) {
+			await app.vault.adapter.write(normalized, content);
+			return;
+		}
+		await app.vault.create(normalized, content);
+	});
 }
 
 export async function readRemoteFileBytes(
 	client: ConvexHttpClient,
 	secret: string,
 	path: string,
+	options?: BinaryVaultTransferOptions,
 ): Promise<{ bytes: ArrayBuffer; updatedAtMs: number } | null> {
+	const relax = options?.relaxBandwidthPacing === true;
 	const signed = await client.query(api.fileSync.getDownloadUrl, {
 		convexSecret: secret,
 		path,
@@ -153,14 +216,45 @@ export async function readRemoteFileBytes(
 			path,
 			message: error instanceof Error ? error.message : String(error),
 		});
-		const fallback = await client.action(api.fileSync.getFileBytes, {
-			convexSecret: secret,
-			path,
-		});
-		if (!fallback) {
-			return null;
+		let offset = 0;
+		let totalSize = 0;
+		let updatedAtMs = 0;
+		const chunks: Uint8Array[] = [];
+		for (;;) {
+			const part = await client.action(api.fileSync.getFileBytesChunk, {
+				convexSecret: secret,
+				path,
+				byteOffset: offset,
+				maxBytes: REMOTE_DOWNLOAD_CHUNK_BYTES,
+			});
+			if (!part) {
+				if (chunks.length === 0) {
+					return null;
+				}
+				throw new Error(`getFileBytesChunk returned null mid-stream for ${path}`);
+			}
+			totalSize = part.sizeBytes;
+			updatedAtMs = part.updatedAtMs;
+			chunks.push(new Uint8Array(part.bytes));
+			if (part.isLast) {
+				break;
+			}
+			offset += part.bytes.byteLength;
+			if (offset >= totalSize) {
+				break;
+			}
+			// Tiny delay so chunk reads do not stampede Convex if many files fail HTTPS at once.
+			if (!relax) {
+				await sleep(20);
+			}
 		}
-		return { bytes: fallback.bytes, updatedAtMs: fallback.updatedAtMs };
+		const out = new Uint8Array(totalSize);
+		let writeAt = 0;
+		for (const c of chunks) {
+			out.set(c, writeAt);
+			writeAt += c.byteLength;
+		}
+		return { bytes: out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength), updatedAtMs };
 	}
 }
 
@@ -172,7 +266,9 @@ export async function uploadLocalFile(
 	path: string,
 	bytes: ArrayBuffer,
 	updatedAtMs: number,
+	options?: BinaryVaultTransferOptions,
 ): Promise<"ok" | "stale_write"> {
+	const relax = options?.relaxBandwidthPacing === true;
 	const blob = new Blob([bytes], { type: "application/octet-stream" });
 	const contentHash = await sha256Bytes(bytes);
 	const issued = await client.mutation(api.fileSync.issueUploadUrl, {
@@ -197,7 +293,7 @@ export async function uploadLocalFile(
 	if (!payload.storageId) {
 		throw new Error(`Upload did not return storageId for ${path}`);
 	}
-	const finalized = await client.mutation(api.fileSync.finalizeUpload, {
+	const finalizeArgs = {
 		convexSecret: secret,
 		path,
 		storageId: payload.storageId as never,
@@ -205,7 +301,26 @@ export async function uploadLocalFile(
 		updatedAtMs,
 		sizeBytes: blob.size,
 		clientId,
-	});
+	};
+	let finalized: { ok: true } | { ok: false; reason: "stale_write"; remoteUpdatedAtMs: number };
+	let attempt = 0;
+	const maxFinalizeAttempts = 10;
+	let backoffMs = 500;
+	for (;;) {
+		try {
+			finalized = await client.mutation(api.fileSync.finalizeUpload, finalizeArgs);
+			break;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (!isConvexWriteBandwidthError(message) || attempt >= maxFinalizeAttempts - 1) {
+				throw err;
+			}
+			attempt += 1;
+			await sleep(backoffMs);
+			backoffMs = Math.min(backoffMs * 2, 10_000);
+		}
+	}
+	await paceAfterBinaryFinalize(blob.size, relax);
 	if (!finalized.ok && finalized.reason === "stale_write") {
 		return "stale_write";
 	}
@@ -350,14 +465,18 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 
 	const client = host.getConvexHttpClient();
 	const clientId = host.getPresenceSessionId();
+	const xfer = binaryTransferOpts(host.settings);
 	host.reportSyncProgress?.({
 		phase: "Preparing snapshot",
 		completed: 0,
 		total: 1,
 	});
 	const snapshot = await fetchSnapshot(client, secret);
-	const remoteByPath = new Map(
+	const remoteBinaryByPath = new Map(
 		snapshot.files.filter((row) => !row.isText).map((row) => [row.path, row]),
+	);
+	const remoteTextByPath = new Map(
+		snapshot.files.filter((row) => row.isText).map((row) => [row.path, row]),
 	);
 	for (const remoteFolder of snapshot.folders) {
 		if (!remoteFolder.isExplicitlyEmpty) {
@@ -374,11 +493,13 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 	const localPaths = new Set(
 		localFiles.map((f) => normalizePath(f.path)),
 	);
+	const localTextFiles = localFiles.filter((file) => isTextSyncFile(normalizePath(file.path)));
 	const remoteBinaryCount = snapshot.files.filter((file) => !file.isText).length;
+	const remoteTextCount = snapshot.files.filter((file) => file.isText).length;
 	const localBinaryCount = localFiles.filter(
 		(f) => !isTextSyncFile(normalizePath(f.path)),
 	).length;
-	const totalSteps = localBinaryCount + remoteBinaryCount + 2;
+	const totalSteps = localBinaryCount + remoteBinaryCount + localTextFiles.length + remoteTextCount + 1;
 	let completedSteps = 0;
 	const tick = (phase: string): void => {
 		completedSteps += 1;
@@ -388,13 +509,107 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 			total: totalSteps,
 		});
 	};
+	for (const localFile of localTextFiles) {
+		const path = normalizePath(localFile.path);
+		const abstract = host.app.vault.getAbstractFileByPath(path);
+		if (!(abstract instanceof TFile)) {
+			tick("Skipping unavailable local notes");
+			continue;
+		}
+		const localContent = await host.app.vault.cachedRead(abstract);
+		const localHash = await sha256Utf8(localContent);
+		const remote = remoteTextByPath.get(path);
+		if (!remote) {
+			const doc = createTextYDoc(localContent);
+			try {
+				await pushTextDocumentSnapshot({
+					client,
+					convexApi: api,
+					convexSecret: secret,
+					clientId,
+					vaultName: host.app.vault.getName(),
+					path,
+					doc,
+					updatedAtMs: abstract.stat.mtime,
+				});
+			} finally {
+				doc.destroy();
+			}
+			tick("Uploading local notes");
+			continue;
+		}
+		if (remote.updatedAtMs > abstract.stat.mtime) {
+			const remoteContent = await readRemoteTextContent({
+				client,
+				convexApi: api,
+				convexSecret: secret,
+				vaultName: host.app.vault.getName(),
+				path,
+			});
+			await writeLocalTextFile(host.app, path, remoteContent);
+			tick("Pulling newer remote notes");
+			continue;
+		}
+		if (abstract.stat.mtime > remote.updatedAtMs) {
+			const doc = createTextYDoc(localContent);
+			try {
+				await pushTextDocumentSnapshot({
+					client,
+					convexApi: api,
+					convexSecret: secret,
+					clientId,
+					vaultName: host.app.vault.getName(),
+					path,
+					doc,
+					updatedAtMs: abstract.stat.mtime,
+				});
+			} finally {
+				doc.destroy();
+			}
+			tick("Reconciling newer local notes");
+			continue;
+		}
+		if (localHash === remote.contentHash) {
+			tick("Checking unchanged notes");
+			continue;
+		}
+		const localWins = clientId.localeCompare(remote.updatedByClientId) <= 0;
+		if (localWins) {
+			const doc = createTextYDoc(localContent);
+			try {
+				await pushTextDocumentSnapshot({
+					client,
+					convexApi: api,
+					convexSecret: secret,
+					clientId,
+					vaultName: host.app.vault.getName(),
+					path,
+					doc,
+					updatedAtMs: abstract.stat.mtime,
+				});
+			} finally {
+				doc.destroy();
+			}
+		} else {
+			const remoteContent = await readRemoteTextContent({
+				client,
+				convexApi: api,
+				convexSecret: secret,
+				vaultName: host.app.vault.getName(),
+				path,
+			});
+			await writeLocalTextFile(host.app, path, remoteContent);
+		}
+		tick("Resolving note conflicts");
+	}
+
 	for (const localFile of localFiles) {
 		const path = normalizePath(localFile.path);
 		if (isTextSyncFile(path)) {
 			continue;
 		}
 		const localUpdatedAtMs = localFile.updatedAtMs;
-		const remote = remoteByPath.get(path);
+		const remote = remoteBinaryByPath.get(path);
 		if (!remote) {
 			const bytes = await localFile.readBytes();
 			await uploadLocalFile(
@@ -404,6 +619,7 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 				path,
 				bytes,
 				localUpdatedAtMs,
+				xfer,
 			);
 			tick("Uploading local files");
 			continue;
@@ -417,9 +633,10 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 				path,
 				bytes,
 				localUpdatedAtMs,
+				xfer,
 			);
 			if (result === "stale_write") {
-				const remotePayload = await readRemoteFileBytes(client, secret, path);
+				const remotePayload = await readRemoteFileBytes(client, secret, path, xfer);
 				if (remotePayload) {
 					await localFile.writeBytes(remotePayload.bytes);
 				}
@@ -428,7 +645,7 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 			continue;
 		}
 		if (remote.updatedAtMs > localUpdatedAtMs) {
-			const remotePayload = await readRemoteFileBytes(client, secret, path);
+			const remotePayload = await readRemoteFileBytes(client, secret, path, xfer);
 			if (!remotePayload) {
 				tick("Skipping unavailable remote updates");
 				continue;
@@ -452,9 +669,10 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 				path,
 				localBytes,
 				localUpdatedAtMs,
+				xfer,
 			);
 		} else {
-			const remotePayload = await readRemoteFileBytes(client, secret, path);
+			const remotePayload = await readRemoteFileBytes(client, secret, path, xfer);
 			if (remotePayload) {
 				await localFile.writeBytes(remotePayload.bytes);
 			}
@@ -464,17 +682,26 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 
 	for (const remoteFile of snapshot.files) {
 		if (remoteFile.isText) {
+			if (localPaths.has(remoteFile.path)) {
+				tick("Skipping existing remote notes");
+				continue;
+			}
+			const remoteContent = await readRemoteTextContent({
+				client,
+				convexApi: api,
+				convexSecret: secret,
+				vaultName: host.app.vault.getName(),
+				path: remoteFile.path,
+			});
+			await writeLocalTextFile(host.app, remoteFile.path, remoteContent);
+			tick("Creating missing local notes");
 			continue;
 		}
 		if (localPaths.has(remoteFile.path)) {
 			tick("Skipping existing remote files");
 			continue;
 		}
-		const remotePayload = await readRemoteFileBytes(
-			client,
-			secret,
-			remoteFile.path,
-		);
+		const remotePayload = await readRemoteFileBytes(client, secret, remoteFile.path, xfer);
 		if (!remotePayload) {
 			tick("Skipping unavailable remote files");
 			continue;
@@ -483,7 +710,9 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		if (parent) {
 			await ensureFolderExists(host.app, parent);
 		}
-		await host.app.vault.createBinary(remoteFile.path, remotePayload.bytes);
+		await withSuppressedLocalChange(remoteFile.path, async () => {
+			await host.app.vault.createBinary(remoteFile.path, remotePayload.bytes);
+		});
 		tick("Creating missing local files");
 	}
 
@@ -494,19 +723,6 @@ export async function runVaultFileSync(host: FileSyncHost): Promise<void> {
 		emptyFolderPaths: localState.emptyFolders,
 	});
 	tick("Syncing folder state");
-
-	const removedRemotePaths = snapshot.files
-		.filter((file) => !file.isText)
-		.map((file) => file.path)
-		.filter((path) => !localPaths.has(path));
-	for (let i = 0; i < removedRemotePaths.length; i += ARG_CHUNK_SIZE) {
-		const chunk = removedRemotePaths.slice(i, i + ARG_CHUNK_SIZE);
-		await client.mutation(api.fileSync.removeFilesByPath, {
-			convexSecret: secret,
-			removedPaths: chunk,
-		});
-	}
-	tick("Pruning remote deletions");
 
 	new Notice("Convex sync: vault files synchronized.", 5000);
 }
