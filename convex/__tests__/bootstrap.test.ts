@@ -5,11 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const refs = vi.hoisted(() => ({
 	internal: {
 		yjsSync: {
-			_listDocIdsWithPendingUpdates: "internal.yjsSync._listDocIdsWithPendingUpdates",
 			_snapshotUpdates: "internal.yjsSync._snapshotUpdates",
+			_readTextForBootstrap: "internal.yjsSync._readTextForBootstrap",
 		},
 		bootstrap: {
-			_readSnapshot: "internal.bootstrap._readSnapshot",
+			_readFilePage: "internal.bootstrap._readFilePage",
 			issueZipUploadUrl: "internal.bootstrap.issueZipUploadUrl",
 			updateProgress: "internal.bootstrap.updateProgress",
 			finalizeArchive: "internal.bootstrap.finalizeArchive",
@@ -17,9 +17,7 @@ const refs = vi.hoisted(() => ({
 		},
 	},
 	api: {
-		yjsSync: {
-			init: "api.yjsSync.init",
-		},
+		yjsSync: {},
 	},
 }));
 
@@ -79,26 +77,25 @@ describe("convex/bootstrap", () => {
 		vi.unstubAllGlobals();
 	});
 
-	it("snapshots pending updates before reading file snapshot", async () => {
+	it("pages files and reads text without preflushing dirty Yjs docs", async () => {
 		mockZipUpload();
 		const calls: string[] = [];
 		const ctx = {
 			runQuery: vi.fn(async (ref: string) => {
 				calls.push(`query:${ref}`);
-				if (ref === refs.internal.yjsSync._listDocIdsWithPendingUpdates) {
-					return ["vault::notes/test.md"];
-				}
-				if (ref === refs.internal.bootstrap._readSnapshot) {
+				if (ref === refs.internal.bootstrap._readFilePage) {
 					return {
-						files: [{ path: "notes/test.md", isText: true, sizeBytes: 0 }],
+						page: [{ path: "notes/test.md", isText: true, sizeBytes: 0 }],
+						isDone: true,
+						continueCursor: "end",
 					};
 				}
 				return null;
 			}),
 			runAction: vi.fn(async (ref: string) => {
 				calls.push(`action:${ref}`);
-				if (ref === refs.api.yjsSync.init) {
-					return { update: new ArrayBuffer(0), serverStateVector: new ArrayBuffer(0) };
+				if (ref === refs.internal.yjsSync._readTextForBootstrap) {
+					return "hello";
 				}
 				return null;
 			}),
@@ -120,9 +117,12 @@ describe("convex/bootstrap", () => {
 			vaultName: "vault",
 		});
 
-		expect(calls.indexOf(`action:${refs.internal.yjsSync._snapshotUpdates}`)).toBeGreaterThan(-1);
-		expect(calls.indexOf(`query:${refs.internal.bootstrap._readSnapshot}`)).toBeGreaterThan(
-			calls.indexOf(`action:${refs.internal.yjsSync._snapshotUpdates}`),
+		expect(calls).not.toContain(`action:${refs.internal.yjsSync._snapshotUpdates}`);
+		expect(calls.filter((call) => call === `query:${refs.internal.bootstrap._readFilePage}`)).toHaveLength(2);
+		expect(
+			calls.indexOf(`action:${refs.internal.yjsSync._readTextForBootstrap}`),
+		).toBeGreaterThan(
+			calls.indexOf(`query:${refs.internal.bootstrap._readFilePage}`),
 		);
 	});
 
@@ -130,19 +130,18 @@ describe("convex/bootstrap", () => {
 		mockZipUpload();
 		const ctx = {
 			runQuery: vi.fn(async (ref: string) => {
-				if (ref === refs.internal.yjsSync._listDocIdsWithPendingUpdates) {
-					return [];
-				}
-				if (ref === refs.internal.bootstrap._readSnapshot) {
+				if (ref === refs.internal.bootstrap._readFilePage) {
 					return {
-						files: [{ path: "notes/orphan.md", isText: true, sizeBytes: 10 }],
+						page: [{ path: "notes/orphan.md", isText: true, sizeBytes: 10 }],
+						isDone: true,
+						continueCursor: "end",
 					};
 				}
 				return null;
 			}),
 			runAction: vi.fn(async (ref: string) => {
-				if (ref === refs.api.yjsSync.init) {
-					return { update: new ArrayBuffer(0), serverStateVector: new ArrayBuffer(0) };
+				if (ref === refs.internal.yjsSync._readTextForBootstrap) {
+					return "";
 				}
 				return null;
 			}),

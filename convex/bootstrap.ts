@@ -1,26 +1,28 @@
 import { ConvexError, v } from "convex/values";
+import { paginationOptsValidator } from "convex/server";
 import { internal } from "./_generated/api";
+import type { Doc } from "./_generated/dataModel";
 import { internalMutation, internalQuery, mutation, query } from "./_generated/server";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
 import { requirePluginSecret } from "./security";
 
 const TEN_MINUTES_MS = 10 * 60_000;
 
-type BootstrapRow = {
-	_id: string;
-	storageId?: string;
-	downloadToken?: string;
-	archiveName?: string;
-	status: "building" | "ready" | "expired" | "failed";
-};
+type BootstrapRow = Doc<"vaultBootstraps">;
 
-async function getSingletonRow(ctx: any): Promise<any | null> {
-	const rows = await ctx.db.query("vaultBootstraps").collect();
+async function getSingletonRow(
+	ctx: Pick<QueryCtx | MutationCtx, "db">,
+): Promise<BootstrapRow | null> {
+	const rows = await ctx.db.query("vaultBootstraps").take(1);
 	return rows[0] ?? null;
 }
 
-async function cleanupBootstrapStorage(ctx: any, row: BootstrapRow | null): Promise<void> {
+async function cleanupBootstrapStorage(
+	ctx: Pick<MutationCtx, "storage">,
+	row: BootstrapRow | null,
+): Promise<void> {
 	if (row?.storageId) {
-		await ctx.storage.delete(row.storageId as never);
+		await ctx.storage.delete(row.storageId);
 	}
 }
 
@@ -50,18 +52,15 @@ export const startBuild = mutation({
 			await ctx.db.delete(existing._id);
 		}
 
-		const allFiles = await ctx.db.query("vaultFiles").collect();
-		const bytesTotal = allFiles.reduce((sum, file) => sum + file.sizeBytes, 0);
-
 		const cleanVaultName = sanitizeVaultName(args.vaultName);
 		const archiveName = `${cleanVaultName || "obsidian-vault"}.zip`;
 		const rowId = await ctx.db.insert("vaultBootstraps", {
 			status: "building",
-			phase: "Queued",
+			phase: "Scanning vault files",
 			filesProcessed: 0,
-			filesTotal: allFiles.length,
+			filesTotal: 0,
 			bytesProcessed: 0,
-			bytesTotal,
+			bytesTotal: 0,
 			archiveName,
 			startedAtMs: Date.now(),
 			createdByClientId: args.clientId,
@@ -150,16 +149,33 @@ export const updateProgress = internalMutation({
 		phase: v.string(),
 		filesProcessed: v.number(),
 		bytesProcessed: v.number(),
+		filesTotal: v.optional(v.number()),
+		bytesTotal: v.optional(v.number()),
 	},
 	handler: async (ctx, args) => {
 		const row = await ctx.db.get(args.bootstrapId);
 		if (!row || row.status !== "building") {
 			return;
 		}
-		await ctx.db.patch(args.bootstrapId, {
+		const patch: {
+			phase: string;
+			filesProcessed: number;
+			bytesProcessed: number;
+			filesTotal?: number;
+			bytesTotal?: number;
+		} = {
 			phase: args.phase,
 			filesProcessed: args.filesProcessed,
 			bytesProcessed: args.bytesProcessed,
+		};
+		if (args.filesTotal !== undefined) {
+			patch.filesTotal = args.filesTotal;
+		}
+		if (args.bytesTotal !== undefined) {
+			patch.bytesTotal = args.bytesTotal;
+		}
+		await ctx.db.patch(args.bootstrapId, {
+			...patch,
 		});
 	},
 });
@@ -174,6 +190,10 @@ export const finalizeArchive = internalMutation({
 	handler: async (ctx, args) => {
 		const row = await ctx.db.get(args.bootstrapId);
 		if (!row) {
+			await ctx.storage.delete(args.storageId);
+			return;
+		}
+		if (row.status !== "building") {
 			await ctx.storage.delete(args.storageId);
 			return;
 		}
@@ -206,7 +226,7 @@ export const failBuild = internalMutation({
 	},
 	handler: async (ctx, args) => {
 		const row = await ctx.db.get(args.bootstrapId);
-		if (!row) {
+		if (!row || row.status !== "building") {
 			return;
 		}
 		await cleanupBootstrapStorage(ctx, row);
@@ -240,8 +260,10 @@ export const expireBootstrap = internalMutation({
 export const resolveDownloadByToken = internalQuery({
 	args: { token: v.string() },
 	handler: async (ctx, args) => {
-		const rows = await ctx.db.query("vaultBootstraps").collect();
-		const row = rows.find((entry) => entry.downloadToken === args.token);
+		const row = await ctx.db
+			.query("vaultBootstraps")
+			.withIndex("by_downloadToken", (q) => q.eq("downloadToken", args.token))
+			.unique();
 		if (!row || row.status !== "ready") {
 			return null;
 		}
@@ -259,18 +281,26 @@ export const resolveDownloadByToken = internalQuery({
 	},
 });
 
-export const _readSnapshot = internalQuery({
-	args: { convexSecret: v.string() },
+export const _readFilePage = internalQuery({
+	args: {
+		convexSecret: v.string(),
+		paginationOpts: paginationOptsValidator,
+	},
 	handler: async (ctx, args) => {
 		await requirePluginSecret(ctx, args.convexSecret);
-		const files = await ctx.db.query("vaultFiles").collect();
+		const files = await ctx.db
+			.query("vaultFiles")
+			.withIndex("by_path")
+			.paginate(args.paginationOpts);
 		return {
-			files: files.map((row) => ({
+			page: files.page.map((row) => ({
 				path: row.path,
 				isText: row.isText,
 				storageId: row.storageId,
 				sizeBytes: row.sizeBytes,
 			})),
+			isDone: files.isDone,
+			continueCursor: files.continueCursor,
 		};
 	},
 });

@@ -10,6 +10,7 @@ import {
 	internalQuery,
 	mutation,
 } from "./_generated/server";
+import type { MutationCtx } from "./_generated/server";
 import { paginationOptsValidator } from "convex/server";
 import { normalizeVaultPath, upsertTextVaultFile } from "./_lib/vaultFiles";
 import { requirePluginSecret } from "./security";
@@ -18,18 +19,18 @@ const UPDATES_TRIM_THRESHOLD = 25;
 // Keep chunks comfortably below Convex's large-document warning threshold.
 const MAX_UPDATE_CHUNK_BYTES = 256 * 1024;
 const MAX_SNAPSHOT_CHUNK_BYTES = 256 * 1024;
-const SNAPSHOT_PRUNE_BATCH_SIZE = 64;
+const COMPACTION_DELETE_BATCH_SIZE = 4;
+const COMPACTION_REQUEST_STALE_MS = 2 * 60_000;
+const WRITE_THROTTLE_BYTES_PER_SECOND = 1.5 * 1024 * 1024;
 const DOC_REMOVAL_BATCH_SIZE = 64;
 const GET_DOC_PAGE_SIZE = 32;
-const GET_DOC_PAGE_MAX_BYTES = 8 * 1024 * 1024;
+const GET_DOC_PAGE_MAX_BYTES = 1 * 1024 * 1024;
 
 export const init = action({
 	args: {
 		convexSecret: v.string(),
 		docId: v.string(),
 		stateVector: v.bytes(),
-		/** When true, do not enqueue `_snapshotUpdates` (bootstrap pre-flushes dirty docs; scheduling per file would flood writes). */
-		skipCompactionSchedule: v.optional(v.boolean()),
 	},
 	returns: v.object({
 		update: v.bytes(),
@@ -38,13 +39,16 @@ export const init = action({
 	handler: async (ctx, args) => {
 		await requirePluginSecretForAction(ctx, args.convexSecret);
 		const { mergedUpdate, updateRowCount } = await getDocData(ctx, args.docId);
-		if (
-			!args.skipCompactionSchedule &&
-			updateRowCount >= UPDATES_TRIM_THRESHOLD
-		) {
-			await ctx.scheduler.runAfter(0, internal.yjsSync._snapshotUpdates, {
+		if (updateRowCount >= UPDATES_TRIM_THRESHOLD) {
+			const scheduled = await ctx.runMutation(internal.yjsSync._requestCompaction, {
 				docId: args.docId,
+				nowMs: Date.now(),
 			});
+			if (scheduled) {
+				await ctx.scheduler.runAfter(0, internal.yjsSync._snapshotUpdates, {
+					docId: args.docId,
+				});
+			}
 		}
 		const stateVec = new Uint8Array(args.stateVector);
 		const update = Y.diffUpdate(mergedUpdate, stateVec);
@@ -99,23 +103,31 @@ export const push = mutation({
 					});
 				}
 			}
-			// Keep update backlog bounded under heavy typing bursts so pull stays fast.
+			const dirtyDoc = await ctx.db
+				.query("yjsDirtyDocs")
+				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
+				.unique();
+			if (dirtyDoc) {
+				await ctx.db.patch(dirtyDoc._id, { updatedAtMs: args.updatedAtMs });
+			} else {
+				await ctx.db.insert("yjsDirtyDocs", {
+					docId: args.docId,
+					updatedAtMs: args.updatedAtMs,
+				});
+			}
+			// Keep update backlog bounded, but only allow one queued compaction per doc.
 			const recentBatch = await ctx.db
 				.query("yjsUpdates")
 				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
 				.order("desc")
 				.take(UPDATES_TRIM_THRESHOLD);
 			if (recentBatch.length >= UPDATES_TRIM_THRESHOLD) {
-				await ctx.scheduler.runAfter(0, internal.yjsSync._snapshotUpdates, {
-					docId: args.docId,
-				});
-			}
-			const dirtyDoc = await ctx.db
-				.query("yjsDirtyDocs")
-				.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-				.unique();
-			if (!dirtyDoc) {
-				await ctx.db.insert("yjsDirtyDocs", { docId: args.docId });
+				const scheduled = await requestCompaction(ctx, args.docId, Date.now());
+				if (scheduled) {
+					await ctx.scheduler.runAfter(0, internal.yjsSync._snapshotUpdates, {
+						docId: args.docId,
+					});
+				}
 			}
 		}
 		return null;
@@ -135,14 +147,89 @@ export const pull = action({
 	},
 });
 
-/** Spreads DB writes so bootstrap / compaction stays under Convex write-rate limits. */
-function writeThrottleMs(): number {
-	return 75;
+export const _readTextForBootstrap = internalAction({
+	args: { docId: v.string() },
+	returns: v.string(),
+	handler: async (ctx, args) => {
+		const { mergedUpdate } = await getDocData(ctx, args.docId);
+		const doc = new Y.Doc();
+		try {
+			if (mergedUpdate.byteLength > 0) {
+				Y.applyUpdate(doc, mergedUpdate);
+			}
+			return doc.getText("content").toJSON();
+		} finally {
+			doc.destroy();
+		}
+	},
+});
+
+type CompactionBatchResult = {
+	more: boolean;
+	rows: number;
+	bytesWritten: number;
+};
+
+/** Spreads DB writes so compaction stays below Convex deployment write-rate limits. */
+function writeThrottleMs(bytesWritten: number): number {
+	if (bytesWritten <= 0) {
+		return 0;
+	}
+	return Math.ceil((bytesWritten / WRITE_THROTTLE_BYTES_PER_SECOND) * 1000);
 }
 
 async function sleepMs(ms: number): Promise<void> {
+	if (ms <= 0) {
+		return;
+	}
 	await new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+async function sleepAfterWriteBytes(bytesWritten: number): Promise<void> {
+	await sleepMs(writeThrottleMs(bytesWritten));
+}
+
+async function requestCompaction(
+	ctx: MutationCtx,
+	docId: string,
+	nowMs: number,
+): Promise<boolean> {
+	const dirtyDoc = await ctx.db
+		.query("yjsDirtyDocs")
+		.withIndex("by_doc_id", (q) => q.eq("docId", docId))
+		.unique();
+	if (!dirtyDoc) {
+		await ctx.db.insert("yjsDirtyDocs", {
+			docId,
+			updatedAtMs: nowMs,
+			compactionRequestedAtMs: nowMs,
+		});
+		return true;
+	}
+	const requestedAt = dirtyDoc.compactionRequestedAtMs;
+	if (
+		typeof requestedAt === "number" &&
+		nowMs - requestedAt < COMPACTION_REQUEST_STALE_MS
+	) {
+		return false;
+	}
+	await ctx.db.patch(dirtyDoc._id, {
+		updatedAtMs: dirtyDoc.updatedAtMs ?? nowMs,
+		compactionRequestedAtMs: nowMs,
+	});
+	return true;
+}
+
+export const _requestCompaction = internalMutation({
+	args: {
+		docId: v.string(),
+		nowMs: v.number(),
+	},
+	returns: v.boolean(),
+	handler: async (ctx, args) => {
+		return await requestCompaction(ctx, args.docId, args.nowMs);
+	},
+});
 
 export const _snapshotUpdates = internalAction({
 	args: { docId: v.string() },
@@ -150,19 +237,22 @@ export const _snapshotUpdates = internalAction({
 	handler: async (ctx, args) => {
 		const { mergedUpdate, updateRowCount, lastUpdateCreationTime } = await getDocData(ctx, args.docId);
 		if (updateRowCount === 0) {
+			await ctx.runMutation(internal.yjsSync._markCompactionComplete, {
+				docId: args.docId,
+				compactedThroughCreationTime: 0,
+				nowMs: Date.now(),
+			});
 			return null;
 		}
 		const timestamp = lastUpdateCreationTime;
-		const throttle = writeThrottleMs();
 
 		let moreSnapshots = true;
 		while (moreSnapshots) {
-			moreSnapshots = await ctx.runMutation(internal.yjsSync._pruneOldSnapshotsOnce, {
+			const result = (await ctx.runMutation(internal.yjsSync._pruneOldSnapshotsOnce, {
 				docId: args.docId,
-			});
-			if (moreSnapshots) {
-				await sleepMs(throttle);
-			}
+			})) as CompactionBatchResult;
+			moreSnapshots = result.more;
+			await sleepAfterWriteBytes(result.bytesWritten);
 		}
 
 		const snapshotChunks = splitBytesForStorage(
@@ -178,6 +268,7 @@ export const _snapshotUpdates = internalAction({
 				docId: args.docId,
 				data: onlyChunk,
 			});
+			await sleepAfterWriteBytes(onlyChunk.byteLength);
 		} else {
 			const chunkGroupId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 			for (const [chunkIndex, chunk] of snapshotChunks.entries()) {
@@ -188,40 +279,56 @@ export const _snapshotUpdates = internalAction({
 					chunkIndex,
 					chunkCount: snapshotChunks.length,
 				});
-				if (chunkIndex + 1 < snapshotChunks.length) {
-					await sleepMs(throttle);
-				}
+				await sleepAfterWriteBytes(chunk.byteLength);
 			}
 		}
 
 		let moreUpdates = true;
 		while (moreUpdates) {
-			moreUpdates = await ctx.runMutation(internal.yjsSync._pruneOldUpdatesOnce, {
+			const result = (await ctx.runMutation(internal.yjsSync._pruneOldUpdatesOnce, {
 				docId: args.docId,
 				timestamp,
-			});
-			if (moreUpdates) {
-				await sleepMs(throttle);
-			}
+			})) as CompactionBatchResult;
+			moreUpdates = result.more;
+			await sleepAfterWriteBytes(result.bytesWritten);
 		}
 
-		await ctx.runMutation(internal.yjsSync._markDocClean, { docId: args.docId });
+		const complete = (await ctx.runMutation(internal.yjsSync._markCompactionComplete, {
+			docId: args.docId,
+			compactedThroughCreationTime: timestamp,
+			nowMs: Date.now(),
+		})) as { shouldReschedule: boolean };
+		if (complete.shouldReschedule) {
+			await ctx.scheduler.runAfter(0, internal.yjsSync._snapshotUpdates, {
+				docId: args.docId,
+			});
+		}
 		return null;
 	},
 });
 
 export const _pruneOldSnapshotsOnce = internalMutation({
 	args: { docId: v.string() },
-	returns: v.boolean(),
+	returns: v.object({
+		more: v.boolean(),
+		rows: v.number(),
+		bytesWritten: v.number(),
+	}),
 	handler: async (ctx, args) => {
 		const batch = await ctx.db
 			.query("yjsSnapshots")
 			.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
-			.take(SNAPSHOT_PRUNE_BATCH_SIZE);
+			.take(COMPACTION_DELETE_BATCH_SIZE);
+		let bytesWritten = 0;
 		for (const row of batch) {
+			bytesWritten += row.data.byteLength;
 			await ctx.db.delete(row._id);
 		}
-		return batch.length === SNAPSHOT_PRUNE_BATCH_SIZE;
+		return {
+			more: batch.length === COMPACTION_DELETE_BATCH_SIZE,
+			rows: batch.length,
+			bytesWritten,
+		};
 	},
 });
 
@@ -230,18 +337,28 @@ export const _pruneOldUpdatesOnce = internalMutation({
 		docId: v.string(),
 		timestamp: v.number(),
 	},
-	returns: v.boolean(),
+	returns: v.object({
+		more: v.boolean(),
+		rows: v.number(),
+		bytesWritten: v.number(),
+	}),
 	handler: async (ctx, args) => {
 		const batch = await ctx.db
 			.query("yjsUpdates")
 			.withIndex("by_doc_id", (q) =>
 				q.eq("docId", args.docId).lte("_creationTime", args.timestamp),
 			)
-			.take(SNAPSHOT_PRUNE_BATCH_SIZE);
+			.take(COMPACTION_DELETE_BATCH_SIZE);
+		let bytesWritten = 0;
 		for (const row of batch) {
+			bytesWritten += row.update.byteLength;
 			await ctx.db.delete(row._id);
 		}
-		return batch.length === SNAPSHOT_PRUNE_BATCH_SIZE;
+		return {
+			more: batch.length === COMPACTION_DELETE_BATCH_SIZE,
+			rows: batch.length,
+			bytesWritten,
+		};
 	},
 });
 
@@ -281,11 +398,54 @@ export const _markDocClean = internalMutation({
 	},
 });
 
+export const _markCompactionComplete = internalMutation({
+	args: {
+		docId: v.string(),
+		compactedThroughCreationTime: v.number(),
+		nowMs: v.number(),
+	},
+	returns: v.object({ shouldReschedule: v.boolean() }),
+	handler: async (ctx, args) => {
+		const remainingUpdates = await ctx.db
+			.query("yjsUpdates")
+			.withIndex("by_doc_id", (q) =>
+				q.eq("docId", args.docId).gt("_creationTime", args.compactedThroughCreationTime),
+			)
+			.take(UPDATES_TRIM_THRESHOLD);
+		const dirtyDoc = await ctx.db
+			.query("yjsDirtyDocs")
+			.withIndex("by_doc_id", (q) => q.eq("docId", args.docId))
+			.unique();
+		if (remainingUpdates.length === 0) {
+			if (dirtyDoc) {
+				await ctx.db.delete(dirtyDoc._id);
+			}
+			return { shouldReschedule: false };
+		}
+		const shouldReschedule = remainingUpdates.length >= UPDATES_TRIM_THRESHOLD;
+		const patch = {
+			updatedAtMs: args.nowMs,
+			compactionRequestedAtMs: shouldReschedule ? args.nowMs : undefined,
+		};
+		if (dirtyDoc) {
+			await ctx.db.patch(dirtyDoc._id, patch);
+		} else {
+			await ctx.db.insert("yjsDirtyDocs", {
+				docId: args.docId,
+				...patch,
+			});
+		}
+		return { shouldReschedule };
+	},
+});
+
 export const _listDocIdsWithPendingUpdates = internalQuery({
-	args: {},
+	args: { limit: v.optional(v.number()) },
 	returns: v.array(v.string()),
-	handler: async (ctx) => {
-		const dirtyDocs = await ctx.db.query("yjsDirtyDocs").collect();
+	handler: async (ctx, args) => {
+		const dirtyDocs = await ctx.db
+			.query("yjsDirtyDocs")
+			.take(Math.min(Math.max(args.limit ?? 100, 1), 500));
 		return dirtyDocs.map((row) => row.docId);
 	},
 });
@@ -331,7 +491,11 @@ export const _removeDocsByPathSuffix = internalAction({
 
 export const _deleteUpdateRowsOnce = internalMutation({
 	args: { docId: v.string(), timestamp: v.optional(v.number()) },
-	returns: v.boolean(),
+	returns: v.object({
+		more: v.boolean(),
+		rows: v.number(),
+		bytesWritten: v.number(),
+	}),
 	handler: async (ctx, args) => {
 		const batch = await ctx.db
 			.query("yjsUpdates")
@@ -341,11 +505,17 @@ export const _deleteUpdateRowsOnce = internalMutation({
 					? docQuery
 					: docQuery.lte("_creationTime", args.timestamp);
 			})
-			.take(SNAPSHOT_PRUNE_BATCH_SIZE);
+			.take(COMPACTION_DELETE_BATCH_SIZE);
+		let bytesWritten = 0;
 		for (const row of batch) {
+			bytesWritten += row.update.byteLength;
 			await ctx.db.delete(row._id);
 		}
-		return batch.length === SNAPSHOT_PRUNE_BATCH_SIZE;
+		return {
+			more: batch.length === COMPACTION_DELETE_BATCH_SIZE,
+			rows: batch.length,
+			bytesWritten,
+		};
 	},
 });
 
@@ -424,40 +594,32 @@ type ChunkedBytesRow = {
 	chunkCount?: number;
 };
 
-/** Matches `reconstructLogicalBytes` ordering: all non-chunked rows in iteration order, then completed chunk groups in first-seen group order. */
 type LogicalStreamAcc = {
 	grouped: Map<string, Map<number, ArrayBuffer>>;
 	expectedChunkCounts: Map<string, number>;
-	chunkGroupOrder: string[];
-	nonChunked: ArrayBuffer[];
-	completedChunks: Map<string, ArrayBuffer>;
 };
 
 function emptyLogicalStreamAcc(): LogicalStreamAcc {
 	return {
 		grouped: new Map(),
 		expectedChunkCounts: new Map(),
-		chunkGroupOrder: [],
-		nonChunked: [],
-		completedChunks: new Map(),
 	};
 }
 
-function feedLogicalStreamRow(acc: LogicalStreamAcc, row: ChunkedBytesRow): void {
+function feedLogicalStreamRow(doc: Y.Doc, acc: LogicalStreamAcc, row: ChunkedBytesRow): void {
 	const { data, chunkGroupId, chunkIndex, chunkCount } = row;
 	if (
 		chunkGroupId === undefined ||
 		chunkIndex === undefined ||
 		chunkCount === undefined
 	) {
-		acc.nonChunked.push(data);
+		Y.applyUpdate(doc, new Uint8Array(data));
 		return;
 	}
 	let group = acc.grouped.get(chunkGroupId);
 	if (!group) {
 		group = new Map<number, ArrayBuffer>();
 		acc.grouped.set(chunkGroupId, group);
-		acc.chunkGroupOrder.push(chunkGroupId);
 	}
 	group.set(chunkIndex, data);
 	acc.expectedChunkCounts.set(chunkGroupId, chunkCount);
@@ -486,21 +648,9 @@ function feedLogicalStreamRow(acc: LogicalStreamAcc, row: ChunkedBytesRow): void
 		merged.set(chunk, offset);
 		offset += chunk.byteLength;
 	}
-	acc.completedChunks.set(chunkGroupId, asArrayBuffer(merged));
+	Y.applyUpdate(doc, merged);
 	acc.grouped.delete(chunkGroupId);
 	acc.expectedChunkCounts.delete(chunkGroupId);
-}
-
-function applyLogicalStreamAccToYDoc(doc: Y.Doc, acc: LogicalStreamAcc): void {
-	for (const buf of acc.nonChunked) {
-		Y.applyUpdate(doc, new Uint8Array(buf));
-	}
-	for (const gid of acc.chunkGroupOrder) {
-		const buf = acc.completedChunks.get(gid);
-		if (buf) {
-			Y.applyUpdate(doc, new Uint8Array(buf));
-		}
-	}
 }
 
 async function getDocData(
@@ -522,7 +672,7 @@ async function getDocData(
 			},
 		})) as PaginatedRows<StoredYjsSnapshot>;
 		for (const row of page.page) {
-			feedLogicalStreamRow(snapshotAcc, {
+			feedLogicalStreamRow(doc, snapshotAcc, {
 				data: row.data,
 				chunkGroupId: row.chunkGroupId,
 				chunkIndex: row.chunkIndex,
@@ -532,7 +682,6 @@ async function getDocData(
 		snapshotCursor = page.continueCursor;
 		snapshotsDone = page.isDone;
 	}
-	applyLogicalStreamAccToYDoc(doc, snapshotAcc);
 
 	const updateAcc = emptyLogicalStreamAcc();
 	let updateRowCount = 0;
@@ -552,7 +701,7 @@ async function getDocData(
 		for (const row of page.page) {
 			updateRowCount += 1;
 			lastUpdateCreationTime = row._creationTime;
-			feedLogicalStreamRow(updateAcc, {
+			feedLogicalStreamRow(doc, updateAcc, {
 				data: row.update,
 				chunkGroupId: row.chunkGroupId,
 				chunkIndex: row.chunkIndex,
@@ -562,7 +711,6 @@ async function getDocData(
 		updateCursor = page.continueCursor;
 		updatesDone = page.isDone;
 	}
-	applyLogicalStreamAccToYDoc(doc, updateAcc);
 
 	const mergedUpdate = Y.encodeStateAsUpdate(doc);
 	doc.destroy();
@@ -576,11 +724,19 @@ async function removeDocRows(
 ): Promise<void> {
 	let moreSnapshots = true;
 	while (moreSnapshots) {
-		moreSnapshots = await ctx.runMutation(internal.yjsSync._pruneOldSnapshotsOnce, { docId });
+		const result = (await ctx.runMutation(internal.yjsSync._pruneOldSnapshotsOnce, {
+			docId,
+		})) as CompactionBatchResult;
+		moreSnapshots = result.more;
+		await sleepAfterWriteBytes(result.bytesWritten);
 	}
 	let moreUpdates = true;
 	while (moreUpdates) {
-		moreUpdates = await ctx.runMutation(internal.yjsSync._deleteUpdateRowsOnce, { docId });
+		const result = (await ctx.runMutation(internal.yjsSync._deleteUpdateRowsOnce, {
+			docId,
+		})) as CompactionBatchResult;
+		moreUpdates = result.more;
+		await sleepAfterWriteBytes(result.bytesWritten);
 	}
 	await ctx.runMutation(internal.yjsSync._markDocClean, { docId });
 }

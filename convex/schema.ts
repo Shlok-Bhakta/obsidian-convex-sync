@@ -23,7 +23,7 @@ export default defineSchema({
 	})
 		.index("by_path", ["path"])
 		.index("by_updatedAtMs", ["updatedAtMs"]),
-	vaultBootstraps: defineTable({
+		vaultBootstraps: defineTable({
 		status: v.union(
 			v.literal("building"),
 			v.literal("ready"),
@@ -42,10 +42,10 @@ export default defineSchema({
 		readyAtMs: v.optional(v.number()),
 		expiresAtMs: v.optional(v.number()),
 		downloadToken: v.optional(v.string()),
-		archiveName: v.optional(v.string()),
-		createdByClientId: v.string(),
-		errorMessage: v.optional(v.string()),
-	}),
+			archiveName: v.optional(v.string()),
+			createdByClientId: v.string(),
+			errorMessage: v.optional(v.string()),
+		}).index("by_downloadToken", ["downloadToken"]),
 	/** At most one row: shared vault API key for this deployment. */
 	pluginAuth: defineTable({
 		secret: v.string(),
@@ -72,9 +72,11 @@ export default defineSchema({
 		chunkIndex: v.optional(v.number()),
 		chunkCount: v.optional(v.number()),
 	}).index("by_doc_id", ["docId"]),
-	yjsDirtyDocs: defineTable({
-		docId: v.string(),
-	}).index("by_doc_id", ["docId"]),
+		yjsDirtyDocs: defineTable({
+			docId: v.string(),
+			updatedAtMs: v.optional(v.number()),
+			compactionRequestedAtMs: v.optional(v.number()),
+		}).index("by_doc_id", ["docId"]),
 	/** Full merged Yjs state; inline bytes so reactive `pull` can read it (queries cannot use `storage.get`). */
 	yjsSnapshots: defineTable({
 		docId: v.string(),

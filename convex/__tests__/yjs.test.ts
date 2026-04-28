@@ -8,6 +8,7 @@ const refs = vi.hoisted(() => ({
 			_insertSnapshotChunk: "internal.yjsSync._insertSnapshotChunk",
 			_pruneOldUpdatesOnce: "internal.yjsSync._pruneOldUpdatesOnce",
 			_markDocClean: "internal.yjsSync._markDocClean",
+			_markCompactionComplete: "internal.yjsSync._markCompactionComplete",
 		},
 	},
 }));
@@ -39,9 +40,10 @@ function invokeHandler<Args, Result>(
 describe("convex/yjsSync snapshot lifecycle", () => {
 	it("prunes old snapshot rows one bounded batch at a time", async () => {
 		const deletedIds: string[] = [];
+		const data = new Uint8Array([1, 2]).buffer;
 		const take = vi.fn().mockResolvedValue([
-			{ _id: "s1" },
-			{ _id: "s2" },
+			{ _id: "s1", data },
+			{ _id: "s2", data },
 		]);
 		const ctx = {
 			db: {
@@ -54,12 +56,12 @@ describe("convex/yjsSync snapshot lifecycle", () => {
 			},
 		};
 
-		const more = await invokeHandler(_pruneOldSnapshotsOnce, ctx, {
+		const result = await invokeHandler(_pruneOldSnapshotsOnce, ctx, {
 			docId: "vault::notes/test.md",
 		});
 
-		expect(more).toBe(false);
-		expect(take).toHaveBeenCalledWith(16);
+		expect(result).toEqual({ more: false, rows: 2, bytesWritten: 4 });
+		expect(take).toHaveBeenCalledWith(4);
 		expect(deletedIds).toEqual(["s1", "s2"]);
 	});
 
@@ -101,7 +103,16 @@ describe("convex/yjsSync snapshot lifecycle", () => {
 			}),
 			runMutation: vi.fn(async (ref: string) => {
 				calls.push(ref);
-				return false;
+				if (
+					ref === refs.internal.yjsSync._pruneOldSnapshotsOnce ||
+					ref === refs.internal.yjsSync._pruneOldUpdatesOnce
+				) {
+					return { more: false, rows: 0, bytesWritten: 0 };
+				}
+				if (ref === refs.internal.yjsSync._markCompactionComplete) {
+					return { shouldReschedule: false };
+				}
+				return null;
 			}),
 		};
 
@@ -113,7 +124,7 @@ describe("convex/yjsSync snapshot lifecycle", () => {
 			refs.internal.yjsSync._pruneOldSnapshotsOnce,
 			refs.internal.yjsSync._insertSnapshotChunk,
 			refs.internal.yjsSync._pruneOldUpdatesOnce,
-			refs.internal.yjsSync._markDocClean,
+			refs.internal.yjsSync._markCompactionComplete,
 		]);
 	});
 });

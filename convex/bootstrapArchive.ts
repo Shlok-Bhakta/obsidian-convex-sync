@@ -8,18 +8,28 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { finished, pipeline } from "node:stream/promises";
-import * as Y from "yjs";
 import { v } from "convex/values";
-import { api, internal } from "./_generated/api";
+import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { internalAction } from "./_generated/server";
 
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-	return bytes.buffer.slice(
-		bytes.byteOffset,
-		bytes.byteOffset + bytes.byteLength,
-	) as ArrayBuffer;
-}
+const FILE_PAGE_SIZE = 64;
+const FILE_PAGE_MAX_BYTES = 1 * 1024 * 1024;
+const PROGRESS_MIN_INTERVAL_MS = 1_500;
+const PROGRESS_MIN_FILE_DELTA = 32;
+
+type SnapshotFileRow = {
+	path: string;
+	isText: boolean;
+	storageId?: Id<"_storage">;
+	sizeBytes: number;
+};
+
+type SnapshotFilePage = {
+	page: SnapshotFileRow[];
+	isDone: boolean;
+	continueCursor: string;
+};
 
 /** Top-level folder inside the ZIP (matches bootstrap archive naming rules). */
 function sanitizeVaultFolder(vaultName: string): string {
@@ -57,29 +67,59 @@ export const buildArchive = internalAction({
 		const tmpPath = join(tmpdir(), `obsidian-bootstrap-${randomBytes(16).toString("hex")}.zip`);
 		const stagingPaths: string[] = [];
 		try {
-			const docsWithPendingUpdates = await ctx.runQuery(
-				internal.yjsSync._listDocIdsWithPendingUpdates,
-				{},
-			);
-			// Dirty-doc snapshotting issues many mutations; pace it to avoid Convex TooManyWrites.
-			const betweenDirtyDocMs = 200;
-			for (let i = 0; i < docsWithPendingUpdates.length; i++) {
-				const docId = docsWithPendingUpdates[i];
-				if (i > 0) {
-					await new Promise((r) => setTimeout(r, betweenDirtyDocMs));
-				}
-				await ctx.runAction(internal.yjsSync._snapshotUpdates, { docId });
-			}
-
-			const snapshot = await ctx.runQuery(internal.bootstrap._readSnapshot, {
-				convexSecret: args.convexSecret,
-			});
-
 			let filesProcessed = 0;
 			let bytesProcessed = 0;
-			const chunkInterval = 8;
+			let filesTotal = 0;
+			let bytesTotal = 0;
 			const vaultPrefix = `${args.vaultName}::`;
 			const zipRoot = sanitizeVaultFolder(args.vaultName);
+			let lastProgressAt = 0;
+			let lastProgressFiles = 0;
+
+			const readFilePage = async (cursor: string | null): Promise<SnapshotFilePage> =>
+				(await ctx.runQuery(internal.bootstrap._readFilePage, {
+					convexSecret: args.convexSecret,
+					paginationOpts: {
+						cursor,
+						numItems: FILE_PAGE_SIZE,
+						maximumBytesRead: FILE_PAGE_MAX_BYTES,
+					},
+				})) as SnapshotFilePage;
+
+			const reportProgress = async (phase: string, force = false): Promise<void> => {
+				const now = Date.now();
+				if (
+					!force &&
+					now - lastProgressAt < PROGRESS_MIN_INTERVAL_MS &&
+					filesProcessed - lastProgressFiles < PROGRESS_MIN_FILE_DELTA
+				) {
+					return;
+				}
+				lastProgressAt = now;
+				lastProgressFiles = filesProcessed;
+				await ctx.runMutation(internal.bootstrap.updateProgress, {
+					bootstrapId: args.bootstrapId,
+					phase,
+					filesProcessed,
+					bytesProcessed,
+					filesTotal,
+					bytesTotal,
+				});
+			};
+
+			let countCursor: string | null = null;
+			let countDone = false;
+			while (!countDone) {
+				const page = await readFilePage(countCursor);
+				for (const row of page.page) {
+					filesTotal += 1;
+					bytesTotal += row.sizeBytes;
+				}
+				countCursor = page.continueCursor;
+				countDone = page.isDone;
+				await reportProgress(`Scanning vault files (${filesTotal})`);
+			}
+			await reportProgress("Collecting vault files", true);
 
 			const hash = createHash("sha256");
 			const output = createWriteStream(tmpPath);
@@ -99,73 +139,50 @@ export const buildArchive = internalAction({
 
 			archive.pipe(hashTransform).pipe(output);
 
-			for (const row of snapshot.files) {
-				try {
-					if (row.isText) {
-						const doc = new Y.Doc();
-						try {
-							const initial = await ctx.runAction(api.yjsSync.init, {
-								convexSecret: args.convexSecret,
+			let fileCursor: string | null = null;
+			let filesDone = false;
+			while (!filesDone) {
+				const page = await readFilePage(fileCursor);
+				for (const row of page.page) {
+					try {
+						if (row.isText) {
+							const text = await ctx.runAction(internal.yjsSync._readTextForBootstrap, {
 								docId: `${vaultPrefix}${row.path}`,
-								stateVector: toArrayBuffer(Y.encodeStateVector(doc)),
-								skipCompactionSchedule: true,
 							});
-							if (
-								initial &&
-								typeof initial === "object" &&
-								"update" in initial &&
-								(initial as { update?: ArrayBuffer | Uint8Array }).update
-							) {
-								const raw = (initial as { update: ArrayBuffer | Uint8Array }).update;
-								const u8 = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
-								if (u8.byteLength > 0) {
-									Y.applyUpdate(doc, u8);
+							archive.append(Buffer.from(text, "utf8"), {
+								name: zipEntryPath(zipRoot, row.path),
+							});
+						} else if (row.storageId) {
+							const blob = await ctx.storage.get(row.storageId);
+							if (blob) {
+								const staging = join(
+									tmpdir(),
+									`obsidian-bootstrap-staging-${randomBytes(12).toString("hex")}.bin`,
+								);
+								try {
+									await pipeline(
+										Readable.fromWeb(
+											blob.stream() as import("node:stream/web").ReadableStream<Uint8Array>,
+										),
+										createWriteStream(staging),
+									);
+									archive.file(staging, { name: zipEntryPath(zipRoot, row.path) });
+									stagingPaths.push(staging);
+								} catch (err) {
+									await unlink(staging).catch(() => {});
+									throw err;
 								}
 							}
-							const text = doc.getText("content").toString();
-							archive.append(Buffer.from(text, "utf8"), { name: zipEntryPath(zipRoot, row.path) });
-						} finally {
-							doc.destroy();
 						}
-					} else {
-						if (!row.storageId) {
-							continue;
-						}
-						const blob = await ctx.storage.get(row.storageId);
-						if (!blob) {
-							continue;
-						}
-						const staging = join(
-							tmpdir(),
-							`obsidian-bootstrap-staging-${randomBytes(12).toString("hex")}.bin`,
-						);
-						try {
-							await pipeline(
-								Readable.fromWeb(
-									blob.stream() as import("node:stream/web").ReadableStream<Uint8Array>,
-								),
-								createWriteStream(staging),
-							);
-							archive.file(staging, { name: zipEntryPath(zipRoot, row.path) });
-							stagingPaths.push(staging);
-						} catch (err) {
-							await unlink(staging).catch(() => {});
-							throw err;
-						}
+					} catch (err) {
+						console.warn(`[bootstrap] skipping ${row.path}:`, err);
 					}
-				} catch (err) {
-					console.warn(`[bootstrap] skipping ${row.path}:`, err);
+					filesProcessed += 1;
+					bytesProcessed += row.sizeBytes;
+					await reportProgress(`Collecting vault files (${filesProcessed}/${filesTotal})`);
 				}
-				filesProcessed += 1;
-				bytesProcessed += row.sizeBytes;
-				if (filesProcessed % chunkInterval === 0) {
-					await ctx.runMutation(internal.bootstrap.updateProgress, {
-						bootstrapId: args.bootstrapId,
-						phase: `Collecting vault files (${filesProcessed}/${snapshot.files.length})`,
-						filesProcessed,
-						bytesProcessed,
-					});
-				}
+				fileCursor = page.continueCursor;
+				filesDone = page.isDone;
 			}
 
 			await ctx.runMutation(internal.bootstrap.updateProgress, {
@@ -173,6 +190,8 @@ export const buildArchive = internalAction({
 				phase: "Writing archive",
 				filesProcessed,
 				bytesProcessed,
+				filesTotal,
+				bytesTotal,
 			});
 
 			await archive.finalize();
